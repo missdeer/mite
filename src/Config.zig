@@ -250,6 +250,9 @@ fullscreen: bool = false,
 // Validated range 1..1000; out-of-range values fall back to the default.
 render_interval_local_ms: u32 = 16,
 render_interval_remote_ms: u32 = 50,
+// Optional Windows display-adapter name. `null` keeps D3D's automatic
+// hardware-adapter selection; the renderer consumes this at process startup.
+gpu: ?[]const u8 = null,
 
 arena: ?std.heap.ArenaAllocator = null,
 
@@ -336,6 +339,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
     var fullscreen: bool = false;
     var render_interval_local_ms: u32 = 16;
     var render_interval_remote_ms: u32 = 50;
+    var gpu: ?[]const u8 = null;
     var codepoint_maps: std.ArrayListUnmanaged(CodepointMap) = .empty;
     var launchers: std.ArrayListUnmanaged(Launcher) = .empty;
     var envs: std.ArrayListUnmanaged(EnvEntry) = .empty;
@@ -483,6 +487,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
                 continue;
             };
             render_interval_remote_ms = n;
+        } else if (std.mem.eql(u8, key, "gpu")) {
+            gpu = if (value.len == 0) null else a.dupe(u8, value) catch oom();
         } else if (std.mem.eql(u8, key, "background-opacity")) {
             const n = std.fmt.parseFloat(f32, value) catch {
                 std.log.warn("config: {s}:{}: invalid background-opacity '{s}'", .{ source_name, line_no, value });
@@ -596,6 +602,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
         .fullscreen = fullscreen,
         .render_interval_local_ms = render_interval_local_ms,
         .render_interval_remote_ms = render_interval_remote_ms,
+        .gpu = gpu,
         .arena = arena,
     };
 }
@@ -1452,6 +1459,39 @@ test "parse render intervals keep local responsive and remote conservative" {
         defer cfg.deinit();
         try std.testing.expectEqual(@as(u32, 16), cfg.render_interval_local_ms);
         try std.testing.expectEqual(@as(u32, 50), cfg.render_interval_remote_ms);
+    }
+}
+
+test "parse gpu keeps the last full display name in config-owned storage" {
+    const source = try std.testing.allocator.dupe(
+        u8,
+        "gpu = Intel(R) UHD Graphics 770\n" ++
+            "gpu = NVIDIA GeForce RTX 4060 Ti\n",
+    );
+    defer std.testing.allocator.free(source);
+
+    var cfg = parse(std.testing.allocator, source, "test");
+    defer cfg.deinit();
+    @memset(source, 'x');
+
+    try std.testing.expectEqualStrings("NVIDIA GeForce RTX 4060 Ti", cfg.gpu.?);
+}
+
+test "parse gpu treats missing and whitespace-only values as automatic selection" {
+    {
+        var cfg = parse(std.testing.allocator, "", "test");
+        defer cfg.deinit();
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.gpu);
+    }
+    {
+        var cfg = parse(
+            std.testing.allocator,
+            "gpu = NVIDIA GeForce RTX 4060 Ti\n" ++
+                "gpu =    \n",
+            "test",
+        );
+        defer cfg.deinit();
+        try std.testing.expectEqual(@as(?[]const u8, null), cfg.gpu);
     }
 }
 
