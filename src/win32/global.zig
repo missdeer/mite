@@ -2,14 +2,14 @@ const std = @import("std");
 const win32 = @import("win32").everything;
 
 const Config = @import("../Config.zig");
+const Renderer = @import("Renderer.zig");
 const diag = @import("diag.zig");
-const d3d11 = @import("d3d11.zig");
 const icons_mod = @import("icons.zig");
 const state = @import("state.zig");
 
 pub const global = struct {
     pub var icons: icons_mod.Icons = undefined;
-    pub var renderer: d3d11 = undefined;
+    pub var renderer: Renderer = undefined;
     pub var window: ?state.Window = null;
     pub var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     pub var config: Config = .{};

@@ -99,7 +99,7 @@ pub fn main() !void {
     const emoji_families_u16 = util.utf16FontFamilies(gpa_alloc, global.config.emoji_font_families);
     const codepoint_maps_u16 = util.utf16CodepointMaps(gpa_alloc, global.config.font_codepoint_maps);
     const font_features = util.dwriteFontFeatures(gpa_alloc, global.config.font_features);
-    const font_config: d3d11.FontConfig = .{
+    const font_config: Renderer.FontConfig = .{
         .families = font_families_u16,
         .emoji_families = emoji_families_u16,
         .family_bold = util.utf16FamilyOptional(gpa_alloc, global.config.font_family_bold),
@@ -120,13 +120,13 @@ pub fn main() !void {
         .tabbar_family = util.utf16FamilyOptional(gpa_alloc, global.config.tabbar_font_family),
         .tabbar_font_size_pt = global.config.tabbar_font_size_pt,
     };
-    global.renderer = d3d11.init(
+    global.renderer.init(
         @max(dpi.x, dpi.y),
         font_config,
         global.config.font_ligatures,
         global.config.gpu,
     );
-    const cell_size = global.renderer.cell_size;
+    const cell_size = global.renderer.common.cell_size;
     const placement = window_geom.calcWindowPlacement(
         maybe_monitor,
         @max(dpi.x, dpi.y),
@@ -294,8 +294,8 @@ pub fn main() !void {
 }
 
 const Config = @import("Config.zig");
+const Renderer = @import("win32/Renderer.zig");
 const config_watch = @import("win32/config_watch.zig");
-const d3d11 = @import("win32/d3d11.zig");
 const diag = @import("win32/diag.zig");
 const dispatch = @import("win32/wnd/dispatch.zig");
 const global_mod = @import("win32/global.zig");

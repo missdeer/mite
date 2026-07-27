@@ -2,7 +2,7 @@ const std = @import("std");
 const win32 = @import("win32").everything;
 const types = @import("types.zig");
 const Config = @import("../Config.zig");
-const d3d11 = @import("d3d11.zig");
+const Renderer = @import("Renderer.zig");
 
 pub fn XY(comptime T: type) type {
     return struct {
@@ -124,8 +124,8 @@ pub fn utf16ZAllocConst(allocator: std.mem.Allocator, utf8: []const u8) error{Ou
 pub fn utf16CodepointMaps(
     allocator: std.mem.Allocator,
     maps: []const Config.CodepointMap,
-) []const d3d11.FontConfig.CodepointMapEntry {
-    var out: std.ArrayListUnmanaged(d3d11.FontConfig.CodepointMapEntry) = .empty;
+) []const Renderer.FontConfig.CodepointMapEntry {
+    var out: std.ArrayListUnmanaged(Renderer.FontConfig.CodepointMapEntry) = .empty;
     for (maps) |m| {
         const required = std.unicode.calcUtf16LeLen(m.family) catch {
             std.log.warn("config: invalid utf-8 in font-codepoint-map family '{s}'; skipping", .{m.family});
@@ -147,9 +147,9 @@ pub fn utf16CodepointMaps(
 pub fn dwriteFontFeatures(
     allocator: std.mem.Allocator,
     features: []const Config.FontFeature,
-) []const d3d11.FontConfig.FontFeature {
+) []const Renderer.FontConfig.FontFeature {
     if (features.len == 0) return &.{};
-    const out = allocator.alloc(d3d11.FontConfig.FontFeature, features.len) catch |e| oom(e);
+    const out = allocator.alloc(Renderer.FontConfig.FontFeature, features.len) catch |e| oom(e);
     for (features, out) |feature, *dst| {
         dst.* = .{
             .nameTag = @enumFromInt(feature.tag),
@@ -161,7 +161,7 @@ pub fn dwriteFontFeatures(
 
 // Converts a Config.FontStyle (UTF-8 in arena) into a FontConfig.StyleSpec
 // (UTF-16 for DirectWrite). Same leak-by-design lifetime as families.
-pub fn convertStyleSpec(allocator: std.mem.Allocator, style: Config.FontStyle) d3d11.FontConfig.StyleSpec {
+pub fn convertStyleSpec(allocator: std.mem.Allocator, style: Config.FontStyle) Renderer.FontConfig.StyleSpec {
     return switch (style) {
         .default => .default,
         .disabled => .disabled,

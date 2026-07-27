@@ -1,7 +1,7 @@
 const std = @import("std");
 const win32 = @import("win32").everything;
 
-const d3d11 = @import("../d3d11.zig");
+const Renderer = @import("../Renderer.zig");
 const err_mod = @import("../error.zig");
 const global_mod = @import("../global.zig");
 const render = @import("../render.zig");
@@ -66,7 +66,7 @@ pub fn onSizing(hwnd: win32.HWND, wparam: win32.WPARAM, lparam: win32.LPARAM) ?w
     }
     const rect: *win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
     const dpi = win32.dpiFromHwnd(hwnd);
-    const new_rect = window_geom.calcWindowRect(dpi, rect.*, wparam, global.renderer.cell_size);
+    const new_rect = window_geom.calcWindowRect(dpi, rect.*, wparam, global.renderer.common.cell_size);
     window.bounds = .{
         .token = new_rect,
         .rect = rect.*,
@@ -81,7 +81,7 @@ pub fn onWindowPosChanged(hwnd: win32.HWND, _: win32.WPARAM, lparam: win32.LPARA
     const iconic = win32.IsIconic(hwnd) != 0;
 
     if (pos.flags.NOSIZE == 0 and !iconic) {
-        const cell_count = window_geom.computeGridCellCount(hwnd, global.renderer.cell_size);
+        const cell_count = window_geom.computeGridCellCount(hwnd, global.renderer.common.cell_size);
 
         for (window.tabs.items) |tab| {
             if (tab.closing) continue;
@@ -136,11 +136,11 @@ pub fn onGetDpiScaledSize(hwnd: win32.HWND, wparam: win32.WPARAM, lparam: win32.
     const inout_size: *win32.SIZE = @ptrFromInt(@as(usize, @bitCast(lparam)));
     const new_dpi: u32 = @intCast(0xffffffff & wparam);
     const current_dpi = win32.dpiFromHwnd(hwnd);
-    const cs = global.renderer.cell_size;
+    const cs = global.renderer.common.cell_size;
 
-    const tbh_cur = global.renderer.tab_bar_height;
+    const tbh_cur = global.renderer.common.tab_bar_height;
     const client_size = win32.getClientSize(hwnd);
-    const grid_w = client_size.cx -| @as(i32, d3d11.scrollbarWidth(current_dpi));
+    const grid_w = client_size.cx -| @as(i32, Renderer.scrollbarWidth(current_dpi));
     const grid_h_cur = @max(0, client_size.cy - tbh_cur);
     // Prefer the active terminal's committed grid as the source of truth so a
     // DPI change reproduces the same logical size at the new DPI. WM_GETDPISCALEDSIZE
@@ -159,7 +159,7 @@ pub fn onGetDpiScaledSize(hwnd: win32.HWND, wparam: win32.WPARAM, lparam: win32.
     }
 
     const new_cs = global.renderer.cellSizeForDpi(new_dpi);
-    const new_client_w = col_count * new_cs.cx + @as(i32, d3d11.scrollbarWidth(new_dpi));
+    const new_client_w = col_count * new_cs.cx + @as(i32, Renderer.scrollbarWidth(new_dpi));
     const new_grid_h = row_count * new_cs.cy;
     const new_client_h = new_grid_h + global.renderer.tabBarHeightForDpi(new_dpi); // add tab bar band at new dpi
     const new_inset = util.getClientInset(new_dpi);

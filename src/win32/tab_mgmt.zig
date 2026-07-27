@@ -90,7 +90,7 @@ fn onXtVersion(_: *vt.TerminalStream.Handler) []const u8 {
 // the active renderer; rows/cols from the per-tab terminal state. Returns
 // null (silently ignored) if the renderer hasn't measured a cell yet.
 fn onSize(handler: *vt.TerminalStream.Handler) EffectReturnType("size") {
-    const cs = global.renderer.cell_size;
+    const cs = global.renderer.common.cell_size;
     const cell_width = std.math.cast(u32, cs.cx) orelse return null;
     const cell_height = std.math.cast(u32, cs.cy) orelse return null;
     if (cell_width == 0 or cell_height == 0) return null;
@@ -124,7 +124,7 @@ fn terminalInitOptions(cols: u16, rows: u16) vt.Terminal.Options {
 }
 
 pub fn syncTerminalPixelSize(term: *vt.Terminal) void {
-    const cs = global.renderer.cell_size;
+    const cs = global.renderer.common.cell_size;
     const cell_w = std.math.cast(u32, cs.cx) orelse 0;
     const cell_h = std.math.cast(u32, cs.cy) orelse 0;
     if (cell_w == 0 or cell_h == 0) return;
@@ -145,7 +145,7 @@ pub fn newTabWithLauncher(window: *Window, launcher: ?*const Config.Launcher) vo
         std.log.warn("tab limit reached ({}); not opening new tab", .{types.MAX_TABS});
         return;
     }
-    const cs = global.renderer.cell_size;
+    const cs = global.renderer.common.cell_size;
     const cell_count = window_geom.computeGridCellCount(window.hwnd, cs);
 
     const tab = global.gpa.allocator().create(Tab) catch util.oom(error.OutOfMemory);

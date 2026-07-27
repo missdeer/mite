@@ -21,7 +21,7 @@ fn setImeCompositionPos(window: *Window) void {
 
 fn setImeCandidatePos(window: *Window) void {
     const caret = render.caretPixelPos(window) orelse return;
-    const cs = global_mod.global.renderer.cell_size;
+    const cs = global_mod.global.renderer.common.cell_size;
     const himc = win32.ImmGetContext(window.hwnd) orelse return;
     defer _ = win32.ImmReleaseContext(window.hwnd, himc);
     // CFS_EXCLUDE: anchor the candidate list at ptCurrentPos and tell the IME

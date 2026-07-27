@@ -19,7 +19,7 @@ pub fn renderWindow(window: *Window) void {
     // the render-throttle rate.
     mouse.revalidateHoverForActiveTab(window);
 
-    const cs = global.renderer.cell_size;
+    const cs = global.renderer.common.cell_size;
     const cell_count = window_geom.computeGridCellCount(window.hwnd, cs);
     const total_cols = cell_count.col;
     var tab_buf: [types.MAX_TABS]types.TabDrawInfo = undefined;
@@ -61,8 +61,8 @@ pub fn renderWindow(window: *Window) void {
 pub fn caretPixelPos(window: *Window) ?win32.POINT {
     if (window.tabs.items.len == 0) return null;
     const screen = window.active().term.screens.active;
-    const cs = global.renderer.cell_size;
+    const cs = global.renderer.common.cell_size;
     const x: i32 = @as(i32, @intCast(screen.cursor.x)) * cs.cx;
-    const y: i32 = @as(i32, @intCast(screen.cursor.y)) * cs.cy + global.renderer.tab_bar_height;
+    const y: i32 = @as(i32, @intCast(screen.cursor.y)) * cs.cy + global.renderer.common.tab_bar_height;
     return .{ .x = x, .y = y };
 }

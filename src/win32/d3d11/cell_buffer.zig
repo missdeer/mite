@@ -267,7 +267,7 @@ pub fn buildAndUpload(
                 continue;
             }
 
-            if (self.font_ligatures and visual.shape_candidate) {
+            if (self.common.font_ligatures and visual.shape_candidate) {
                 var run_text: [glyph_mod.max_ligature_run_cells]u8 = undefined;
                 var run_visuals: [glyph_mod.max_ligature_run_cells]VisualCell = undefined;
                 std.debug.assert(visual.codepoint <= std.math.maxInt(u8));

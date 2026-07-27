@@ -2,7 +2,7 @@ const std = @import("std");
 const win32 = @import("win32").everything;
 const vt = @import("vt");
 
-const d3d11 = @import("../d3d11.zig");
+const Renderer = @import("../Renderer.zig");
 const global_mod = @import("../global.zig");
 const launcher = @import("../launcher.zig");
 const mouse_report = @import("../mouse_report.zig");
@@ -25,10 +25,10 @@ const TerminalMouse = struct {
 };
 
 fn terminalMouse(tab: *state.Tab, hwnd: win32.HWND, mouse_x: i32, mouse_y: i32) TerminalMouse {
-    const cs = global.renderer.cell_size;
-    const tbh = global.renderer.tab_bar_height;
+    const cs = global.renderer.common.cell_size;
+    const tbh = global.renderer.common.tab_bar_height;
     const client_size = win32.getClientSize(hwnd);
-    const sb_px = d3d11.scrollbarWidth(win32.dpiFromHwnd(hwnd));
+    const sb_px = Renderer.scrollbarWidth(win32.dpiFromHwnd(hwnd));
     const grid_w = client_size.cx -| @as(i32, sb_px);
     const grid_h = @max(0, client_size.cy - tbh);
     const grid_mouse_y = mouse_y - tbh;
@@ -81,8 +81,8 @@ fn clearUrlHover(window: *state.Window) void {
 // tab. Returns null when the point is above the tab bar, left of the grid, or
 // outside the terminal's columns/rows.
 fn cellAtClient(window: *state.Window, mouse_x: i32, mouse_y: i32) ?struct { col: u16, row: u16 } {
-    const cs = global.renderer.cell_size;
-    const tbh = global.renderer.tab_bar_height;
+    const cs = global.renderer.common.cell_size;
+    const tbh = global.renderer.common.tab_bar_height;
     const grid_y = mouse_y - tbh;
     if (grid_y < 0 or mouse_x < 0) return null;
     const tab = window.active();
@@ -308,10 +308,10 @@ pub fn onLButtonDown(hwnd: win32.HWND, _: win32.WPARAM, lparam: win32.LPARAM) ?w
     const window = global_mod.windowFromHwnd(hwnd);
     const mouse_x: i32 = win32.xFromLparam(lparam);
     const mouse_y: i32 = win32.yFromLparam(lparam);
-    const cs = global.renderer.cell_size;
-    const tbh = global.renderer.tab_bar_height;
+    const cs = global.renderer.common.cell_size;
+    const tbh = global.renderer.common.tab_bar_height;
     const client_size = win32.getClientSize(hwnd);
-    const sb_px = d3d11.scrollbarWidth(win32.dpiFromHwnd(hwnd));
+    const sb_px = Renderer.scrollbarWidth(win32.dpiFromHwnd(hwnd));
     const grid_w = client_size.cx -| @as(i32, sb_px);
 
     // Tab bar gets first dibs on a fresh click.
@@ -535,10 +535,10 @@ pub fn onLButtonDblClk(hwnd: win32.HWND, wparam: win32.WPARAM, lparam: win32.LPA
     const window = global_mod.windowFromHwnd(hwnd);
     const mouse_x: i32 = win32.xFromLparam(lparam);
     const mouse_y: i32 = win32.yFromLparam(lparam);
-    const tbh = global.renderer.tab_bar_height;
-    const cs = global.renderer.cell_size;
+    const tbh = global.renderer.common.tab_bar_height;
+    const cs = global.renderer.common.cell_size;
     const client_size = win32.getClientSize(hwnd);
-    const sb_px = d3d11.scrollbarWidth(win32.dpiFromHwnd(hwnd));
+    const sb_px = Renderer.scrollbarWidth(win32.dpiFromHwnd(hwnd));
     const grid_w = client_size.cx -| @as(i32, sb_px);
 
     // CS_DBLCLKS replaces the second WM_LBUTTONDOWN of a fast double-click
@@ -710,10 +710,10 @@ pub fn onMouseMove(hwnd: win32.HWND, _: win32.WPARAM, lparam: win32.LPARAM) ?win
     }
     const mouse_x: i32 = win32.xFromLparam(lparam);
     const mouse_y: i32 = win32.yFromLparam(lparam);
-    const cs = global.renderer.cell_size;
-    const tbh = global.renderer.tab_bar_height;
+    const cs = global.renderer.common.cell_size;
+    const tbh = global.renderer.common.tab_bar_height;
     const client_size = win32.getClientSize(hwnd);
-    const grid_w = client_size.cx -| @as(i32, d3d11.scrollbarWidth(win32.dpiFromHwnd(hwnd)));
+    const grid_w = client_size.cx -| @as(i32, Renderer.scrollbarWidth(win32.dpiFromHwnd(hwnd)));
 
     // Capture in progress takes priority over tab-bar hover.
     if (window.mouse_capture != .none) {
@@ -844,8 +844,8 @@ pub fn onRButtonDown(hwnd: win32.HWND, _: win32.WPARAM, lparam: win32.LPARAM) ?w
     const window = global_mod.windowFromHwnd(hwnd);
     const mouse_x: i32 = win32.xFromLparam(lparam);
     const mouse_y: i32 = win32.yFromLparam(lparam);
-    const cs = global.renderer.cell_size;
-    if (mouse_y < global.renderer.tab_bar_height) {
+    const cs = global.renderer.common.cell_size;
+    if (mouse_y < global.renderer.common.tab_bar_height) {
         tooltip.hide(window);
         const cell_count = window_geom.computeGridCellCount(hwnd, cs);
         const hit = tab_bar.hitTestTabBar(window, cell_count.col, mouse_x, cs.cx);

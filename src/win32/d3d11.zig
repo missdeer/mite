@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const vt = @import("vt");
 const win32 = @import("win32").everything;
 const GlyphIndexCache = @import("GlyphIndexCache.zig");
+const RendererCommon = @import("RendererCommon.zig");
 const types = @import("types.zig");
 const Config = @import("../Config.zig");
 
@@ -71,6 +72,7 @@ const DebugStats = struct {
 };
 
 // D3D11 core
+common: *RendererCommon,
 device: *win32.ID3D11Device,
 context: *win32.ID3D11DeviceContext,
 
@@ -124,7 +126,6 @@ glyph_cache_cell_size: ?CellXY = null,
 staging_texture: StagingTexture = .{},
 
 stats: DebugStats = .{},
-remote_or_software_adapter: bool = false,
 // Set by Present when DXGI returns DXGI_STATUS_OCCLUDED (window fully
 // covered or display-mode-locked). While true, render() first sends a cheap
 // Present(0, DXGI_PRESENT_TEST) probe. If the window is still occluded we
@@ -168,14 +169,12 @@ scissor_rasterizer_state: ?*win32.ID3D11RasterizerState = null,
 grid_force_full: bool = true,
 last_const_snapshot: grid.ConfigSnapshot = .{},
 
-cell_size: win32.SIZE,
 cell_size_xy: CellXY,
 
 // Effective font configuration (defaults if user didn't override). Lifetimes
 // of the [*:0]u16 strings are owned by the caller of `init`.
 font_size_pt: f32,
 font_features: []const FontConfig.FontFeature = &.{},
-font_ligatures: bool = true,
 effective_primary: [*:0]const u16,
 // Per-style primary overrides for bold/italic/bold-italic respectively.
 // null entry == inherit regular primary. Held so updateDpi can rebuild
@@ -206,10 +205,8 @@ tabbar_fallback: *win32.IDWriteFontFallback,
 tabbar_trimming_sign: ?*win32.IDWriteInlineObject,
 effective_tabbar_primary: [*:0]const u16,
 tabbar_font_size_pt: f32,
-// Tab-bar band height in physical pixels (line height of the tab-bar font +
-// padding), independent of the terminal cell height. Drives the grid's pixel
-// offset and every "where does the terminal start" geometry/input calc.
-tab_bar_height: i32,
+// `common.tab_bar_height` is the physical-pixel band height computed from
+// this format and consumed by grid geometry and input hit testing.
 // Offscreen target the tab bar is painted into, then copied onto the back
 // buffer's top strip. Recreated on resize / height change by getOrCreate.
 band_texture: gpu.BandTexture = .{},
@@ -254,17 +251,17 @@ glyph_worker_started: bool = false,
 cache_gen: u32 = 0,
 
 pub fn cellSizeForDpi(self: *D3d11Renderer, dpi: u32) win32.SIZE {
-    if (dpi == self.dpi) return self.cell_size;
+    if (dpi == self.dpi) return self.common.cell_size;
     return font_mod.measureCellSize(&self.dwrite_factory.IDWriteFactory, dpi, self.effective_primary, self.font_size_pt);
 }
 
 pub fn tabBarHeightForDpi(self: *D3d11Renderer, dpi: u32) i32 {
-    if (dpi == self.dpi) return self.tab_bar_height;
+    if (dpi == self.dpi) return self.common.tab_bar_height;
     const cs = self.cellSizeForDpi(dpi);
     return font_state.computeTabBarHeight(self.dwrite_factory, dpi, self.effective_tabbar_primary, self.tabbar_font_size_pt, @intCast(cs.cy));
 }
 
-pub fn init(dpi: u32, font_config: FontConfig, font_ligatures: bool, configured_gpu: ?[]const u8) D3d11Renderer {
+pub fn init(common: *RendererCommon, dpi: u32, font_config: FontConfig, font_ligatures: bool, configured_gpu: ?[]const u8) D3d11Renderer {
     // Create D3D11 device
     const levels = [_]win32.D3D_FEATURE_LEVEL{.@"11_0"};
     var device: *win32.ID3D11Device = undefined;
@@ -404,7 +401,15 @@ pub fn init(dpi: u32, font_config: FontConfig, font_ligatures: bool, configured_
         if (hr < 0) fatalHr("D2D1CreateFactory", hr);
     }
 
+    common.* = .{
+        .cell_size = fmts.cell_size,
+        .tab_bar_height = fmts.tab_bar_height,
+        .font_ligatures = font_ligatures,
+        .remote_or_software_adapter = adapter_info.remote_or_software,
+    };
+
     return .{
+        .common = common,
         .device = device,
         .context = context,
         .vertex_shader = vertex_shader,
@@ -420,12 +425,10 @@ pub fn init(dpi: u32, font_config: FontConfig, font_ligatures: bool, configured_
         .emoji_text_format = fmts.emoji_format,
         .emoji_fallback = fmts.emoji_fallback,
         .rendering_params = rendering_params,
-        .cell_size = fmts.cell_size,
         .cell_size_xy = fmts.cell_size_xy,
         .dpi = dpi,
         .font_size_pt = eff.font_size_pt,
         .font_features = eff.font_features,
-        .font_ligatures = font_ligatures,
         .effective_primary = eff.primary,
         .effective_style_primaries = eff.style_primaries,
         .effective_style_specs = eff.style_specs,
@@ -438,8 +441,6 @@ pub fn init(dpi: u32, font_config: FontConfig, font_ligatures: bool, configured_
         .tabbar_trimming_sign = fmts.tabbar_trimming_sign,
         .effective_tabbar_primary = eff.tabbar_primary,
         .tabbar_font_size_pt = eff.tabbar_font_size_pt,
-        .tab_bar_height = fmts.tab_bar_height,
-        .remote_or_software_adapter = adapter_info.remote_or_software,
     };
 }
 
@@ -773,7 +774,7 @@ fn prepareFrame(
     // painted via D2D after the grid. The cell grid is terminal-only and
     // the grid quad is drawn under a viewport offset by tab_bar_h; the
     // shader subtracts tab_bar_h from SV_Position.y.
-    const tab_bar_h: u32 = @intCast(@max(0, self.tab_bar_height));
+    const tab_bar_h: u32 = @intCast(@max(0, self.common.tab_bar_height));
     const term_pixel_h: u32 = client_h -| tab_bar_h;
     const term_shader_row: u32 = @divTrunc(term_pixel_h + cs.y - 1, cs.y);
 
@@ -945,7 +946,7 @@ fn paintChromeAndPresent(self: *D3d11Renderer, prepared: PreparedFrame, tabbar: 
     //
     // OCCLUDED is handled by the cheap early TEST probe in prepareFrame.
     // This final Present always submits the frame.
-    const sync_interval: u32 = if (self.remote_or_software_adapter or remote_session) 1 else 0;
+    const sync_interval: u32 = if (self.common.remote_or_software_adapter or remote_session) 1 else 0;
     const hr = prepared.swap_chain.IDXGISwapChain.Present(sync_interval, 0);
     if (hr == DXGI_STATUS_OCCLUDED) {
         self.occluded = true;

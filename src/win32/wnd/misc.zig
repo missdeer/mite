@@ -2,7 +2,7 @@ const std = @import("std");
 const win32 = @import("win32").everything;
 
 const Config = @import("../../Config.zig");
-const d3d11 = @import("../d3d11.zig");
+const Renderer = @import("../Renderer.zig");
 const diag = @import("../diag.zig");
 const err_mod = @import("../error.zig");
 const global_mod = @import("../global.zig");
@@ -162,7 +162,7 @@ fn reloadConfig(hwnd: win32.HWND) void {
     var old = global.config;
     global.config = new_cfg;
     old.deinit();
-    global.renderer.font_ligatures = global.config.font_ligatures;
+    global.renderer.common.font_ligatures = global.config.font_ligatures;
 
     // render-interval-*-ms may have changed; re-apply against the current
     // session state. No-op when the effective interval is unchanged.
@@ -170,7 +170,7 @@ fn reloadConfig(hwnd: win32.HWND) void {
         window.applyRenderInterval(
             global.config.render_interval_local_ms,
             global.config.render_interval_remote_ms,
-            global.renderer.remote_or_software_adapter,
+            global.renderer.common.remote_or_software_adapter,
         );
     }
 
@@ -184,7 +184,7 @@ fn reloadConfig(hwnd: win32.HWND) void {
             // WM_WINDOWPOSCHANGED on restore re-syncs to the real grid.
             const iconic = win32.IsIconic(hwnd) != 0;
             if (!iconic) {
-                const cell_count = window_geom.computeGridCellCount(hwnd, global.renderer.cell_size);
+                const cell_count = window_geom.computeGridCellCount(hwnd, global.renderer.common.cell_size);
                 for (window.tabs.items) |tab| {
                     if (tab.closing) continue;
                     if (tab.term.cols != cell_count.col or tab.term.rows != cell_count.row) {
@@ -627,7 +627,7 @@ pub fn onWtsSessionChange(hwnd: win32.HWND, wparam: win32.WPARAM, _: win32.LPARA
     window.applyRenderInterval(
         global.config.render_interval_local_ms,
         global.config.render_interval_remote_ms,
-        global.renderer.remote_or_software_adapter,
+        global.renderer.common.remote_or_software_adapter,
     );
     return 0;
 }
@@ -744,7 +744,7 @@ fn drainPendingPtyTabs() void {
 // `BgImageDecoded` heap struct (path + pixels). The renderer applies it if
 // the request id still matches the latest reload; either way we free here.
 pub fn onAppBgImageDecoded(_: win32.HWND, _: win32.WPARAM, lparam: win32.LPARAM) ?win32.LRESULT {
-    const result: *d3d11.BgImageDecoded = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    const result: *Renderer.BgImageDecoded = @ptrFromInt(@as(usize, @bitCast(lparam)));
     const gpa = global.gpa.allocator();
     defer result.deinit(gpa);
     global.renderer.applyDecodedBackgroundImage(result);
@@ -758,7 +758,7 @@ pub fn onAppBgImageDecoded(_: win32.HWND, _: win32.WPARAM, lparam: win32.LPARAM)
 // On a successful upload, kick a repaint so the next frame's row diff swaps
 // the placeholder glyph_index for the real slot.
 pub fn onAppGlyphReady(_: win32.HWND, _: win32.WPARAM, lparam: win32.LPARAM) ?win32.LRESULT {
-    const result: *d3d11.RasterResult = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    const result: *Renderer.RasterResult = @ptrFromInt(@as(usize, @bitCast(lparam)));
     const gpa = global.gpa.allocator();
     defer result.deinit(gpa);
     const uploaded = global.renderer.applyGlyphResult(result);

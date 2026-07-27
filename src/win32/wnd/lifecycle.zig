@@ -23,7 +23,7 @@ pub fn onCreate(hwnd: win32.HWND, _: win32.WPARAM, _: win32.LPARAM) ?win32.LRESU
     window.applyRenderInterval(
         global.config.render_interval_local_ms,
         global.config.render_interval_remote_ms,
-        global.renderer.remote_or_software_adapter,
+        global.renderer.common.remote_or_software_adapter,
     );
     if (win32.WTSRegisterSessionNotification(hwnd, win32.NOTIFY_FOR_THIS_SESSION) == 0) {
         std.log.warn("WTSRegisterSessionNotification failed; render interval will not adapt to RDP connect/disconnect", .{});

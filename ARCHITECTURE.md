@@ -50,6 +50,8 @@ src/
     wnd/misc.zig           timers, config reload, fullscreen, theme submenu, app messages
 
     # Renderer
+    Renderer.zig          stable facade + tagged backend union
+    RendererCommon.zig    backend-independent metrics/adapter state
     d3d11.zig              top-level renderer struct; init / render / resize / deinit
     render.zig             renderWindow orchestration (state → renderer.render)
     GlyphIndexCache.zig    circular-LRU mapping (codepoint,half,style) → atlas slot
@@ -134,8 +136,9 @@ Entry sequence in `mosttywindows.zig`:
    4. Converts the font family/codepoint-map strings to sentinel-terminated
       UTF-16 (allocations leaked into the process arena — they live for the
       whole renderer lifetime).
-   5. `d3d11.init(dpi, font_config)` builds the renderer up to a point where
-      cell-size is known — actual swap-chain creation is deferred to the first
+   5. The process-global `Renderer` is initialized in place with its D3D11
+      backend. Its common state owns the cell metrics used by the rest of the
+      application; actual swap-chain creation is deferred to the first
       `render`.
    6. `window_geom.calcWindowPlacement` snaps a default 70%×80% rect to whole
       cells.
@@ -467,7 +470,15 @@ Kitty graphics support is wired through `vt_stream.zig` and
 
 ## 6. Rendering Pipeline
 
-### 6.1 Top-level renderer (`d3d11.zig`)
+### 6.1 Renderer facade and D3D11 backend
+
+The process-global `Renderer` (`Renderer.zig`) is the only boundary used by
+window, input, layout, and render orchestration code. It owns a
+backend-independent `RendererCommon` (cell size, tab-bar height, ligature
+setting, and adapter classification) plus a tagged backend union. D3D11 is the
+only available variant today; unimplemented backends are not selectable. The
+D3D11 backend borrows the common state rather than duplicating it, so font/DPI
+updates publish one authoritative set of metrics.
 
 The `d3d11` struct owns:
 
@@ -493,9 +504,10 @@ The `d3d11` struct owns:
 - background-image state (CPU pixels + GPU SRV + decode req-id + worker
   thread join state).
 
-Public entry points: `init`, `deinit`, `updateDpi`, `updateFont` (both
-trigger `font_state.rebuildAndAssign` → glyph cache reset + force full
-redraw), `reloadBackgroundImage`, and `render`.
+The facade exposes `init`, `deinit`, `updateDpi`, `updateFont` (both trigger
+`font_state.rebuildAndAssign` → glyph cache reset + force full redraw),
+`reloadBackgroundImage`, and `render`, and dispatches them to the active
+backend.
 
 ### 6.2 Per-frame orchestration
 

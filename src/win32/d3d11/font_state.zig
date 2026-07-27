@@ -218,9 +218,9 @@ pub fn rebuildAndAssign(self: *D3d11Renderer, dpi: u32, eff: Effective) void {
     self.tabbar_text_format = fmts.tabbar_format;
     self.tabbar_fallback = fmts.tabbar_fallback;
     self.tabbar_trimming_sign = fmts.tabbar_trimming_sign;
-    self.cell_size = fmts.cell_size;
+    self.common.cell_size = fmts.cell_size;
     self.cell_size_xy = fmts.cell_size_xy;
-    self.tab_bar_height = fmts.tab_bar_height;
+    self.common.tab_bar_height = fmts.tab_bar_height;
 
     self.dpi = dpi;
     self.font_size_pt = eff.font_size_pt;
