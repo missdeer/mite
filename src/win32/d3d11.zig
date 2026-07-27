@@ -24,6 +24,7 @@ const font_state = @import("d3d11/font_state.zig");
 const cell_buffer = @import("d3d11/cell_buffer.zig");
 const grid = @import("d3d11/grid.zig");
 const diag = @import("diag.zig");
+const shader_assets = @import("shader_assets.zig");
 
 // Re-exported so external callers (window message handlers) stay agnostic
 // to the internal module layout.
@@ -305,41 +306,35 @@ pub fn init(common: *RendererCommon, dpi: u32, font_config: FontConfig, font_lig
         },
     );
 
-    // Compile shaders
-    const shader_source = @embedFile("terminal.hlsl");
-
-    const vs_blob = gpu.compileShaderBlob(shader_source, "VertexMain", "vs_5_0");
-    defer _ = vs_blob.IUnknown.Release();
+    // Load the build-time shader assets. Runtime compilation would delay
+    // startup and could silently diverge from the SPIR-V produced for future
+    // backends.
     var vertex_shader: *win32.ID3D11VertexShader = undefined;
     {
         const hr = device.CreateVertexShader(
-            @ptrCast(vs_blob.GetBufferPointer()),
-            vs_blob.GetBufferSize(),
+            shader_assets.vertex.directx.ptr,
+            shader_assets.vertex.directx.len,
             null,
             &vertex_shader,
         );
         if (hr < 0) fatalHr("CreateVertexShader", hr);
     }
 
-    const ps_blob = gpu.compileShaderBlob(shader_source, "PixelMain", "ps_5_0");
-    defer _ = ps_blob.IUnknown.Release();
     var pixel_shader: *win32.ID3D11PixelShader = undefined;
     {
         const hr = device.CreatePixelShader(
-            @ptrCast(ps_blob.GetBufferPointer()),
-            ps_blob.GetBufferSize(),
+            shader_assets.pixel.directx.ptr,
+            shader_assets.pixel.directx.len,
             null,
             &pixel_shader,
         );
         if (hr < 0) fatalHr("CreatePixelShader", hr);
     }
-    const image_ps_blob = gpu.compileShaderBlob(shader_source, "ImagePixelMain", "ps_5_0");
-    defer _ = image_ps_blob.IUnknown.Release();
     var image_pixel_shader: *win32.ID3D11PixelShader = undefined;
     {
         const hr = device.CreatePixelShader(
-            @ptrCast(image_ps_blob.GetBufferPointer()),
-            image_ps_blob.GetBufferSize(),
+            shader_assets.image_pixel.directx.ptr,
+            shader_assets.image_pixel.directx.len,
             null,
             &image_pixel_shader,
         );
@@ -1081,10 +1076,53 @@ pub fn releaseKittyImagesForTab(self: *D3d11Renderer, tab_id: types.TabId) void 
     self.grid_force_full = true;
 }
 
-test "terminal shader passes compile" {
-    const shader_source = @embedFile("terminal.hlsl");
-    const text_ps_blob = gpu.compileShaderBlob(shader_source, "PixelMain", "ps_5_0");
-    defer _ = text_ps_blob.IUnknown.Release();
-    const ps_blob = gpu.compileShaderBlob(shader_source, "ImagePixelMain", "ps_5_0");
-    defer _ = ps_blob.IUnknown.Release();
+test "D3D11 accepts every generated DirectX shader asset" {
+    var device: *win32.ID3D11Device = undefined;
+    var context: *win32.ID3D11DeviceContext = undefined;
+    const levels = [_]win32.D3D_FEATURE_LEVEL{.@"11_0"};
+    const hr = win32.D3D11CreateDevice(
+        null,
+        .WARP,
+        null,
+        .{},
+        &levels,
+        levels.len,
+        win32.D3D11_SDK_VERSION,
+        &device,
+        null,
+        &context,
+    );
+    try std.testing.expect(hr >= 0);
+    defer _ = context.IUnknown.Release();
+    defer _ = device.IUnknown.Release();
+
+    var vertex_shader: *win32.ID3D11VertexShader = undefined;
+    const vertex_hr = device.CreateVertexShader(
+        shader_assets.vertex.directx.ptr,
+        shader_assets.vertex.directx.len,
+        null,
+        &vertex_shader,
+    );
+    try std.testing.expect(vertex_hr >= 0);
+    defer _ = vertex_shader.IUnknown.Release();
+
+    var pixel_shader: *win32.ID3D11PixelShader = undefined;
+    const pixel_hr = device.CreatePixelShader(
+        shader_assets.pixel.directx.ptr,
+        shader_assets.pixel.directx.len,
+        null,
+        &pixel_shader,
+    );
+    try std.testing.expect(pixel_hr >= 0);
+    defer _ = pixel_shader.IUnknown.Release();
+
+    var image_pixel_shader: *win32.ID3D11PixelShader = undefined;
+    const image_pixel_hr = device.CreatePixelShader(
+        shader_assets.image_pixel.directx.ptr,
+        shader_assets.image_pixel.directx.len,
+        null,
+        &image_pixel_shader,
+    );
+    try std.testing.expect(image_pixel_hr >= 0);
+    defer _ = image_pixel_shader.IUnknown.Release();
 }

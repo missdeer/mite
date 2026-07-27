@@ -30,6 +30,13 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Install shader toolchain
+        shell: pwsh
+        run: >-
+          winget install --id KhronosGroup.VulkanSDK --version 1.4.350.0 --exact
+          --silent --disable-interactivity --accept-package-agreements
+          --accept-source-agreements
+
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }} -Dcpu=${{ matrix.cpu }}
 

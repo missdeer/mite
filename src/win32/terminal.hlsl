@@ -1,4 +1,10 @@
-cbuffer GridConfig : register(b0)
+#ifdef SPIRV
+#define VK_BINDING(slot) [[vk::binding(slot, 0)]]
+#else
+#define VK_BINDING(slot)
+#endif
+
+VK_BINDING(0) cbuffer GridConfig : register(b0)
 {
     uint2 cell_size;
     uint col_count;
@@ -30,13 +36,13 @@ struct Cell
     uint fg;
     uint attrs;
 };
-StructuredBuffer<Cell> cells : register(t0);
-Texture2D<float4> glyph_texture : register(t1);
-Texture2D<float4> bg_image : register(t2);
-Texture2D<float4> inline_image : register(t3);
-SamplerState bg_sampler : register(s0);
+VK_BINDING(1) StructuredBuffer<Cell> cells : register(t0);
+VK_BINDING(2) Texture2D<float4> glyph_texture : register(t1);
+VK_BINDING(3) Texture2D<float4> bg_image : register(t2);
+VK_BINDING(5) Texture2D<float4> inline_image : register(t3);
+VK_BINDING(4) SamplerState bg_sampler : register(s0);
 
-cbuffer ImageConfig : register(b0)
+VK_BINDING(0) cbuffer ImageConfig : register(b0)
 {
     float4 image_dest;
     float4 image_source;

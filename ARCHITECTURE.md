@@ -5,7 +5,7 @@ of every key path. Mostty is a Windows-only terminal emulator that pairs Ghostty
 VT state machine (`libghostty-vt`) with a hand-rolled Win32 / D3D11 /
 DirectWrite shell.
 
-Pinned versions: Zig `0.15.2`, Windows + MSVC ABI only. Build with
+Pinned versions: Zig `0.15.2`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI only. The build also requires Windows SDK `fxc.exe` and Vulkan SDK `dxc.exe` / `spirv-val.exe`. Build with
 `cmd.exe /c "D:\zig-x86_64-windows-0.15.2\zig.exe build --global-cache-dir D:\zig-cache"`.
 
 ---
@@ -483,7 +483,7 @@ updates publish one authoritative set of metrics.
 The `d3d11` struct owns:
 
 - `device`, `context` (created lazily at first `init`),
-- compiled vertex/pixel shaders from `terminal.hlsl`,
+- build-time vertex/pixel shader assets generated from `terminal.hlsl`,
 - `GridConfig` constant buffer,
 - `font` / `font_state` (DirectWrite text formats, cell metrics, fallback
   chains),
@@ -508,6 +508,16 @@ The facade exposes `init`, `deinit`, `updateDpi`, `updateFont` (both trigger
 `font_state.rebuildAndAssign` → glyph cache reset + force full redraw),
 `reloadBackgroundImage`, and `render`, and dispatches them to the active
 backend.
+
+The shader build graph treats `terminal.hlsl` as the single source of truth.
+For each runtime entry point it produces an SM5/DXBC asset with the Windows SDK
+compiler for D3D11 and a Vulkan 1.1 SPIR-V asset with the Vulkan SDK DXC. Every
+SPIR-V output passes `spirv-val`; either target failing stops the build. D3D11
+embeds and loads only the DXBC side at startup, while the SPIR-V side remains a
+validated future-backend asset. Explicit Vulkan bindings keep constant buffers,
+structured cells, textures, and the sampler in one collision-free descriptor
+contract. SPIR-V runtime/visual equivalence is intentionally deferred until a
+backend consumes those assets.
 
 ### 6.2 Per-frame orchestration
 

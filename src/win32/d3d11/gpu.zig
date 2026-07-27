@@ -83,38 +83,6 @@ pub fn scrollbarWidth(dpi: u32) u16 {
     return @intFromFloat(@round(@as(f32, @floatFromInt(scrollbar_logical_width)) * @as(f32, @floatFromInt(dpi)) / 96.0));
 }
 
-pub fn compileShaderBlob(
-    source: []const u8,
-    entry: [*:0]const u8,
-    target: [*:0]const u8,
-) *win32.ID3DBlob {
-    var blob: *win32.ID3DBlob = undefined;
-    var error_blob: ?*win32.ID3DBlob = null;
-    const hr = win32.D3DCompile(
-        source.ptr,
-        source.len,
-        "terminal.hlsl",
-        null,
-        null,
-        entry,
-        target,
-        0,
-        0,
-        @ptrCast(&blob),
-        @ptrCast(&error_blob),
-    );
-    if (error_blob) |err| {
-        defer _ = err.IUnknown.Release();
-        if (err.GetBufferPointer()) |buf_ptr| {
-            const ptr: [*]const u8 = @ptrCast(buf_ptr);
-            const str = ptr[0..err.GetBufferSize()];
-            log.err("shader error:\n{s}", .{str});
-        }
-    }
-    if (hr < 0) com.fatalHr("D3DCompile", hr);
-    return blob;
-}
-
 pub fn getTextureMaxCellCount(cell_size: CellXY) CellXY {
     // Cap the atlas to 4096² (≈64 MiB at BGRA8). At typical cell sizes this
     // holds ~75k glyphs, far above any realistic terminal session. Each
