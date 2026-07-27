@@ -494,7 +494,7 @@ fn visualFromCell(
         fg = cursor_fg_rgba;
     }
 
-    const style_kind = self.effective_style[@intFromEnum(glyph_mod.styleFromFlags(bold, italic))];
+    const style_kind = self.font_service.effective_style[@intFromEnum(glyph_mod.styleFromFlags(bold, italic))];
     const shape_candidate = !cursor_hit and
         grapheme.len == 0 and
         (attrs & (gpu.cell_attr_color_glyph | gpu.cell_attr_invisible)) == 0 and

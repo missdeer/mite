@@ -1,5 +1,5 @@
-//! Font / DPI lifecycle subroutine shared by `init`, `updateDpi`, and
-//! `updateFont`. Each of those callers used to inline 60+ lines of
+//! Font / DPI lifecycle subroutine owned by the process-level font service.
+//! The service's init, DPI update, and font update all share the same
 //! "rebuild text formats + tab-bar format + cell metrics + tab_bar_height
 //! + invalidate glyph cache + grid_force_full" with the same field-write
 //! order and the same release-then-rebuild pattern.
@@ -14,7 +14,6 @@
 
 const std = @import("std");
 const win32 = @import("win32").everything;
-const D3d11Renderer = @import("../d3d11.zig");
 const font_mod = @import("font.zig");
 const gpu = @import("gpu.zig");
 const GlyphIndexCache = @import("../GlyphIndexCache.zig");
@@ -101,7 +100,7 @@ pub fn deriveFromConfig(
 // Snapshot `Effective` from current renderer state. Used by `updateDpi`,
 // where the font config is unchanged but DPI-dependent formats and metrics
 // must be rebuilt.
-pub fn snapshotFromRenderer(self: *D3d11Renderer) Effective {
+pub fn snapshot(self: anytype) Effective {
     return .{
         .primary = self.effective_primary,
         .user_fallbacks = self.effective_user_fallbacks,
@@ -193,7 +192,7 @@ pub fn buildFormats(
 //
 // Shared subroutine for `updateDpi` and `updateFont`. Both end up needing
 // the same sequence; the only difference is where `eff` comes from.
-pub fn rebuildAndAssign(self: *D3d11Renderer, dpi: u32, eff: Effective) void {
+pub fn rebuildAndAssign(self: anytype, dpi: u32, eff: Effective) void {
     font_mod.releaseTextFormatSet(&self.text_formats, &self.font_fallbacks);
     {
         var old_emoji: font_mod.EmojiFormat = .{
@@ -234,25 +233,6 @@ pub fn rebuildAndAssign(self: *D3d11Renderer, dpi: u32, eff: Effective) void {
     self.effective_codepoint_maps = eff.codepoint_maps;
     self.effective_tabbar_primary = eff.tabbar_primary;
     self.tabbar_font_size_pt = eff.tabbar_font_size_pt;
-
-    invalidateGlyphCache(self);
-    self.grid_force_full = true;
-}
-
-// Drop the glyph atlas LRU and reset the arena that backs it. Called after
-// any font/DPI change so glyphs re-rasterize at the new face/size.
-pub fn invalidateGlyphCache(self: *D3d11Renderer) void {
-    // Bump before tearing down: in-flight raster jobs captured the old
-    // cache_gen at submit time; applyGlyphResult will reject them before
-    // they land in the new atlas (font/DPI change resizes cells, so a
-    // stale upload would write past slot boundaries).
-    self.cache_gen +%= 1;
-    if (self.glyph_cache) |*c| {
-        c.deinit(self.glyph_cache_arena.allocator());
-        self.glyph_cache = null;
-    }
-    _ = self.glyph_cache_arena.reset(.free_all);
-    self.glyph_cache_cell_size = null;
 }
 
 // Band height = tab-bar font line height (or terminal cell height when the

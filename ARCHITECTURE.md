@@ -52,6 +52,7 @@ src/
     # Renderer
     Renderer.zig          stable facade + tagged backend union
     RendererCommon.zig    backend-independent metrics/adapter state
+    FontService.zig       process-lifetime DirectWrite/D2D + font D3D11 owner
     d3d11.zig              top-level renderer struct; init / render / resize / deinit
     render.zig             renderWindow orchestration (state → renderer.render)
     GlyphIndexCache.zig    circular-LRU mapping (codepoint,half,style) → atlas slot
@@ -473,22 +474,29 @@ Kitty graphics support is wired through `vt_stream.zig` and
 ### 6.1 Renderer facade and D3D11 backend
 
 The process-global `Renderer` (`Renderer.zig`) is the only boundary used by
-window, input, layout, and render orchestration code. It owns a
-backend-independent `RendererCommon` (cell size, tab-bar height, ligature
-setting, and adapter classification) plus a tagged backend union. D3D11 is the
-only available variant today; unimplemented backends are not selectable. The
-D3D11 backend borrows the common state rather than duplicating it, so font/DPI
-updates publish one authoritative set of metrics.
+window, input, layout, and render orchestration code. It owns a process-lifetime
+`FontService`, a backend-independent `RendererCommon` (cell size, tab-bar
+height, ligature setting, and adapter classification), plus a tagged backend
+union. D3D11 is the only available variant today; unimplemented backends are
+not selectable. The font service publishes font/DPI metrics into the common
+state, while D3D11 borrows both and keeps no authoritative font state.
+
+`FontService` owns DirectWrite formats/fallbacks, its D2D factory, the glyph
+worker, and a dedicated D3D11 device/context used for D2D-compatible font
+surfaces. It is initialized before the backend and destroyed after it, so a
+backend lifecycle never determines font lifetime. D2D glyph staging and the
+tab-bar band use keyed shared textures: the service writes under key 0 and
+hands off key 1; D3D11 imports the texture on its own device, copies the result,
+then returns key 0. Atlas slots, result validation, and presentation remain
+backend responsibilities.
 
 The `d3d11` struct owns:
 
 - `device`, `context` (created lazily at first `init`),
 - build-time vertex/pixel shader assets generated from `terminal.hlsl`,
 - `GridConfig` constant buffer,
-- `font` / `font_state` (DirectWrite text formats, cell metrics, fallback
-  chains),
-- `glyph_cache` (`GlyphIndexCache`) + glyph atlas texture + two D2D staging
-  textures (mask for ClearType, color for emoji),
+- `glyph_cache` (`GlyphIndexCache`) + glyph atlas texture + two shared staging
+  imports (mask for ClearType, color for emoji),
 - swap chain (created on first frame via DirectComposition: an
   `IDXGISwapChain1` cast to `IDXGISwapChain2`, bound to a DComposition
   visual and pushed to the HWND). `BufferCount = 3` so a third back
@@ -504,8 +512,8 @@ The `d3d11` struct owns:
 - background-image state (CPU pixels + GPU SRV + decode req-id + worker
   thread join state).
 
-The facade exposes `init`, `deinit`, `updateDpi`, `updateFont` (both trigger
-`font_state.rebuildAndAssign` → glyph cache reset + force full redraw),
+The facade exposes `init`, `deinit`, `updateDpi`, `updateFont` (both rebuild the
+font service state, then reset the active backend glyph cache and force a full redraw),
 `reloadBackgroundImage`, and `render`, and dispatches them to the active
 backend.
 
@@ -627,9 +635,10 @@ On a miss, `glyph.zig:generateGlyph` picks a path:
 - **DirectWrite path** (`renderGlyphToStaging`): build an
   `IDWriteTextLayout` over the format selected by current style and
   emoji-routing rules, measure ink bounds, optionally center / scale for
-  ambiguous symbols (●✶★), render to the mask staging texture for
-  ClearType text or the color staging texture for COLR/CBDT emoji, then
-  `copyStagingHalfToAtlas` into the slot.
+  ambiguous symbols (●✶★), render on the font service device to the mask
+  staging texture for ClearType text or the color staging texture for
+  COLR/CBDT emoji, then import the keyed shared surface on the backend device
+  and copy the required half into the atlas slot.
 
 Both staging textures are pinned to 96 DPI + PIXEL unit mode so DIPs map
 1:1 to atlas pixels.
@@ -660,9 +669,10 @@ shift monospace alignment.
 - **Tab bar** (`d3d11/tabbar_paint.zig`): proportional D2D painter — for
   each tab, fills a rectangle (active/hover/inactive color) and draws the
   title with the tab-bar text format, then centers `×` (close) and `+`
-  (new tab). The band is painted into an offscreen 96-DPI target and
-  copied onto the top strip of the back buffer. Cells start *below* the
-  band: `SV_Position.y - tab_bar_height` in the pixel shader.
+  (new tab). The band is painted into an offscreen 96-DPI target owned by the
+  font service, imported through the keyed shared-texture bridge, and copied
+  onto the top strip of the back buffer. Cells start *below* the band:
+  `SV_Position.y - tab_bar_height` in the pixel shader.
 - **Background image**: `reloadBackgroundImage` increments
   `bg_image_req_id` to stale any in-flight worker, then detaches
   `decodeWorker` which calls `gpu.decodeBackground` (WIC), posts

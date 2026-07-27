@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const vt = @import("vt");
 const win32 = @import("win32").everything;
 const GlyphIndexCache = @import("GlyphIndexCache.zig");
+const FontService = @import("FontService.zig");
 const RendererCommon = @import("RendererCommon.zig");
 const types = @import("types.zig");
 const Config = @import("../Config.zig");
@@ -13,14 +14,11 @@ const com = @import("d3d11/com.zig");
 const gpu = @import("d3d11/gpu.zig");
 const color = @import("d3d11/color.zig");
 const emoji = @import("d3d11/emoji.zig");
-const font_mod = @import("d3d11/font.zig");
 const glyph_mod = @import("d3d11/glyph.zig");
-const glyph_worker_mod = @import("d3d11/glyph_worker.zig");
 const kitty_image_mod = @import("d3d11/kitty_images.zig");
 const tabbar_paint = @import("d3d11/tabbar_paint.zig");
 const bg_image = @import("d3d11/background_image.zig");
 const swap_chain_mod = @import("d3d11/swap_chain.zig");
-const font_state = @import("d3d11/font_state.zig");
 const cell_buffer = @import("d3d11/cell_buffer.zig");
 const grid = @import("d3d11/grid.zig");
 const diag = @import("diag.zig");
@@ -29,26 +27,19 @@ const shader_assets = @import("shader_assets.zig");
 // Re-exported so external callers (window message handlers) stay agnostic
 // to the internal module layout.
 pub const BgImageDecoded = bg_image.BgImageDecoded;
-pub const RasterResult = glyph_worker_mod.RasterResult;
+pub const RasterResult = FontService.RasterResult;
 
 const log = std.log.scoped(.d3d);
 
 const DXGI_STATUS_OCCLUDED = swap_chain_mod.DXGI_STATUS_OCCLUDED;
 
-// Re-exports for external callers (state/render/tab_bar/tab_mgmt depend on
-// these). New code inside the renderer should prefer the module-qualified
-// names (`font_mod.FontConfig`, etc.).
-pub const FontConfig = font_mod.FontConfig;
 pub const scrollbarWidth = gpu.scrollbarWidth;
-pub const default_primary_font_family = font_mod.default_primary_font_family;
-pub const default_font_size_pt = font_mod.default_font_size_pt;
 
 const Rgba8 = gpu.Rgba8;
 const CellXY = gpu.CellXY;
 const shader = gpu.shader;
 const ShaderCells = gpu.ShaderCells;
 const GlyphTexture = gpu.GlyphTexture;
-const StagingTexture = gpu.StagingTexture;
 const fatalHr = com.fatalHr;
 const oom = com.oom;
 
@@ -74,6 +65,7 @@ const DebugStats = struct {
 
 // D3D11 core
 common: *RendererCommon,
+font_service: *FontService,
 device: *win32.ID3D11Device,
 context: *win32.ID3D11DeviceContext,
 
@@ -84,22 +76,6 @@ const_buf: *win32.ID3D11Buffer,
 image_pixel_shader: *win32.ID3D11PixelShader,
 image_const_buf: *win32.ID3D11Buffer,
 image_blend_state: *win32.ID3D11BlendState,
-
-// DirectWrite
-dwrite_factory: *win32.IDWriteFactory2,
-d2d_factory: *win32.ID2D1Factory,
-// One IDWriteTextFormat per (bold, italic) combination, indexed by
-// `@intFromEnum(GlyphIndexCache.Style)`. Each format owns its own preferred
-// family AND fallback chain so style-specific families can be plumbed
-// independently (Step 2.2). When the user doesn't set a style-family it
-// inherits the regular primary, and DirectWrite's synthetic bold/oblique
-// kicks in via the format's weight/style.
-text_formats: [4]*win32.IDWriteTextFormat,
-font_fallbacks: [4]*win32.IDWriteFontFallback,
-emoji_text_format: *win32.IDWriteTextFormat,
-emoji_fallback: *win32.IDWriteFontFallback,
-rendering_params: *win32.IDWriteRenderingParams,
-dpi: u32,
 
 // DirectComposition
 dcomp_device: *win32.IDCompositionDevice = undefined,
@@ -124,7 +100,7 @@ glyph_texture: GlyphTexture = .{},
 glyph_cache_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
 glyph_cache: ?GlyphIndexCache = null,
 glyph_cache_cell_size: ?CellXY = null,
-staging_texture: StagingTexture = .{},
+glyph_staging_bridge: gpu.SharedTexture = .{},
 
 stats: DebugStats = .{},
 // Set by Present when DXGI returns DXGI_STATUS_OCCLUDED (window fully
@@ -170,47 +146,7 @@ scissor_rasterizer_state: ?*win32.ID3D11RasterizerState = null,
 grid_force_full: bool = true,
 last_const_snapshot: grid.ConfigSnapshot = .{},
 
-cell_size_xy: CellXY,
-
-// Effective font configuration (defaults if user didn't override). Lifetimes
-// of the [*:0]u16 strings are owned by the caller of `init`.
-font_size_pt: f32,
-font_features: []const FontConfig.FontFeature = &.{},
-effective_primary: [*:0]const u16,
-// Per-style primary overrides for bold/italic/bold-italic respectively.
-// null entry == inherit regular primary. Held so updateDpi can rebuild
-// text_formats without the caller re-supplying the font config.
-effective_style_primaries: [3]?[*:0]const u16,
-// Active `font-style*` pins retained for updateDpi rebuilds. Pointers into
-// the caller's UTF-16 storage; same leak-by-design lifetime as families.
-effective_style_specs: [4]FontConfig.StyleSpec,
-// Maps a requested style (from styleFromFlags) to the style slot actually
-// used at render time. Identity by default; entries 1..3 may collapse to 0
-// when synthesis is disabled AND the chosen family lacks a real face.
-// The cache key uses the EFFECTIVE style so suppressed cells share the
-// regular atlas slots — no redundant entries for identical pixels.
-effective_style: [4]GlyphIndexCache.Style,
-effective_user_fallbacks: []const [*:0]const u16,
-effective_emoji_families: []const [*:0]const u16,
-effective_codepoint_maps: []const FontConfig.CodepointMapEntry,
-
-// Tab-bar title text format (regular weight only). Built from the tab-bar
-// family/size overrides, falling back to the terminal primary/size. Rebuilt
-// alongside text_formats on DPI change and font hot-reload. Consumed by the
-// proportional band painter (tabbar_paint), which draws directly with D2D —
-// the tab bar does not go through the glyph atlas.
-tabbar_text_format: *win32.IDWriteTextFormat,
-tabbar_fallback: *win32.IDWriteFontFallback,
-// Ellipsis sign for the tab-bar format, cached so the per-frame painter reuses
-// it. Rebuilt with the format on DPI/font change.
-tabbar_trimming_sign: ?*win32.IDWriteInlineObject,
-effective_tabbar_primary: [*:0]const u16,
-tabbar_font_size_pt: f32,
-// `common.tab_bar_height` is the physical-pixel band height computed from
-// this format and consumed by grid geometry and input hit testing.
-// Offscreen target the tab bar is painted into, then copied onto the back
-// buffer's top strip. Recreated on resize / height change by getOrCreate.
-band_texture: gpu.BandTexture = .{},
+band_bridge: gpu.SharedTexture = .{},
 // Back-buffer texture retained so the persistent grid texture and tab-bar band
 // can be copied into the current flip-model back buffer. Released/reacquired
 // on swap-chain resize.
@@ -236,13 +172,6 @@ bg_sampler: ?*win32.ID3D11SamplerState = null,
 bg_image_req_id: u32 = 0,
 kitty_images: kitty_image_mod.Cache = .{},
 
-// Async DirectWrite raster worker. The struct stays `undefined` until
-// `setWorkerHwnd` calls `Worker.start` and flips `glyph_worker_started`.
-// Every code path that touches `glyph_worker` (submit, shutdown) must
-// gate on the flag — reading any field before start is UB.
-glyph_worker: glyph_worker_mod.Worker = undefined,
-glyph_worker_started: bool = false,
-
 // Monotonic counter bumped whenever the glyph cache / atlas is rebuilt
 // (font reload, DPI change, atlas resize). In-flight raster jobs carry
 // the value captured at submit time; results whose cache_gen no longer
@@ -251,18 +180,7 @@ glyph_worker_started: bool = false,
 // of the whole cache being thrown out.
 cache_gen: u32 = 0,
 
-pub fn cellSizeForDpi(self: *D3d11Renderer, dpi: u32) win32.SIZE {
-    if (dpi == self.dpi) return self.common.cell_size;
-    return font_mod.measureCellSize(&self.dwrite_factory.IDWriteFactory, dpi, self.effective_primary, self.font_size_pt);
-}
-
-pub fn tabBarHeightForDpi(self: *D3d11Renderer, dpi: u32) i32 {
-    if (dpi == self.dpi) return self.common.tab_bar_height;
-    const cs = self.cellSizeForDpi(dpi);
-    return font_state.computeTabBarHeight(self.dwrite_factory, dpi, self.effective_tabbar_primary, self.tabbar_font_size_pt, @intCast(cs.cy));
-}
-
-pub fn init(common: *RendererCommon, dpi: u32, font_config: FontConfig, font_ligatures: bool, configured_gpu: ?[]const u8) D3d11Renderer {
+pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu: ?[]const u8) D3d11Renderer {
     // Create D3D11 device
     const levels = [_]win32.D3D_FEATURE_LEVEL{.@"11_0"};
     var device: *win32.ID3D11Device = undefined;
@@ -369,42 +287,11 @@ pub fn init(common: *RendererCommon, dpi: u32, font_config: FontConfig, font_lig
         if (hr < 0) fatalHr("CreateConstBuffer(image)", hr);
     }
 
-    // DirectWrite (factory2 for custom font fallback support, Win 8.1+)
-    var dwrite_factory: *win32.IDWriteFactory2 = undefined;
-    {
-        const hr = win32.DWriteCreateFactory(
-            win32.DWRITE_FACTORY_TYPE_SHARED,
-            win32.IID_IDWriteFactory2,
-            @ptrCast(&dwrite_factory),
-        );
-        if (hr < 0) fatalHr("DWriteCreateFactory", hr);
-    }
-    const rendering_params = font_mod.buildRenderingParams(&dwrite_factory.IDWriteFactory);
-
-    const eff = font_state.deriveFromConfig(dwrite_factory, font_config);
-    const fmts = font_state.buildFormats(dwrite_factory, dpi, eff);
-
-    // Direct2D factory for glyph rendering
-    var d2d_factory: *win32.ID2D1Factory = undefined;
-    {
-        const hr = win32.D2D1CreateFactory(
-            .SINGLE_THREADED,
-            win32.IID_ID2D1Factory,
-            null,
-            @ptrCast(&d2d_factory),
-        );
-        if (hr < 0) fatalHr("D2D1CreateFactory", hr);
-    }
-
-    common.* = .{
-        .cell_size = fmts.cell_size,
-        .tab_bar_height = fmts.tab_bar_height,
-        .font_ligatures = font_ligatures,
-        .remote_or_software_adapter = adapter_info.remote_or_software,
-    };
+    common.remote_or_software_adapter = adapter_info.remote_or_software;
 
     return .{
         .common = common,
+        .font_service = font_service,
         .device = device,
         .context = context,
         .vertex_shader = vertex_shader,
@@ -413,67 +300,29 @@ pub fn init(common: *RendererCommon, dpi: u32, font_config: FontConfig, font_lig
         .image_pixel_shader = image_pixel_shader,
         .image_const_buf = image_const_buf,
         .image_blend_state = kitty_image_mod.createBlendState(device),
-        .dwrite_factory = dwrite_factory,
-        .d2d_factory = d2d_factory,
-        .text_formats = fmts.text_formats,
-        .font_fallbacks = fmts.font_fallbacks,
-        .emoji_text_format = fmts.emoji_format,
-        .emoji_fallback = fmts.emoji_fallback,
-        .rendering_params = rendering_params,
-        .cell_size_xy = fmts.cell_size_xy,
-        .dpi = dpi,
-        .font_size_pt = eff.font_size_pt,
-        .font_features = eff.font_features,
-        .effective_primary = eff.primary,
-        .effective_style_primaries = eff.style_primaries,
-        .effective_style_specs = eff.style_specs,
-        .effective_style = eff.style,
-        .effective_user_fallbacks = eff.user_fallbacks,
-        .effective_emoji_families = eff.emoji_families,
-        .effective_codepoint_maps = eff.codepoint_maps,
-        .tabbar_text_format = fmts.tabbar_format,
-        .tabbar_fallback = fmts.tabbar_fallback,
-        .tabbar_trimming_sign = fmts.tabbar_trimming_sign,
-        .effective_tabbar_primary = eff.tabbar_primary,
-        .tabbar_font_size_pt = eff.tabbar_font_size_pt,
     };
 }
 
-pub fn updateDpi(self: *D3d11Renderer, dpi: u32) void {
-    if (dpi == self.dpi) return;
-    // DPI alone doesn't change effective font config (family bindings,
-    // style synthesis, code-point maps); only the DPI-dependent formats
-    // and metrics need rebuilding.
-    font_state.rebuildAndAssign(self, dpi, font_state.snapshotFromRenderer(self));
-}
-
-// Re-applies font configuration at runtime (config hot-reload). The caller
-// owns the lifetime of the [*:0]u16 strings in `font_config` (same contract
-// as `init`); the renderer keeps pointers into them via
-// `effective_primary`/`effective_user_fallbacks`.
-pub fn updateFont(self: *D3d11Renderer, font_config: FontConfig) void {
-    const eff = font_state.deriveFromConfig(self.dwrite_factory, font_config);
-    font_state.rebuildAndAssign(self, self.dpi, eff);
+pub fn onFontStateChanged(self: *D3d11Renderer) void {
+    self.cache_gen +%= 1;
+    if (self.glyph_cache) |*cache| {
+        cache.deinit(self.glyph_cache_arena.allocator());
+        self.glyph_cache = null;
+    }
+    _ = self.glyph_cache_arena.reset(.free_all);
+    self.glyph_cache_cell_size = null;
+    self.grid_force_full = true;
 }
 
 pub fn deinit(self: *D3d11Renderer) void {
-    if (self.glyph_worker_started) {
-        self.glyph_worker.shutdown();
-        // The worker thread is joined; no new WM_APP_GLYPH_READY can be
-        // posted. Drain any results that were posted before shutdown ran
-        // but never dispatched (e.g. a renderer teardown that beats the
-        // message loop to the punch), otherwise each one leaks its
-        // heap-owned `RasterResult` + bytes.
-        drainGlyphReadyQueue(self.glyph_worker.gpa);
-    }
     if (comptime debug_stats_enabled) {
         const total = self.stats.rows_uploaded + self.stats.rows_skipped;
         const skip_pct: f64 = if (total == 0) 0.0 else @as(f64, @floatFromInt(self.stats.rows_skipped)) / @as(f64, @floatFromInt(total)) * 100.0;
         log.info("uploadCellRow stats: uploaded={d} skipped={d} ({d:.1}% skipped)", .{ self.stats.rows_uploaded, self.stats.rows_skipped, skip_pct });
     }
-    self.staging_texture.release();
+    self.glyph_staging_bridge.release();
+    self.band_bridge.release();
     self.kitty_images.deinit(std.heap.page_allocator);
-    self.band_texture.release();
     if (self.glyph_cache) |*c| {
         c.deinit(self.glyph_cache_arena.allocator());
         self.glyph_cache = null;
@@ -516,21 +365,6 @@ pub fn deinit(self: *D3d11Renderer) void {
         _ = win32.CloseHandle(h);
         self.frame_latency_waitable = null;
     }
-    _ = self.d2d_factory.IUnknown.Release();
-    font_mod.releaseTextFormatSet(&self.text_formats, &self.font_fallbacks);
-    {
-        var emoji_fmt: font_mod.EmojiFormat = .{
-            .format = self.emoji_text_format,
-            .fallback = self.emoji_fallback,
-        };
-        font_mod.releaseEmojiFormat(&emoji_fmt);
-    }
-    {
-        var tabbar: font_mod.TabBarFormat = .{ .format = self.tabbar_text_format, .fallback = self.tabbar_fallback, .trimming_sign = self.tabbar_trimming_sign };
-        font_mod.releaseTabBarFormat(&tabbar);
-    }
-    _ = self.rendering_params.IUnknown.Release();
-    _ = self.dwrite_factory.IUnknown.Release();
     _ = self.const_buf.IUnknown.Release();
     _ = self.image_blend_state.IUnknown.Release();
     _ = self.image_const_buf.IUnknown.Release();
@@ -761,7 +595,7 @@ fn prepareFrame(
     grid.ensureTexture(self, client_w, client_h);
     _ = grid.ensureScissorRasterizerState(self);
 
-    const cs = self.cell_size_xy;
+    const cs = self.font_service.cell_size_xy;
     const sb_px: u32 = scrollbarWidth(win32.dpiFromHwnd(hwnd));
     const grid_w: u32 = client_w -| sb_px;
     const shader_col: u32 = @divTrunc(grid_w + cs.x - 1, cs.x);
@@ -899,17 +733,26 @@ fn paintChromeAndPresent(self: *D3d11Renderer, prepared: PreparedFrame, tabbar: 
     // the texture).
     if (prepared.tab_bar_h > 0) {
         self.diag_tabbar_paints += 1;
-        const band = self.band_texture.getOrCreate(self.device, self.d2d_factory, prepared.client_w, prepared.tab_bar_h);
+        const band = self.font_service.band_texture.getOrCreate(
+            self.font_service.device,
+            self.font_service.d2d_factory,
+            prepared.client_w,
+            prepared.tab_bar_h,
+        );
+        gpu.acquireFontWrite(band.mutex);
         tabbar_paint.paint(
             band.render_target,
             band.brush,
-            &self.dwrite_factory.IDWriteFactory,
-            self.tabbar_text_format,
-            self.tabbar_trimming_sign,
+            &self.font_service.dwrite_factory.IDWriteFactory,
+            self.font_service.tabbar_text_format,
+            self.font_service.tabbar_trimming_sign,
             tabbar,
             prepared.cs.x,
             prepared.tab_bar_h,
         );
+        gpu.releaseFontWrite(band.mutex);
+        const imported_band = self.band_bridge.acquireRead(self.device, band.texture);
+        defer self.band_bridge.releaseRead();
         // Unbind the RTV so the back buffer can be a CopySubresourceRegion dest.
         self.context.OMSetRenderTargets(0, null, null);
         if (self.back_buffer_tex) |bb| {
@@ -922,7 +765,7 @@ fn paintChromeAndPresent(self: *D3d11Renderer, prepared: PreparedFrame, tabbar: 
                 .bottom = copy_h,
                 .back = 1,
             };
-            self.context.CopySubresourceRegion(&bb.ID3D11Resource, 0, 0, 0, 0, &band.texture.ID3D11Resource, 0, &src_box);
+            self.context.CopySubresourceRegion(&bb.ID3D11Resource, 0, 0, 0, 0, &imported_band.ID3D11Resource, 0, &src_box);
         }
     }
 
@@ -983,21 +826,6 @@ fn maybeLogDiag(self: *D3d11Renderer, client_w: u32, client_h: u32, cols: u32, r
     self.diag_rows_skipped = 0;
 }
 
-// Starts the glyph raster worker thread and binds its result-delivery HWND.
-// Called once from mosttywindows.zig after CreateWindowExW returns — the
-// renderer is at its final address by then, so the thread can safely capture
-// `&self.glyph_worker`. No glyph jobs can be submitted before this point;
-// `submit` callsites live behind the per-frame render path that only runs
-// after the window exists.
-pub fn setWorkerHwnd(self: *D3d11Renderer, gpa: std.mem.Allocator, hwnd: win32.HWND) void {
-    self.glyph_worker.start(gpa, self.dwrite_factory) catch |e| {
-        log.warn("glyph raster worker spawn failed: {s}; falling back to UI-thread raster", .{@errorName(e)});
-        return;
-    };
-    self.glyph_worker_started = true;
-    self.glyph_worker.setHwnd(hwnd);
-}
-
 // Called by the WM_APP_GLYPH_READY handler. Validates the result against
 // the renderer-level `cache_gen` (covers full cache rebuilds) and the
 // cache's per-slot `gen` (covers in-cache slot reuse) before uploading the
@@ -1012,7 +840,7 @@ pub fn applyGlyphResult(self: *D3d11Renderer, result: *RasterResult) bool {
     if (result.failed) return cache.cancelPending(result.slot, result.slot_gen, result.key);
     if (!cache.markReady(result.slot, result.slot_gen, result.key)) return false;
 
-    const cs = self.cell_size_xy;
+    const cs = self.font_service.cell_size_xy;
     const tex_cell_count = gpu.getTextureMaxCellCount(cs);
     const pos = gpu.cellPosFromIndex(result.slot, tex_cell_count.x);
     const dst_x: u32 = @as(u32, cs.x) * pos.x;
@@ -1034,28 +862,6 @@ pub fn applyGlyphResult(self: *D3d11Renderer, result: *RasterResult) bool {
         0,
     );
     return true;
-}
-
-// Pop every WM_APP_GLYPH_READY still sitting in the calling thread's queue
-// and free its `RasterResult`. Hwnd-agnostic on purpose: PeekMessage with
-// hwnd=null picks up messages for any window owned by this thread, which is
-// what we want after the renderer's window has already torn down. The
-// message-ID filter guarantees we don't accidentally drain other WM_APPs
-// (BG_IMAGE_DECODED, etc) that have their own ownership rules.
-fn drainGlyphReadyQueue(gpa: std.mem.Allocator) void {
-    var msg: win32.MSG = undefined;
-    while (true) {
-        const got = win32.PeekMessageW(
-            &msg,
-            null,
-            types.WM_APP_GLYPH_READY,
-            types.WM_APP_GLYPH_READY,
-            win32.PM_REMOVE,
-        );
-        if (got == 0) break;
-        const result: *RasterResult = @ptrFromInt(@as(usize, @bitCast(msg.lParam)));
-        result.deinit(gpa);
-    }
 }
 
 pub fn reloadBackgroundImage(

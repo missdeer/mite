@@ -6,22 +6,24 @@ const win32 = @import("win32").everything;
 
 const Config = @import("../Config.zig");
 const d3d11 = @import("d3d11.zig");
+const FontService = @import("FontService.zig");
 const types = @import("types.zig");
 
 pub const RendererCommon = @import("RendererCommon.zig");
 
 pub const BgImageDecoded = d3d11.BgImageDecoded;
-pub const RasterResult = d3d11.RasterResult;
-pub const FontConfig = d3d11.FontConfig;
+pub const RasterResult = FontService.RasterResult;
+pub const FontConfig = FontService.FontConfig;
 pub const scrollbarWidth = d3d11.scrollbarWidth;
-pub const default_primary_font_family = d3d11.default_primary_font_family;
-pub const default_font_size_pt = d3d11.default_font_size_pt;
+pub const default_primary_font_family = FontService.default_primary_font_family;
+pub const default_font_size_pt = FontService.default_font_size_pt;
 
 pub const RendererBackend = union(enum) {
     d3d11: d3d11,
 };
 
 common: RendererCommon,
+font_service: FontService,
 backend: RendererBackend,
 
 // Initialize in place: the backend borrows `common`, and the async glyph
@@ -34,32 +36,38 @@ pub fn init(
     font_ligatures: bool,
     configured_gpu: ?[]const u8,
 ) void {
+    self.font_service = FontService.init(
+        &self.common,
+        dpi,
+        font_config,
+        font_ligatures,
+        configured_gpu,
+    );
     self.backend = .{
-        .d3d11 = d3d11.init(&self.common, dpi, font_config, font_ligatures, configured_gpu),
+        .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu),
     };
 }
 
 pub fn cellSizeForDpi(self: *Renderer, dpi: u32) win32.SIZE {
-    return switch (self.backend) {
-        inline else => |*backend| backend.cellSizeForDpi(dpi),
-    };
+    return self.font_service.cellSizeForDpi(dpi);
 }
 
 pub fn tabBarHeightForDpi(self: *Renderer, dpi: u32) i32 {
-    return switch (self.backend) {
-        inline else => |*backend| backend.tabBarHeightForDpi(dpi),
-    };
+    return self.font_service.tabBarHeightForDpi(dpi);
 }
 
 pub fn updateDpi(self: *Renderer, dpi: u32) void {
-    switch (self.backend) {
-        inline else => |*backend| backend.updateDpi(dpi),
+    if (self.font_service.updateDpi(dpi)) {
+        switch (self.backend) {
+            inline else => |*backend| backend.onFontStateChanged(),
+        }
     }
 }
 
 pub fn updateFont(self: *Renderer, font_config: FontConfig) void {
+    self.font_service.updateFont(font_config);
     switch (self.backend) {
-        inline else => |*backend| backend.updateFont(font_config),
+        inline else => |*backend| backend.onFontStateChanged(),
     }
 }
 
@@ -67,6 +75,7 @@ pub fn deinit(self: *Renderer) void {
     switch (self.backend) {
         inline else => |*backend| backend.deinit(),
     }
+    self.font_service.deinit();
     self.* = undefined;
 }
 
@@ -106,9 +115,7 @@ pub fn render(
 }
 
 pub fn setWorkerHwnd(self: *Renderer, gpa: std.mem.Allocator, hwnd: win32.HWND) void {
-    switch (self.backend) {
-        inline else => |*backend| backend.setWorkerHwnd(gpa, hwnd),
-    }
+    self.font_service.setWorkerHwnd(gpa, hwnd);
 }
 
 pub fn applyGlyphResult(self: *Renderer, result: *RasterResult) bool {
@@ -152,4 +159,15 @@ test "backend does not duplicate renderer common state" {
         try std.testing.expect(!@hasField(d3d11, field_name));
     }
     try std.testing.expect(@hasField(d3d11, "common"));
+}
+
+test "font service owns font and raster lifecycle outside the backend" {
+    try std.testing.expect(@hasField(Renderer, "font_service"));
+    try std.testing.expect(@hasField(FontService, "device"));
+    try std.testing.expect(@hasField(FontService, "glyph_worker"));
+    try std.testing.expect(@hasField(d3d11, "font_service"));
+    inline for (.{ "dwrite_factory", "d2d_factory", "text_formats", "glyph_worker", "staging_texture" }) |field_name| {
+        try std.testing.expect(@hasField(FontService, field_name));
+        try std.testing.expect(!@hasField(d3d11, field_name));
+    }
 }

@@ -33,7 +33,7 @@ const RunPending = struct {
 // Recreates the cache if the cell size changed or the atlas texture
 // was reallocated.
 pub fn setupGlyphAtlas(self: *D3d11Renderer) gpu.AtlasFrame {
-    const cs = self.cell_size_xy;
+    const cs = self.font_service.cell_size_xy;
     const tex_cell_count = gpu.getTextureMaxCellCount(cs);
     const tex_total: u32 = @as(u32, tex_cell_count.x) * @as(u32, tex_cell_count.y);
 
@@ -87,7 +87,7 @@ pub fn generateGlyph(
     half: GlyphIndexCache.Half,
     style: GlyphIndexCache.Style,
 ) u32 {
-    const cs = self.cell_size_xy;
+    const cs = self.font_service.cell_size_xy;
     const key = GlyphIndexCache.Key.init(codepoint, grapheme, half, style);
     const arena = self.glyph_cache_arena.allocator();
 
@@ -153,7 +153,7 @@ pub fn generateGlyph(
             // placeholder strategy; (2) any glyph at all when the raster
             // worker failed to spawn, so the renderer still produces
             // correct pixels (just on the UI thread, like pre-Stage-C).
-            if (is_blank or !self.glyph_worker_started) {
+            if (is_blank or !self.font_service.glyph_worker_started) {
                 const staging = renderGlyphToStaging(self, codepoint, grapheme, style, false);
                 copyStagingHalfToAtlas(self, staging, 0, coord);
                 std.debug.assert(cache.markReady(reserved.index, reserved.slot_gen, key));
@@ -189,7 +189,7 @@ fn submitRasterJob(
     slot_gen: u32,
     style: GlyphIndexCache.Style,
 ) bool {
-    const gpa = self.glyph_worker.gpa;
+    const gpa = self.font_service.glyph_worker.gpa;
     const job = gpa.create(glyph_worker.RasterJob) catch return false;
     const grapheme_dup: []u21 = if (grapheme.len == 0)
         &.{}
@@ -198,18 +198,18 @@ fn submitRasterJob(
             gpa.destroy(job);
             return false;
         };
-    const features_dup = dupeFontFeatures(gpa, self.font_features) catch {
+    const features_dup = dupeFontFeatures(gpa, self.font_service.font_features) catch {
         if (grapheme_dup.len != 0) gpa.free(grapheme_dup);
         gpa.destroy(job);
         return false;
     };
-    const text_format = self.text_formats[@intFromEnum(style)];
+    const text_format = self.font_service.text_formats[@intFromEnum(style)];
     const layout_format = if (emoji.shouldForceEmojiFont(codepoint, grapheme))
-        self.emoji_text_format
+        self.font_service.emoji_text_format
     else
         text_format;
     _ = layout_format.IUnknown.AddRef();
-    _ = self.rendering_params.IUnknown.AddRef();
+    _ = self.font_service.rendering_params.IUnknown.AddRef();
     job.* = .{
         .key = key,
         .codepoint = codepoint,
@@ -222,12 +222,12 @@ fn submitRasterJob(
         .slot = slot,
         .slot_gen = slot_gen,
         .cache_gen = self.cache_gen,
-        .cs = self.cell_size_xy,
+        .cs = self.font_service.cell_size_xy,
         .text_format = layout_format,
-        .rendering_params = self.rendering_params,
+        .rendering_params = self.font_service.rendering_params,
         .font_features = features_dup,
     };
-    if (!self.glyph_worker.submit(job)) {
+    if (!self.font_service.glyph_worker.submit(job)) {
         // submit() didn't consume the job — destroy locally. `destroy`
         // Releases the COM refs and frees the dupe, mirroring the worker's
         // own success-path cleanup.
@@ -245,7 +245,7 @@ pub fn generateRun(
     style: GlyphIndexCache.Style,
 ) ?RunGlyphs {
     if (text.len < 2 or text.len > max_ligature_run_cells) return null;
-    if (!self.glyph_worker_started) return null;
+    if (!self.font_service.glyph_worker_started) return null;
 
     const arena = self.glyph_cache_arena.allocator();
     const blank = blankGlyphSlot(self, cache, tex_cell_count);
@@ -307,21 +307,21 @@ fn submitRunRasterJob(
     pending: []const RunPending,
 ) bool {
     if (pending.len == 0 or pending.len > max_ligature_run_cells) return false;
-    const gpa = self.glyph_worker.gpa;
+    const gpa = self.font_service.glyph_worker.gpa;
     const job = gpa.create(glyph_worker.RasterJob) catch return false;
     const run_dup = gpa.dupe(u8, text) catch {
         gpa.destroy(job);
         return false;
     };
-    const features_dup = dupeFontFeatures(gpa, self.font_features) catch {
+    const features_dup = dupeFontFeatures(gpa, self.font_service.font_features) catch {
         gpa.free(run_dup);
         gpa.destroy(job);
         return false;
     };
 
-    const text_format = self.text_formats[@intFromEnum(style)];
+    const text_format = self.font_service.text_formats[@intFromEnum(style)];
     _ = text_format.IUnknown.AddRef();
-    _ = self.rendering_params.IUnknown.AddRef();
+    _ = self.font_service.rendering_params.IUnknown.AddRef();
 
     var run_slots: [max_ligature_run_cells]glyph_worker.RunSlot = undefined;
     for (pending, 0..) |p, i| {
@@ -346,12 +346,12 @@ fn submitRunRasterJob(
         .slot = pending[0].index,
         .slot_gen = pending[0].slot_gen,
         .cache_gen = self.cache_gen,
-        .cs = self.cell_size_xy,
+        .cs = self.font_service.cell_size_xy,
         .text_format = text_format,
-        .rendering_params = self.rendering_params,
+        .rendering_params = self.font_service.rendering_params,
         .font_features = features_dup,
     };
-    if (!self.glyph_worker.submit(job)) {
+    if (!self.font_service.glyph_worker.submit(job)) {
         job.destroy(gpa);
         return false;
     }
@@ -380,7 +380,6 @@ pub fn generateWidePair(
     grapheme: []const u21,
     style: GlyphIndexCache.Style,
 ) struct { left: u32, right: u32 } {
-    const cs = self.cell_size_xy;
     const arena = self.glyph_cache_arena.allocator();
     // Wide-pair stays fully synchronous: one DirectWrite raster fills both
     // halves, so there's no win to splitting them across the worker. The
@@ -446,14 +445,13 @@ pub fn generateWidePair(
             else => {
                 std.log.warn("sprite render U+{X} failed ({s}); falling back to DirectWrite", .{ codepoint, @errorName(err) });
                 const staging = renderGlyphToStaging(self, codepoint, grapheme, style, true);
-                if (left_miss) {
-                    const pos = gpu.cellPosFromIndex(left.index, tex_cell_count.x);
-                    copyStagingHalfToAtlas(self, staging, 0, .{ .x = cs.x * pos.x, .y = cs.y * pos.y });
-                }
-                if (right_miss) {
-                    const pos = gpu.cellPosFromIndex(right.index, tex_cell_count.x);
-                    copyStagingHalfToAtlas(self, staging, cs.x, .{ .x = cs.x * pos.x, .y = cs.y * pos.y });
-                }
+                copyStagingPairToAtlas(
+                    self,
+                    staging,
+                    tex_cell_count,
+                    if (left_miss) left.index else null,
+                    if (right_miss) right.index else null,
+                );
             },
         };
         markPairReady(cache, codepoint, grapheme, style, left, right);
@@ -461,14 +459,13 @@ pub fn generateWidePair(
     }
 
     const staging = renderGlyphToStaging(self, codepoint, grapheme, style, true);
-    if (left_miss) {
-        const pos = gpu.cellPosFromIndex(left.index, tex_cell_count.x);
-        copyStagingHalfToAtlas(self, staging, 0, .{ .x = cs.x * pos.x, .y = cs.y * pos.y });
-    }
-    if (right_miss) {
-        const pos = gpu.cellPosFromIndex(right.index, tex_cell_count.x);
-        copyStagingHalfToAtlas(self, staging, cs.x, .{ .x = cs.x * pos.x, .y = cs.y * pos.y });
-    }
+    copyStagingPairToAtlas(
+        self,
+        staging,
+        tex_cell_count,
+        if (left_miss) left.index else null,
+        if (right_miss) right.index else null,
+    );
 
     markPairReady(cache, codepoint, grapheme, style, left, right);
     return .{ .left = left.index, .right = right.index };
@@ -504,12 +501,12 @@ fn renderGlyphToStaging(
     style: GlyphIndexCache.Style,
     is_wide: bool,
 ) *gpu.StagingTexture.Cached {
-    const cs = self.cell_size_xy;
+    const cs = self.font_service.cell_size_xy;
     const staging_size: CellXY = .{ .x = cs.x * 2, .y = cs.y };
     const is_color_glyph = emoji.isColorGlyphRun(codepoint, grapheme);
-    const staging = self.staging_texture.getOrCreate(
-        self.device,
-        self.d2d_factory,
+    const staging = self.font_service.staging_texture.getOrCreate(
+        self.font_service.device,
+        self.font_service.d2d_factory,
         staging_size,
         if (is_color_glyph) .color else .mask,
     );
@@ -549,12 +546,12 @@ fn renderGlyphToStaging(
     // share the regular family today and differ only by synthetic
     // weight/oblique applied by DirectWrite.
     const text_format = if (emoji.shouldForceEmojiFont(codepoint, grapheme))
-        self.emoji_text_format
+        self.font_service.emoji_text_format
     else
-        self.text_formats[@intFromEnum(style)];
+        self.font_service.text_formats[@intFromEnum(style)];
     var layout: *win32.IDWriteTextLayout = undefined;
     {
-        const hr = self.dwrite_factory.IDWriteFactory.CreateTextLayout(
+        const hr = self.font_service.dwrite_factory.IDWriteFactory.CreateTextLayout(
             @ptrCast(utf16_buf[0..utf16_len].ptr),
             @intCast(utf16_len),
             text_format,
@@ -566,7 +563,7 @@ fn renderGlyphToStaging(
     }
     defer _ = layout.IUnknown.Release();
 
-    font.applyFontFeatures(&self.dwrite_factory.IDWriteFactory, layout, self.font_features, @intCast(utf16_len));
+    font.applyFontFeatures(&self.font_service.dwrite_factory.IDWriteFactory, layout, self.font_service.font_features, @intCast(utf16_len));
 
     // For ambiguous symbols, center the glyph in its single cell so the
     // center-anchored scale transform expands uniformly around the cell
@@ -649,8 +646,9 @@ fn renderGlyphToStaging(
         .dx = 0,
         .dy = 0,
     } } };
+    gpu.acquireFontWrite(staging.mutex);
     staging.render_target.SetTransform(&identity);
-    if (!is_color_glyph) staging.render_target.SetTextRenderingParams(self.rendering_params);
+    if (!is_color_glyph) staging.render_target.SetTextRenderingParams(self.font_service.rendering_params);
     staging.render_target.SetTextAntialiasMode(if (is_color_glyph) .GRAYSCALE else .CLEARTYPE);
     staging.render_target.BeginDraw();
     {
@@ -746,6 +744,7 @@ fn renderGlyphToStaging(
     var tag2: u64 = undefined;
     const ehr = staging.render_target.EndDraw(&tag1, &tag2);
     if (ehr < 0) com.fatalHr("EndDraw", ehr);
+    gpu.releaseFontWrite(staging.mutex);
 
     return staging;
 }
@@ -756,7 +755,7 @@ fn copyStagingHalfToAtlas(
     src_left: u32,
     dst_coord: CellXY,
 ) void {
-    const cs = self.cell_size_xy;
+    const cs = self.font_service.cell_size_xy;
     const box: win32.D3D11_BOX = .{
         .left = src_left,
         .top = 0,
@@ -765,16 +764,74 @@ fn copyStagingHalfToAtlas(
         .bottom = cs.y,
         .back = 1,
     };
+    const imported = self.glyph_staging_bridge.acquireRead(self.device, staging.texture);
     self.context.CopySubresourceRegion(
         &self.glyph_texture.obj.?.ID3D11Resource,
         0,
         dst_coord.x,
         dst_coord.y,
         0,
-        &staging.texture.ID3D11Resource,
+        &imported.ID3D11Resource,
         0,
         &box,
     );
+    self.glyph_staging_bridge.releaseRead();
+}
+
+fn copyStagingPairToAtlas(
+    self: *D3d11Renderer,
+    staging: *gpu.StagingTexture.Cached,
+    tex_cell_count: CellXY,
+    left_index: ?u32,
+    right_index: ?u32,
+) void {
+    std.debug.assert(left_index != null or right_index != null);
+    const cs = self.font_service.cell_size_xy;
+    const imported = self.glyph_staging_bridge.acquireRead(self.device, staging.texture);
+    defer self.glyph_staging_bridge.releaseRead();
+
+    if (left_index) |index| {
+        const pos = gpu.cellPosFromIndex(index, tex_cell_count.x);
+        const box = win32.D3D11_BOX{
+            .left = 0,
+            .top = 0,
+            .front = 0,
+            .right = cs.x,
+            .bottom = cs.y,
+            .back = 1,
+        };
+        self.context.CopySubresourceRegion(
+            &self.glyph_texture.obj.?.ID3D11Resource,
+            0,
+            cs.x * pos.x,
+            cs.y * pos.y,
+            0,
+            &imported.ID3D11Resource,
+            0,
+            &box,
+        );
+    }
+    if (right_index) |index| {
+        const pos = gpu.cellPosFromIndex(index, tex_cell_count.x);
+        const box = win32.D3D11_BOX{
+            .left = cs.x,
+            .top = 0,
+            .front = 0,
+            .right = @as(u32, cs.x) * 2,
+            .bottom = cs.y,
+            .back = 1,
+        };
+        self.context.CopySubresourceRegion(
+            &self.glyph_texture.obj.?.ID3D11Resource,
+            0,
+            cs.x * pos.x,
+            cs.y * pos.y,
+            0,
+            &imported.ID3D11Resource,
+            0,
+            &box,
+        );
+    }
 }
 
 // Render a sprite (Block Elements / Box Drawing / Braille / Powerline /
@@ -790,7 +847,7 @@ fn uploadSpriteToAtlas(
     half: GlyphIndexCache.Half,
     coord: CellXY,
 ) !void {
-    const cs = self.cell_size_xy;
+    const cs = self.font_service.cell_size_xy;
     const sprite_cell_w: u32 = if (half != .single) @as(u32, cs.x) * 2 else cs.x;
     const sprite_cell_h: u32 = cs.y;
 
@@ -846,7 +903,7 @@ fn uploadSpriteWidePairToAtlas(
     right_cell_index: ?u32,
 ) !void {
     std.debug.assert(left_cell_index != null or right_cell_index != null);
-    const cs = self.cell_size_xy;
+    const cs = self.font_service.cell_size_xy;
     const sprite_cell_w: u32 = @as(u32, cs.x) * 2;
     const sprite_cell_h: u32 = cs.y;
 
@@ -877,7 +934,7 @@ fn uploadAtlasHalfFromScratch(
     src_row_pitch: u32,
     dst_coord: CellXY,
 ) void {
-    const cs = self.cell_size_xy;
+    const cs = self.font_service.cell_size_xy;
     const dst_box: win32.D3D11_BOX = .{
         .left = dst_coord.x,
         .top = dst_coord.y,

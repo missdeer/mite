@@ -365,6 +365,7 @@ pub const StagingTexture = struct {
     pub const Cached = struct {
         size: CellXY,
         texture: *win32.ID3D11Texture2D,
+        mutex: *win32.IDXGIKeyedMutex,
         render_target: *win32.ID2D1RenderTarget,
         white_brush: *win32.ID2D1SolidColorBrush,
     };
@@ -399,7 +400,7 @@ pub const StagingTexture = struct {
                 .Usage = .DEFAULT,
                 .BindFlags = .{ .RENDER_TARGET = 1 },
                 .CPUAccessFlags = .{},
-                .MiscFlags = .{},
+                .MiscFlags = .{ .SHARED_KEYEDMUTEX = 1 },
             };
             const hr = device.CreateTexture2D(&desc, null, &texture);
             if (hr < 0) com.fatalHr("CreateStagingTexture", hr);
@@ -407,6 +408,7 @@ pub const StagingTexture = struct {
 
         const dxgi_surface = com.queryInterface(texture, win32.IDXGISurface);
         defer _ = dxgi_surface.IUnknown.Release();
+        const mutex = com.queryInterface(texture, win32.IDXGIKeyedMutex);
 
         var render_target: *win32.ID2D1RenderTarget = undefined;
         {
@@ -450,6 +452,7 @@ pub const StagingTexture = struct {
         cached.* = .{
             .size = size,
             .texture = texture,
+            .mutex = mutex,
             .render_target = render_target,
             .white_brush = white_brush,
         };
@@ -465,6 +468,7 @@ pub const StagingTexture = struct {
         if (cached.*) |*c| {
             _ = c.white_brush.IUnknown.Release();
             _ = c.render_target.IUnknown.Release();
+            _ = c.mutex.IUnknown.Release();
             _ = c.texture.IUnknown.Release();
             cached.* = null;
         }
@@ -482,6 +486,7 @@ pub const BandTexture = struct {
         width: u32,
         height: u32,
         texture: *win32.ID3D11Texture2D,
+        mutex: *win32.IDXGIKeyedMutex,
         render_target: *win32.ID2D1RenderTarget,
         brush: *win32.ID2D1SolidColorBrush,
     };
@@ -511,7 +516,7 @@ pub const BandTexture = struct {
                 .Usage = .DEFAULT,
                 .BindFlags = .{ .RENDER_TARGET = 1 },
                 .CPUAccessFlags = .{},
-                .MiscFlags = .{},
+                .MiscFlags = .{ .SHARED_KEYEDMUTEX = 1 },
             };
             const hr = device.CreateTexture2D(&desc, null, &texture);
             if (hr < 0) com.fatalHr("CreateBandTexture", hr);
@@ -519,6 +524,7 @@ pub const BandTexture = struct {
 
         const dxgi_surface = com.queryInterface(texture, win32.IDXGISurface);
         defer _ = dxgi_surface.IUnknown.Release();
+        const mutex = com.queryInterface(texture, win32.IDXGIKeyedMutex);
 
         var render_target: *win32.ID2D1RenderTarget = undefined;
         {
@@ -552,6 +558,7 @@ pub const BandTexture = struct {
             .width = width,
             .height = height,
             .texture = texture,
+            .mutex = mutex,
             .render_target = render_target,
             .brush = brush,
         };
@@ -566,8 +573,74 @@ pub const BandTexture = struct {
         if (cached.*) |*c| {
             _ = c.brush.IUnknown.Release();
             _ = c.render_target.IUnknown.Release();
+            _ = c.mutex.IUnknown.Release();
             _ = c.texture.IUnknown.Release();
             cached.* = null;
         }
+    }
+};
+
+pub fn acquireFontWrite(mutex: *win32.IDXGIKeyedMutex) void {
+    const hr = mutex.AcquireSync(0, win32.INFINITE);
+    if (hr != 0) com.fatalHr("AcquireSync(font write)", hr);
+}
+
+pub fn releaseFontWrite(mutex: *win32.IDXGIKeyedMutex) void {
+    const hr = mutex.ReleaseSync(1);
+    if (hr != 0) com.fatalHr("ReleaseSync(font write)", hr);
+}
+
+// Backend-side view of one font-service texture. The source is AddRef'd so a
+// DPI/size rebuild cannot invalidate the identity while the imported view is
+// still cached. Key 1 belongs to the consumer; releasing key 0 hands the
+// surface back to the font service for its next D2D draw.
+pub const SharedTexture = struct {
+    source: ?*win32.ID3D11Texture2D = null,
+    imported: ?*win32.ID3D11Texture2D = null,
+    mutex: ?*win32.IDXGIKeyedMutex = null,
+
+    pub fn acquireRead(
+        self: *SharedTexture,
+        device: *win32.ID3D11Device,
+        source: *win32.ID3D11Texture2D,
+    ) *win32.ID3D11Texture2D {
+        if (self.source != source) self.open(device, source);
+        const hr = self.mutex.?.AcquireSync(1, win32.INFINITE);
+        if (hr != 0) com.fatalHr("AcquireSync(font read)", hr);
+        return self.imported.?;
+    }
+
+    pub fn releaseRead(self: *SharedTexture) void {
+        const hr = self.mutex.?.ReleaseSync(0);
+        if (hr != 0) com.fatalHr("ReleaseSync(font read)", hr);
+    }
+
+    pub fn release(self: *SharedTexture) void {
+        if (self.mutex) |mutex| _ = mutex.IUnknown.Release();
+        if (self.imported) |texture| _ = texture.IUnknown.Release();
+        if (self.source) |source| _ = source.IUnknown.Release();
+        self.* = .{};
+    }
+
+    fn open(self: *SharedTexture, device: *win32.ID3D11Device, source: *win32.ID3D11Texture2D) void {
+        self.release();
+
+        const resource = com.queryInterface(source, win32.IDXGIResource);
+        defer _ = resource.IUnknown.Release();
+        var handle: ?win32.HANDLE = null;
+        const handle_hr = resource.GetSharedHandle(&handle);
+        if (handle_hr < 0) com.fatalHr("GetSharedHandle(font texture)", handle_hr);
+
+        var imported: *win32.ID3D11Texture2D = undefined;
+        const open_hr = device.OpenSharedResource(handle, win32.IID_ID3D11Texture2D, @ptrCast(&imported));
+        if (open_hr < 0) com.fatalHr("OpenSharedResource(font texture)", open_hr);
+        const mutex = com.queryInterface(imported, win32.IDXGIKeyedMutex);
+
+        _ = source.IUnknown.AddRef();
+        self.* = .{
+            .source = source,
+            .imported = imported,
+            .mutex = mutex,
+        };
     }
 };
