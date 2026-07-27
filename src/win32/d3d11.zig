@@ -264,15 +264,23 @@ pub fn tabBarHeightForDpi(self: *D3d11Renderer, dpi: u32) i32 {
     return font_state.computeTabBarHeight(self.dwrite_factory, dpi, self.effective_tabbar_primary, self.tabbar_font_size_pt, @intCast(cs.cy));
 }
 
-pub fn init(dpi: u32, font_config: FontConfig, font_ligatures: bool) D3d11Renderer {
+pub fn init(dpi: u32, font_config: FontConfig, font_ligatures: bool, configured_gpu: ?[]const u8) D3d11Renderer {
     // Create D3D11 device
     const levels = [_]win32.D3D_FEATURE_LEVEL{.@"11_0"};
     var device: *win32.ID3D11Device = undefined;
     var context: *win32.ID3D11DeviceContext = undefined;
+    const selected_adapter = if (configured_gpu) |name|
+        swap_chain_mod.findHardwareAdapterByName(name) orelse
+            std.debug.panic("configured GPU '{s}' was not found among hardware adapters", .{name})
+    else
+        null;
+    defer {
+        if (selected_adapter) |adapter| _ = adapter.IUnknown.Release();
+    }
     {
         const hr = win32.D3D11CreateDevice(
-            null,
-            .HARDWARE,
+            if (selected_adapter) |adapter| &adapter.IDXGIAdapter else null,
+            if (selected_adapter != null) .UNKNOWN else .HARDWARE,
             null,
             .{ .BGRA_SUPPORT = 1, .SINGLETHREADED = 1 },
             &levels,
@@ -282,12 +290,22 @@ pub fn init(dpi: u32, font_config: FontConfig, font_ligatures: bool) D3d11Render
             null,
             &context,
         );
-        if (hr < 0) fatalHr("D3D11CreateDevice", hr);
+        if (hr < 0) {
+            if (configured_gpu) |name| std.debug.panic(
+                "D3D11CreateDevice failed for configured GPU '{s}', hresult=0x{x}",
+                .{ name, @as(u32, @bitCast(hr)) },
+            );
+            fatalHr("D3D11CreateDevice", hr);
+        }
     }
     const adapter_info = swap_chain_mod.detectAdapter(device);
     log.info(
-        "D3D11 device created: adapter='{s}', remote_or_software={}",
-        .{ adapter_info.name[0..adapter_info.name_len], adapter_info.remote_or_software },
+        "D3D11 device created: selection={s}, adapter='{s}', remote_or_software={}",
+        .{
+            if (configured_gpu != null) "explicit" else "automatic",
+            adapter_info.name[0..adapter_info.name_len],
+            adapter_info.remote_or_software,
+        },
     );
 
     // Compile shaders

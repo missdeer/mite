@@ -27,6 +27,38 @@ pub const AdapterInfo = struct {
     remote_or_software: bool,
 };
 
+pub fn findHardwareAdapterByName(configured_name: []const u8) ?*win32.IDXGIAdapter1 {
+    var factory: *win32.IDXGIFactory1 = undefined;
+    {
+        const hr = win32.CreateDXGIFactory1(win32.IID_IDXGIFactory1, @ptrCast(&factory));
+        if (hr < 0) com.fatalHr("CreateDXGIFactory1", hr);
+    }
+    defer _ = factory.IUnknown.Release();
+
+    var index: u32 = 0;
+    while (true) : (index += 1) {
+        var adapter: *win32.IDXGIAdapter1 = undefined;
+        const enum_hr = factory.EnumAdapters1(index, &adapter);
+        if (enum_hr == win32.DXGI_ERROR_NOT_FOUND) return null;
+        if (enum_hr < 0) com.fatalHr("EnumAdapters1", enum_hr);
+
+        var desc: win32.DXGI_ADAPTER_DESC1 = undefined;
+        const desc_hr = adapter.GetDesc1(&desc);
+        if (desc_hr < 0) {
+            _ = adapter.IUnknown.Release();
+            com.fatalHr("GetDesc1", desc_hr);
+        }
+
+        var name_buf: [512]u8 = undefined;
+        const name = adapterNameUtf8(&desc.Description, &name_buf) orelse {
+            _ = adapter.IUnknown.Release();
+            continue;
+        };
+        if (matchesConfiguredAdapter(configured_name, name, desc.Flags)) return adapter;
+        _ = adapter.IUnknown.Release();
+    }
+}
+
 pub fn detectAdapter(device: *win32.ID3D11Device) AdapterInfo {
     const dxgi_device = com.queryInterface(device, win32.IDXGIDevice);
     defer _ = dxgi_device.IUnknown.Release();
@@ -44,18 +76,27 @@ pub fn detectAdapter(device: *win32.ID3D11Device) AdapterInfo {
         if (hr < 0) return unknownAdapter();
     }
 
-    const raw_name = std.mem.sliceTo(&desc.Description, 0);
     var name_buf: [512]u8 = undefined;
-    const name_len = std.unicode.utf16LeToUtf8(&name_buf, raw_name) catch {
+    const name = adapterNameUtf8(&desc.Description, &name_buf) orelse {
         return unknownAdapter();
     };
-    const name = name_buf[0..name_len];
     const remote_or_software =
         desc.VendorId == 0x1414 or
         utf8ContainsIgnoreCase(name, "warp") or
         utf8ContainsIgnoreCase(name, "basic render") or
         utf8ContainsIgnoreCase(name, "remote");
-    return .{ .name = name_buf, .name_len = name_len, .remote_or_software = remote_or_software };
+    return .{ .name = name_buf, .name_len = name.len, .remote_or_software = remote_or_software };
+}
+
+fn adapterNameUtf8(description: *const [128]u16, buf: *[512]u8) ?[]const u8 {
+    const raw_name = std.mem.sliceTo(description, 0);
+    const name_len = std.unicode.utf16LeToUtf8(buf, raw_name) catch return null;
+    return buf[0..name_len];
+}
+
+fn matchesConfiguredAdapter(configured_name: []const u8, adapter_name: []const u8, flags: u32) bool {
+    const software_flag: u32 = @bitCast(win32.DXGI_ADAPTER_FLAG_SOFTWARE);
+    return flags & software_flag == 0 and std.mem.eql(u8, configured_name, adapter_name);
 }
 
 fn unknownAdapter() AdapterInfo {
@@ -72,6 +113,16 @@ fn utf8ContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
     }
     return false;
+}
+
+test "configured GPU matches only the exact hardware adapter display name" {
+    const configured = "NVIDIA GeForce RTX 4060 Ti";
+    try std.testing.expect(matchesConfiguredAdapter(configured, configured, 0));
+    try std.testing.expect(!matchesConfiguredAdapter(configured, "nvidia geforce rtx 4060 ti", 0));
+    try std.testing.expect(!matchesConfiguredAdapter(configured, "NVIDIA GeForce RTX 4060", 0));
+
+    const software_flag: u32 = @bitCast(win32.DXGI_ADAPTER_FLAG_SOFTWARE);
+    try std.testing.expect(!matchesConfiguredAdapter(configured, configured, software_flag));
 }
 
 pub fn init(self: *D3d11Renderer, hwnd: win32.HWND, width: u32, height: u32) *win32.IDXGISwapChain2 {

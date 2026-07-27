@@ -404,6 +404,27 @@ desktop / lower windows continue to show through translucent cells. This
 differs from Ghostty on macOS, where native fullscreen forces opacity off
 because the OS swaps the background for a flat gray.
 
+### `gpu`
+
+Selects the Windows hardware adapter used to create Mostty's D3D11 rendering
+device. Set it to the full adapter name shown by Windows Device Manager or
+Task Manager:
+
+```
+gpu = NVIDIA GeForce RTX 4060 Ti
+```
+
+The name must match exactly. If several hardware adapters have the same name,
+Mostty uses the first one in Windows enumeration order. If the name is not
+found or that adapter cannot create the required rendering device, startup
+fails instead of silently selecting another GPU or a software renderer.
+
+Omitting `gpu` (or leaving its value blank) preserves Windows' automatic
+hardware-adapter selection. **Hot-reload:** no; changing this setting requires
+restarting Mostty because all rendering resources belong to the startup
+device. With `MOSTTY_DIAG` enabled, the diagnostic log records whether the
+selection was automatic or explicit and the final adapter name.
+
 ### `render-interval-local-ms` / `render-interval-remote-ms`
 
 Minimum interval (in milliseconds) between rendered frames. Mostty coalesces
@@ -504,6 +525,7 @@ background              = #191724
 palette                 = 1 = #eb6f92
 background-opacity      = 0.85
 background-blur         = true
+gpu                     = NVIDIA GeForce RTX 4060 Ti
 render-interval-local-ms  = 16
 render-interval-remote-ms = 50
 launcher                = PowerShell | powershell.exe
