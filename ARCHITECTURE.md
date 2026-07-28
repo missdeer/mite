@@ -5,7 +5,7 @@ of every key path. Mostty is a Windows-only terminal emulator that pairs Ghostty
 VT state machine (`libghostty-vt`) with a hand-rolled Win32 / D3D11 /
 DirectWrite shell.
 
-Pinned versions: Zig `0.15.2`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI only. The build also requires Windows SDK `fxc.exe` and Vulkan SDK `dxc.exe` / `spirv-val.exe`. Build with
+Pinned versions: Zig `0.15.2`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI only. The build also requires Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-val.exe`. Build with
 `cmd.exe /c "D:\zig-x86_64-windows-0.15.2\zig.exe build --global-cache-dir D:\zig-cache"`.
 
 ---
@@ -518,14 +518,25 @@ font service state, then reset the active backend glyph cache and force a full r
 backend.
 
 The shader build graph treats `terminal.hlsl` as the single source of truth.
-For each runtime entry point it produces an SM5/DXBC asset with the Windows SDK
-compiler for D3D11 and a Vulkan 1.1 SPIR-V asset with the Vulkan SDK DXC. Every
-SPIR-V output passes `spirv-val`; either target failing stops the build. D3D11
-embeds and loads only the DXBC side at startup, while the SPIR-V side remains a
-validated future-backend asset. Explicit Vulkan bindings keep constant buffers,
-structured cells, textures, and the sampler in one collision-free descriptor
-contract. SPIR-V runtime/visual equivalence is intentionally deferred until a
-backend consumes those assets.
+For each runtime entry point it produces three assets: an SM5/DXBC asset with
+the Windows SDK `fxc` for D3D11, a signed SM6/DXIL asset with the Windows SDK
+`dxc` for D3D12, and a Vulkan 1.1 SPIR-V asset with the Vulkan SDK `dxc`. The
+two DirectX targets are not interchangeable — D3D11 rejects SM6 and D3D12
+rejects SM5 — and they share a container format, so `shader_assets.zig` checks
+each container's parts rather than its magic. DXIL must be signed: D3D12 refuses
+unsigned bytecode outside developer mode, so the build requires `dxil.dll`
+beside the DXIL compiler and a test asserts the container digest is non-zero.
+Every SPIR-V output passes `spirv-val`; any target failing stops the build.
+D3D11 embeds and loads only the DXBC side at startup. Explicit Vulkan bindings
+keep constant buffers, structured cells, textures, and the sampler in one
+collision-free descriptor contract. SPIR-V runtime/visual equivalence is
+intentionally deferred until a backend consumes those assets.
+
+`d3d12.zig` holds a device/queue/fence skeleton that proves D3D12 accepts the
+DXIL assets and completes a record→submit→signal→wait cycle. It is deliberately
+**not** a `RendererBackend` variant: the facade contract is all-or-nothing, so a
+backend that cannot draw must not be selectable. It is reachable only as
+`Renderer.d3d12`, which keeps it compiled and tested without exposing it.
 
 ### 6.2 Per-frame orchestration
 

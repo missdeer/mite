@@ -97,10 +97,13 @@ fn addImports(
     mod.addImport("vt", vt);
     mod.addImport("z2d", z2d);
     mod.addAnonymousImport("terminal_vertex.dxbc", .{ .root_source_file = shader_assets.vertex.dxbc });
+    mod.addAnonymousImport("terminal_vertex.dxil", .{ .root_source_file = shader_assets.vertex.dxil });
     mod.addAnonymousImport("terminal_vertex.spv", .{ .root_source_file = shader_assets.vertex.spirv });
     mod.addAnonymousImport("terminal_pixel.dxbc", .{ .root_source_file = shader_assets.pixel.dxbc });
+    mod.addAnonymousImport("terminal_pixel.dxil", .{ .root_source_file = shader_assets.pixel.dxil });
     mod.addAnonymousImport("terminal_pixel.spv", .{ .root_source_file = shader_assets.pixel.spirv });
     mod.addAnonymousImport("terminal_image_pixel.dxbc", .{ .root_source_file = shader_assets.image_pixel.dxbc });
+    mod.addAnonymousImport("terminal_image_pixel.dxil", .{ .root_source_file = shader_assets.image_pixel.dxil });
     mod.addAnonymousImport("terminal_image_pixel.spv", .{ .root_source_file = shader_assets.image_pixel.spirv });
     if (b.lazyDependency("win32", .{})) |win32_dep| {
         mod.addImport("win32", win32_dep.module("win32"));
@@ -108,16 +111,17 @@ fn addImports(
     }
 }
 
-const ShaderPair = struct {
+const ShaderTargets = struct {
     dxbc: std.Build.LazyPath,
+    dxil: std.Build.LazyPath,
     spirv: std.Build.LazyPath,
     validation: *std.Build.Step,
 };
 
 const ShaderAssets = struct {
-    vertex: ShaderPair,
-    pixel: ShaderPair,
-    image_pixel: ShaderPair,
+    vertex: ShaderTargets,
+    pixel: ShaderTargets,
+    image_pixel: ShaderTargets,
 };
 
 fn buildShaders(b: *std.Build) ShaderAssets {
@@ -145,48 +149,79 @@ fn buildShaders(b: *std.Build) ShaderAssets {
         b.pathJoin(&.{ dxc_dir, "spirv-val.exe" }),
         "use a LunarG Vulkan SDK DXC installation that includes spirv-val.exe",
     );
+    // DXIL needs a *different* DXC than SPIR-V: signing requires dxil.dll next
+    // to the compiler, which the Vulkan SDK distribution omits. D3D12 rejects
+    // unsigned DXIL outside developer mode, so `sibling` makes signing capability
+    // part of tool discovery — an SDK with dxc.exe but no dxil.dll must be
+    // skipped over, not selected and then rejected.
+    const dxil_dxc = findSdkTool(b, .{
+        .option_name = "dxil-dxc-path",
+        .option_description = "Path to a signing-capable dxc.exe (dxil.dll must sit alongside it) used for D3D12 shader assets",
+        .env_name = "WindowsSdkVerBinPath",
+        .env_suffix = "x64/dxc.exe",
+        .search_root = "C:/Program Files (x86)/Windows Kits/10/bin",
+        .search_suffix = "x64/dxc.exe",
+        .sibling = "dxil.dll",
+        .install_hint = "D3D12 rejects unsigned DXIL; install a Windows SDK whose x64 dxc.exe ships dxil.dll alongside it, or pass -Ddxil-dxc-path=<path>",
+    });
     const source = b.path("src/win32/terminal.hlsl");
 
+    const tools = ShaderTools{
+        .fxc = fxc,
+        .dxc = dxc,
+        .dxil_dxc = dxil_dxc,
+        .spirv_validator = spirv_validator,
+    };
+
     return .{
-        .vertex = compileShaderPair(b, fxc, dxc, spirv_validator, source, "VertexMain", "vs_5_0", "vs_6_0", "terminal_vertex"),
-        .pixel = compileShaderPair(b, fxc, dxc, spirv_validator, source, "PixelMain", "ps_5_0", "ps_6_0", "terminal_pixel"),
-        .image_pixel = compileShaderPair(b, fxc, dxc, spirv_validator, source, "ImagePixelMain", "ps_5_0", "ps_6_0", "terminal_image_pixel"),
+        .vertex = compileShaderTargets(b, tools, source, "VertexMain", "vs_5_0", "vs_6_0", "terminal_vertex"),
+        .pixel = compileShaderTargets(b, tools, source, "PixelMain", "ps_5_0", "ps_6_0", "terminal_pixel"),
+        .image_pixel = compileShaderTargets(b, tools, source, "ImagePixelMain", "ps_5_0", "ps_6_0", "terminal_image_pixel"),
     };
 }
 
-fn compileShaderPair(
-    b: *std.Build,
+const ShaderTools = struct {
     fxc: []const u8,
     dxc: []const u8,
+    dxil_dxc: []const u8,
     spirv_validator: []const u8,
+};
+
+fn compileShaderTargets(
+    b: *std.Build,
+    tools: ShaderTools,
     source: std.Build.LazyPath,
     entry: []const u8,
     dxbc_profile: []const u8,
-    spirv_profile: []const u8,
+    sm6_profile: []const u8,
     basename: []const u8,
-) ShaderPair {
-    const dxbc_command = b.addSystemCommand(&.{ fxc, "/nologo", "/E", entry, "/T", dxbc_profile, "/Fo" });
+) ShaderTargets {
+    const dxbc_command = b.addSystemCommand(&.{ tools.fxc, "/nologo", "/E", entry, "/T", dxbc_profile, "/Fo" });
     const dxbc = dxbc_command.addOutputFileArg(b.fmt("{s}.dxbc", .{basename}));
     dxbc_command.addFileArg(source);
 
+    const dxil_command = b.addSystemCommand(&.{ tools.dxil_dxc, "-E", entry, "-T", sm6_profile, "-Fo" });
+    const dxil = dxil_command.addOutputFileArg(b.fmt("{s}.dxil", .{basename}));
+    dxil_command.addFileArg(source);
+
     const spirv_command = b.addSystemCommand(&.{
-        dxc,
+        tools.dxc,
         "-spirv",
         "-fspv-target-env=vulkan1.1",
         "-DSPIRV=1",
         "-E",
         entry,
         "-T",
-        spirv_profile,
+        sm6_profile,
         "-Fo",
     });
     const spirv = spirv_command.addOutputFileArg(b.fmt("{s}.spv", .{basename}));
     spirv_command.addFileArg(source);
 
-    const validation_command = b.addSystemCommand(&.{ spirv_validator, "--target-env", "vulkan1.1" });
+    const validation_command = b.addSystemCommand(&.{ tools.spirv_validator, "--target-env", "vulkan1.1" });
     validation_command.addFileArg(spirv);
 
-    return .{ .dxbc = dxbc, .spirv = spirv, .validation = &validation_command.step };
+    return .{ .dxbc = dxbc, .dxil = dxil, .spirv = spirv, .validation = &validation_command.step };
 }
 
 fn addShaderValidationDependencies(step: *std.Build.Step, assets: ShaderAssets) void {
@@ -202,16 +237,23 @@ const SdkToolOptions = struct {
     env_suffix: []const u8,
     search_root: []const u8,
     search_suffix: []const u8,
+    /// File that must sit next to the tool for it to be usable at all. A
+    /// candidate missing it is not a candidate.
+    sibling: ?[]const u8 = null,
     install_hint: []const u8,
 };
 
 fn findSdkTool(b: *std.Build, options: SdkToolOptions) []const u8 {
     if (b.option([]const u8, options.option_name, options.option_description)) |path| {
-        return requireTool(b, path, options.install_hint);
+        const resolved = requireTool(b, path, options.install_hint);
+        if (options.sibling) |sibling| {
+            _ = requireTool(b, siblingPath(b, resolved, sibling), options.install_hint);
+        }
+        return resolved;
     }
     if (b.graph.env_map.get(options.env_name)) |root| {
         const path = b.pathJoin(&.{ root, options.env_suffix });
-        if (toolExists(path)) return path;
+        if (usableTool(b, path, options.sibling)) return path;
     }
 
     var root = std.fs.openDirAbsolute(options.search_root, .{ .iterate = true }) catch {
@@ -225,13 +267,23 @@ fn findSdkTool(b: *std.Build, options: SdkToolOptions) []const u8 {
     while (iterator.next() catch @panic("failed to enumerate SDK versions")) |entry| {
         if (entry.kind != .directory) continue;
         const candidate = b.pathJoin(&.{ options.search_root, entry.name, options.search_suffix });
-        if (!toolExists(candidate)) continue;
+        if (!usableTool(b, candidate, options.sibling)) continue;
         if (newest_version == null or versionLessThan(newest_version.?, entry.name)) {
             newest_version = b.dupe(entry.name);
             newest_path = candidate;
         }
     }
     return newest_path orelse std.debug.panic("shader compiler not found: {s}", .{options.install_hint});
+}
+
+fn usableTool(b: *std.Build, path: []const u8, sibling: ?[]const u8) bool {
+    if (!toolExists(path)) return false;
+    const required = sibling orelse return true;
+    return toolExists(siblingPath(b, path, required));
+}
+
+fn siblingPath(b: *std.Build, path: []const u8, name: []const u8) []const u8 {
+    return b.pathJoin(&.{ std.fs.path.dirname(path) orelse ".", name });
 }
 
 fn requireTool(b: *std.Build, path: []const u8, install_hint: []const u8) []const u8 {

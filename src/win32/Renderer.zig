@@ -9,6 +9,11 @@ const d3d11 = @import("d3d11.zig");
 const FontService = @import("FontService.zig");
 const types = @import("types.zig");
 
+// Compiled and tested, but not a `RendererBackend` variant: fulfilling the
+// whole facade contract is the precondition for being selectable, and the
+// D3D12 skeleton cannot do that yet.
+pub const d3d12 = @import("d3d12.zig");
+
 pub const RendererCommon = @import("RendererCommon.zig");
 
 pub const BgImageDecoded = d3d11.BgImageDecoded;
@@ -151,6 +156,17 @@ test "unimplemented renderer backends are not selectable" {
     const fields = @typeInfo(RendererBackend).@"union".fields;
     try std.testing.expectEqual(@as(usize, 1), fields.len);
     try std.testing.expectEqualStrings("d3d11", fields[0].name);
+}
+
+test "d3d12 is built and verified without being reachable through backend selection" {
+    // The facade dispatches every contract method to whichever variant is
+    // selected, so a variant that cannot draw would be a selectable broken
+    // terminal. Presence here is what keeps the skeleton honest: compiled and
+    // covered by tests, but impossible to select.
+    try std.testing.expect(@hasDecl(d3d12, "Skeleton"));
+    inline for (@typeInfo(RendererBackend).@"union".fields) |field| {
+        try std.testing.expect(!std.mem.eql(u8, field.name, "d3d12"));
+    }
 }
 
 test "backend does not duplicate renderer common state" {

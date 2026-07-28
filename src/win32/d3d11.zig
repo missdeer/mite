@@ -230,8 +230,8 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
     var vertex_shader: *win32.ID3D11VertexShader = undefined;
     {
         const hr = device.CreateVertexShader(
-            shader_assets.vertex.directx.ptr,
-            shader_assets.vertex.directx.len,
+            shader_assets.vertex.dxbc.ptr,
+            shader_assets.vertex.dxbc.len,
             null,
             &vertex_shader,
         );
@@ -241,8 +241,8 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
     var pixel_shader: *win32.ID3D11PixelShader = undefined;
     {
         const hr = device.CreatePixelShader(
-            shader_assets.pixel.directx.ptr,
-            shader_assets.pixel.directx.len,
+            shader_assets.pixel.dxbc.ptr,
+            shader_assets.pixel.dxbc.len,
             null,
             &pixel_shader,
         );
@@ -251,8 +251,8 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
     var image_pixel_shader: *win32.ID3D11PixelShader = undefined;
     {
         const hr = device.CreatePixelShader(
-            shader_assets.image_pixel.directx.ptr,
-            shader_assets.image_pixel.directx.len,
+            shader_assets.image_pixel.dxbc.ptr,
+            shader_assets.image_pixel.dxbc.len,
             null,
             &image_pixel_shader,
         );
@@ -904,8 +904,8 @@ test "D3D11 accepts every generated DirectX shader asset" {
 
     var vertex_shader: *win32.ID3D11VertexShader = undefined;
     const vertex_hr = device.CreateVertexShader(
-        shader_assets.vertex.directx.ptr,
-        shader_assets.vertex.directx.len,
+        shader_assets.vertex.dxbc.ptr,
+        shader_assets.vertex.dxbc.len,
         null,
         &vertex_shader,
     );
@@ -914,8 +914,8 @@ test "D3D11 accepts every generated DirectX shader asset" {
 
     var pixel_shader: *win32.ID3D11PixelShader = undefined;
     const pixel_hr = device.CreatePixelShader(
-        shader_assets.pixel.directx.ptr,
-        shader_assets.pixel.directx.len,
+        shader_assets.pixel.dxbc.ptr,
+        shader_assets.pixel.dxbc.len,
         null,
         &pixel_shader,
     );
@@ -924,8 +924,8 @@ test "D3D11 accepts every generated DirectX shader asset" {
 
     var image_pixel_shader: *win32.ID3D11PixelShader = undefined;
     const image_pixel_hr = device.CreatePixelShader(
-        shader_assets.image_pixel.directx.ptr,
-        shader_assets.image_pixel.directx.len,
+        shader_assets.image_pixel.dxbc.ptr,
+        shader_assets.image_pixel.dxbc.len,
         null,
         &image_pixel_shader,
     );
