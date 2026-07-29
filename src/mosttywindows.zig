@@ -125,6 +125,7 @@ pub fn main() !void {
         font_config,
         global.config.font_ligatures,
         global.config.gpu,
+        global.config.renderer,
     );
     const cell_size = global.renderer.common.cell_size;
     const placement = window_geom.calcWindowPlacement(

@@ -9,12 +9,11 @@ const d3d11 = @import("d3d11.zig");
 const FontService = @import("FontService.zig");
 const types = @import("types.zig");
 
-// Compiled and tested, but not a `RendererBackend` variant: fulfilling the
-// whole facade contract is the precondition for being selectable, and the
-// D3D12 skeleton cannot do that yet.
 pub const d3d12 = @import("d3d12.zig");
 
 pub const RendererCommon = @import("RendererCommon.zig");
+const shared = @import("shared.zig");
+const gpu = @import("d3d11/gpu.zig");
 
 pub const BgImageDecoded = d3d11.BgImageDecoded;
 pub const RasterResult = FontService.RasterResult;
@@ -23,8 +22,16 @@ pub const scrollbarWidth = d3d11.scrollbarWidth;
 pub const default_primary_font_family = FontService.default_primary_font_family;
 pub const default_font_size_pt = FontService.default_font_size_pt;
 
+/// Backends are all-or-nothing: every variant here fulfils the whole contract
+/// below, because the facade dispatches every method to whichever one is
+/// selected and a variant that could only draw part of the picture would be a
+/// selectable broken terminal.
 pub const RendererBackend = union(enum) {
     d3d11: d3d11,
+    /// Verified for static and low-frequency correctness only. Selectable on
+    /// request for comparison work, never the default, and not to be
+    /// described as fully capable until sustained-load behaviour is settled.
+    d3d12: d3d12.Renderer,
 };
 
 common: RendererCommon,
@@ -40,7 +47,12 @@ pub fn init(
     font_config: FontConfig,
     font_ligatures: bool,
     configured_gpu: ?[]const u8,
+    backend: Config.RendererBackend,
 ) void {
+    // The font service and the backend resolve the adapter from the same
+    // configured name, which is what keeps them on one GPU. Splitting them
+    // across adapters would leave rasterization and compositing on different
+    // hardware and the visual-equivalence baseline would stop being single.
     self.font_service = FontService.init(
         &self.common,
         dpi,
@@ -48,8 +60,11 @@ pub fn init(
         font_ligatures,
         configured_gpu,
     );
-    self.backend = .{
-        .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu),
+    self.backend = switch (backend) {
+        .d3d11 => .{ .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu) },
+        .d3d12 => .{
+            .d3d12 = d3d12.Renderer.init(&self.common, &self.font_service, configured_gpu),
+        },
     };
 }
 
@@ -152,21 +167,58 @@ pub fn releaseKittyImagesForTab(self: *Renderer, tab_id: types.TabId) void {
     }
 }
 
-test "unimplemented renderer backends are not selectable" {
-    const fields = @typeInfo(RendererBackend).@"union".fields;
-    try std.testing.expectEqual(@as(usize, 1), fields.len);
-    try std.testing.expectEqualStrings("d3d11", fields[0].name);
+test "every selectable backend answers the whole facade contract" {
+    // The facade dispatches each of these to whichever variant is selected,
+    // so a variant missing any one of them would be a selectable terminal
+    // that cannot draw part of its picture. Fulfilling the contract is what
+    // earns selectability, so assert it of every variant rather than trusting
+    // that the union was extended carefully.
+    const contract = .{
+        "init",                        "deinit",
+        "render",                      "onFontStateChanged",
+        "applyGlyphResult",            "reloadBackgroundImage",
+        "applyDecodedBackgroundImage", "releaseKittyImagesForTab",
+    };
+    inline for (@typeInfo(RendererBackend).@"union".fields) |field| {
+        inline for (contract) |name| {
+            try std.testing.expect(@hasDecl(field.type, name));
+        }
+    }
 }
 
-test "d3d12 is built and verified without being reachable through backend selection" {
-    // The facade dispatches every contract method to whichever variant is
-    // selected, so a variant that cannot draw would be a selectable broken
-    // terminal. Presence here is what keeps the skeleton honest: compiled and
-    // covered by tests, but impossible to select.
-    try std.testing.expect(@hasDecl(d3d12, "Skeleton"));
+test "d3d11 stays the default so an untouched install is unaffected" {
+    // D3D12 is verified only for static and low-frequency correctness; it may
+    // be asked for, but it must never become what a user gets by default.
+    try std.testing.expectEqual(Config.RendererBackend.d3d11, (Config{}).renderer);
+    try std.testing.expectEqualStrings(
+        "d3d11",
+        @typeInfo(RendererBackend).@"union".fields[0].name,
+    );
+}
+
+test "both backends consume one rasterizer, differing only in handoff form" {
+    // Text coverage compositing is judged against d3d11, and that comparison
+    // only means anything while both backends render from the same glyph
+    // source. Differing handoff form is expected; a second rasterizer is not.
+    try std.testing.expectEqual(shared.GlyphHandoff.shared_surface, d3d11.glyph_handoff);
+    try std.testing.expectEqual(shared.GlyphHandoff.cpu_pixels, d3d12.Renderer.glyph_handoff);
     inline for (@typeInfo(RendererBackend).@"union".fields) |field| {
-        try std.testing.expect(!std.mem.eql(u8, field.name, "d3d12"));
+        // Neither backend may own font machinery; it belongs to the service.
+        inline for (.{ "dwrite_factory", "d2d_factory", "text_formats" }) |owned_by_service| {
+            try std.testing.expect(!@hasField(field.type, owned_by_service));
+        }
     }
+}
+
+test "a wide glyph's two halves are copied under one surface acquisition" {
+    // The font-service handoff alternates keys, so acquiring twice without an
+    // intervening write blocks the UI thread forever. Taking both halves in
+    // one call is what makes that impossible; a signature accepting a single
+    // region would invite the caller to loop and deadlock instead.
+    const params = @typeInfo(@TypeOf(d3d11.atlasCopyStaging)).@"fn".params;
+    try std.testing.expectEqual(@as(usize, 4), params.len);
+    try std.testing.expectEqual(?gpu.AtlasCopy, params[2].type.?);
+    try std.testing.expectEqual(?gpu.AtlasCopy, params[3].type.?);
 }
 
 test "backend does not duplicate renderer common state" {

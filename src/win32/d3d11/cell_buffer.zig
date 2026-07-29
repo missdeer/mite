@@ -19,7 +19,6 @@ const builtin = @import("builtin");
 const win32 = @import("win32").everything;
 const vt = @import("vt");
 
-const D3d11Renderer = @import("../d3d11.zig");
 const types = @import("../types.zig");
 const gpu = @import("gpu.zig");
 const color = @import("color.zig");
@@ -76,7 +75,7 @@ pub const BuildResult = struct {
 // allocations; the per-row loop is then skipped and an empty result is
 // returned.
 pub fn buildAndUpload(
-    self: *D3d11Renderer,
+    self: anytype,
     term: *vt.Terminal,
     shader_col: u32,
     term_shader_row: u32,
@@ -91,7 +90,7 @@ pub fn buildAndUpload(
     url_highlight: ?types.UrlHighlight,
 ) BuildResult {
     const cell_count = shader_col * term_shader_row;
-    const cells_recreated = self.shader_cells.updateCount(self.device, cell_count);
+    const cells_recreated = self.cellsResize(cell_count);
     if (cell_count == 0) return .{};
 
     const shadow_grown = ensureShadowCapacity(self, cell_count);
@@ -382,7 +381,7 @@ pub fn buildAndUpload(
 }
 
 fn visualFromCell(
-    self: *D3d11Renderer,
+    self: anytype,
     page: anytype,
     page_cells: anytype,
     cell_i: usize,
@@ -525,7 +524,7 @@ fn markDirty(result: *BuildResult, row: u32) void {
 }
 
 fn drawResizeOverlay(
-    self: *D3d11Renderer,
+    self: anytype,
     term: *vt.Terminal,
     glyph_cache: *@import("../GlyphIndexCache.zig"),
     tex_cell_count: gpu.CellXY,
@@ -589,7 +588,7 @@ fn drawResizeOverlay(
 /// caller forces a full upload that frame (newly-allocated tail is undefined
 /// and would otherwise alias a stale row's content). Shrinks are kept as-is:
 /// the tail past `count` is never read.
-pub fn ensureShadowCapacity(self: *D3d11Renderer, count: u32) bool {
+pub fn ensureShadowCapacity(self: anytype, count: u32) bool {
     if (self.shadow_cells.len >= count) return false;
     std.heap.page_allocator.free(self.shadow_cells);
     self.shadow_cells = std.heap.page_allocator.alloc(shader.Cell, count) catch com.oom(error.OutOfMemory);
@@ -603,7 +602,7 @@ pub fn ensureShadowCapacity(self: *D3d11Renderer, count: u32) bool {
 /// `buildAndUpload` uses this to size the scissor rect on the persistent
 /// grid texture's draw.
 pub fn uploadCellRow(
-    self: *D3d11Renderer,
+    self: anytype,
     row_start_cell: u32,
     scratch: []const shader.Cell,
     force_full: bool,
@@ -620,23 +619,7 @@ pub fn uploadCellRow(
     }
     if (comptime debug_stats_enabled) self.stats.rows_uploaded += 1;
     self.diag_rows_uploaded += 1;
-    const cell_bytes: u32 = @sizeOf(shader.Cell);
-    const box: win32.D3D11_BOX = .{
-        .left = row_start_cell * cell_bytes,
-        .right = (row_start_cell + @as(u32, @intCast(scratch.len))) * cell_bytes,
-        .top = 0,
-        .bottom = 1,
-        .front = 0,
-        .back = 1,
-    };
-    self.context.UpdateSubresource(
-        &self.shader_cells.cell_buf.ID3D11Resource,
-        0,
-        &box,
-        scratch.ptr,
-        0,
-        0,
-    );
+    self.cellsUpload(row_start_cell, scratch);
     @memcpy(shadow_row, scratch);
     return true;
 }

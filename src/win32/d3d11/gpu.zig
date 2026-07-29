@@ -580,6 +580,156 @@ pub const BandTexture = struct {
     }
 };
 
+/// One cell-sized region to lift out of a font-service surface: where to read
+/// from within it, and which atlas slot receives it.
+pub const AtlasCopy = struct {
+    src_left: u32,
+    dst: CellXY,
+};
+
+// D3D11's GPU resource for one Kitty inline image. The cache around it is
+// backend-agnostic and only requires `release`.
+pub const KittyImage = struct {
+    texture: *win32.ID3D11Texture2D,
+    view: *win32.ID3D11ShaderResourceView,
+
+    pub fn release(self: *KittyImage) void {
+        _ = self.view.IUnknown.Release();
+        _ = self.texture.IUnknown.Release();
+    }
+};
+
+// CPU-addressable twin of `BandTexture`, for a backend that cannot open the
+// font service's shared surfaces. Same D2D target properties (B8G8R8A8_UNORM,
+// IGNORE alpha, 96 DPI, pixel unit mode) so the tab-bar band rasterizes
+// identically; only the destination differs — a WIC bitmap instead of a
+// DXGI surface — and the caller copies the bytes out itself.
+//
+// This is the same mechanism the async glyph worker already uses, not a
+// GPU readback: D2D renders straight into memory.
+pub const CpuBandTexture = struct {
+    pub const Cached = struct {
+        width: u32,
+        height: u32,
+        bitmap: *win32.IWICBitmap,
+        render_target: *win32.ID2D1RenderTarget,
+        brush: *win32.ID2D1SolidColorBrush,
+        // Destination for CopyPixels. Owned here so the consumer never has to
+        // manage a buffer whose size is tied to this target's dimensions.
+        pixels: []u8,
+
+        pub fn stride(self: *const Cached) u32 {
+            return self.width * 4;
+        }
+
+        /// Pull the freshly drawn band out of the WIC bitmap. Call after the
+        /// D2D EndDraw that produced it.
+        pub fn readPixels(self: *Cached) []const u8 {
+            const s = self.stride();
+            const hr = self.bitmap.IWICBitmapSource.CopyPixels(
+                null,
+                s,
+                @intCast(self.pixels.len),
+                @ptrCast(self.pixels.ptr),
+            );
+            if (hr < 0) com.fatalHr("CopyPixels(cpu band)", hr);
+
+            // The pixel format's fourth byte is padding, not alpha, and its
+            // contents are undefined. These bytes go on to be presented
+            // through a premultiplied-alpha surface, where undefined padding
+            // reads as transparency — so state the band's opacity explicitly
+            // rather than inheriting whatever the imaging layer left behind.
+            var i: usize = 3;
+            while (i < self.pixels.len) : (i += 4) self.pixels[i] = 0xFF;
+            return self.pixels;
+        }
+    };
+    cached: ?Cached = null,
+
+    pub fn getOrCreate(
+        self: *CpuBandTexture,
+        d2d_factory: *win32.ID2D1Factory,
+        wic_factory: *win32.IWICImagingFactory,
+        width: u32,
+        height: u32,
+    ) *Cached {
+        if (self.cached) |*c| {
+            if (c.width == width and c.height == height) return c;
+            releaseCached(&self.cached);
+        }
+
+        var bitmap: *win32.IWICBitmap = undefined;
+        {
+            // 32bppBGR + IGNORE is the pairing D2D accepts for an opaque
+            // ClearType target; 32bppBGRA + IGNORE is rejected outright.
+            var fmt: win32.Guid = win32.GUID_WICPixelFormat32bppBGR;
+            const hr = wic_factory.CreateBitmap(
+                width,
+                height,
+                &fmt,
+                win32.WICBitmapCacheOnLoad,
+                @ptrCast(&bitmap),
+            );
+            if (hr < 0) com.fatalHr("WIC CreateBitmap(cpu band)", hr);
+        }
+
+        var render_target: *win32.ID2D1RenderTarget = undefined;
+        {
+            const props = win32.D2D1_RENDER_TARGET_PROPERTIES{
+                .type = .DEFAULT,
+                .pixelFormat = .{ .format = .B8G8R8A8_UNORM, .alphaMode = .IGNORE },
+                .dpiX = 96.0,
+                .dpiY = 96.0,
+                .usage = .{},
+                .minLevel = .DEFAULT,
+            };
+            const hr = d2d_factory.CreateWicBitmapRenderTarget(bitmap, &props, &render_target);
+            if (hr < 0) com.fatalHr("CreateWicBitmapRenderTarget(cpu band)", hr);
+        }
+
+        const dc = com.queryInterface(render_target, win32.ID2D1DeviceContext);
+        defer _ = dc.IUnknown.Release();
+        dc.SetUnitMode(win32.D2D1_UNIT_MODE_PIXELS);
+
+        var brush: *win32.ID2D1SolidColorBrush = undefined;
+        {
+            const hr = render_target.CreateSolidColorBrush(
+                &.{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 },
+                null,
+                &brush,
+            );
+            if (hr < 0) com.fatalHr("CreateBrush(cpu band)", hr);
+        }
+
+        const pixels = std.heap.page_allocator.alloc(u8, @as(usize, width) * height * 4) catch
+            com.oom(error.OutOfMemory);
+
+        self.cached = .{
+            .width = width,
+            .height = height,
+            .bitmap = bitmap,
+            .render_target = render_target,
+            .brush = brush,
+            .pixels = pixels,
+        };
+        return &self.cached.?;
+    }
+
+    pub fn release(self: *CpuBandTexture) void {
+        releaseCached(&self.cached);
+    }
+
+    fn releaseCached(cached: *?Cached) void {
+        if (cached.*) |*c| {
+            std.heap.page_allocator.free(c.pixels);
+            _ = c.brush.IUnknown.Release();
+            _ = c.render_target.IUnknown.Release();
+            _ = c.bitmap.IUnknown.Release();
+            cached.* = null;
+        }
+    }
+};
+
 pub fn acquireFontWrite(mutex: *win32.IDXGIKeyedMutex) void {
     const hr = mutex.AcquireSync(0, win32.INFINITE);
     if (hr != 0) com.fatalHr("AcquireSync(font write)", hr);

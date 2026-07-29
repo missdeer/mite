@@ -1,0 +1,1334 @@
+//! D3D12 renderer backend.
+//!
+//! Fulfils the whole renderer facade contract, which is the precondition for
+//! being selectable at all: a backend that could only draw part of the
+//! picture would be a selectable broken terminal. It is nonetheless a
+//! research option, not a default — only static and low-frequency correctness
+//! is claimed here, and sustained-load behaviour is a later concern.
+//!
+//! Everything above the GPU boundary — translating terminal state into cells,
+//! glyph cache policy, grid geometry, dirty ranges — is the shared source in
+//! `d3d11/cell_buffer.zig`, `d3d11/glyph.zig` and friends, reached through the
+//! contract in `shared.zig`. This file is only the D3D12 half.
+
+const D3d12Renderer = @This();
+
+const std = @import("std");
+const builtin = @import("builtin");
+const vt = @import("vt");
+const win32 = @import("win32").everything;
+
+const Config = @import("../../Config.zig");
+const FontService = @import("../FontService.zig");
+const GlyphIndexCache = @import("../GlyphIndexCache.zig");
+const RendererCommon = @import("../RendererCommon.zig");
+const shared = @import("../shared.zig");
+const types = @import("../types.zig");
+
+const bg_image = @import("../d3d11/background_image.zig");
+const cell_buffer = @import("../d3d11/cell_buffer.zig");
+const com = @import("../d3d11/com.zig");
+const glyph_mod = @import("../d3d11/glyph.zig");
+const gpu = @import("../d3d11/gpu.zig");
+const grid = @import("../d3d11/grid.zig");
+const kitty_image_mod = @import("../d3d11/kitty_images.zig");
+const swap_chain_mod = @import("../d3d11/swap_chain.zig");
+const tabbar_paint = @import("../d3d11/tabbar_paint.zig");
+const shader_assets = @import("../shader_assets.zig");
+
+const pipeline = @import("pipeline.zig");
+const present = @import("present.zig");
+const upload = @import("upload.zig");
+
+const CellXY = gpu.CellXY;
+const shader = gpu.shader;
+
+const log = std.log.scoped(.d3d12);
+
+pub const BgImageDecoded = bg_image.BgImageDecoded;
+pub const RasterResult = FontService.RasterResult;
+pub const scrollbarWidth = gpu.scrollbarWidth;
+
+const debug_stats_enabled = builtin.mode == .Debug;
+const DebugStats = struct {
+    rows_uploaded: u64 = 0,
+    rows_skipped: u64 = 0,
+};
+
+/// This backend cannot open the font service's shared surfaces — the
+/// mutual-exclusion primitive they rely on has no D3D12 equivalent — so it
+/// takes glyph pixels as ordinary memory instead. Same rasterizer, different
+/// handoff form; see `shared.GlyphHandoff`.
+pub const glyph_handoff: shared.GlyphHandoff = .cpu_pixels;
+
+/// One inline image's GPU resource. Left in shader-readable state for its
+/// whole life, so drawing never has to transition it.
+pub const KittyImage = struct {
+    resource: *win32.ID3D12Resource,
+
+    pub fn release(self: *KittyImage) void {
+        _ = self.resource.IUnknown.Release();
+    }
+};
+
+pub const BackgroundImage = struct {
+    resource: ?*win32.ID3D12Resource = null,
+    src_w: u32 = 0,
+    src_h: u32 = 0,
+
+    pub fn loaded(self: BackgroundImage) bool {
+        return self.resource != null;
+    }
+
+    pub fn release(self: *BackgroundImage) void {
+        if (self.resource) |r| _ = r.IUnknown.Release();
+        self.* = .{};
+    }
+};
+
+// --- Shared-layer state (mirrors the other backend field for field) ---
+common: *RendererCommon,
+font_service: *FontService,
+shadow_cells: []shader.Cell = &.{},
+glyph_cache_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+glyph_cache: ?GlyphIndexCache = null,
+glyph_cache_cell_size: ?CellXY = null,
+cache_gen: u32 = 0,
+grid_force_full: bool = true,
+last_const_snapshot: grid.ConfigSnapshot = .{},
+stats: DebugStats = .{},
+diag_rows_uploaded: u64 = 0,
+diag_rows_skipped: u64 = 0,
+
+background_image: BackgroundImage = .{},
+bg_image_path: []const u8 = &.{},
+bg_image_opacity: f32 = 1.0,
+bg_image_position: Config.BackgroundImagePosition = .center,
+bg_image_fit: Config.BackgroundImageFit = .contain,
+bg_image_repeat: bool = false,
+bg_image_req_id: u32 = 0,
+kitty_images: kitty_image_mod.Cache(KittyImage) = .{},
+
+// --- D3D12 device and explicit synchronization ---
+device: *win32.ID3D12Device,
+queue: *win32.ID3D12CommandQueue,
+command_allocator: *win32.ID3D12CommandAllocator,
+command_list: *win32.ID3D12GraphicsCommandList,
+fence: *win32.ID3D12Fence,
+fence_event: win32.HANDLE,
+fence_value: u64 = 0,
+/// True while `command_list` is open. Uploads triggered outside a frame (an
+/// async glyph landing, say) accumulate in the same list and are carried by
+/// the next present.
+recording: bool = false,
+
+root_signature: *win32.ID3D12RootSignature,
+pso_grid: *win32.ID3D12PipelineState,
+pso_inline_image: *win32.ID3D12PipelineState,
+descriptors: pipeline.Descriptors,
+render_targets: pipeline.RenderTargets,
+arena: upload.Arena = .{},
+
+surface: ?present.Surface = null,
+occluded: bool = false,
+
+grid_target: upload.Tracked = .{},
+grid_size: win32.SIZE = .{ .cx = 0, .cy = 0 },
+back_buffer: upload.Tracked = .{},
+
+cells: upload.Tracked = .{},
+cells_count: u32 = 0,
+atlas: upload.Tracked = .{},
+atlas_size: ?CellXY = null,
+
+pub fn init(
+    common: *RendererCommon,
+    font_service: *FontService,
+    configured_gpu: ?[]const u8,
+) D3d12Renderer {
+    // A backend the user asked for by name must not quietly become a
+    // different one: a silent fallback would let a comparison study
+    // attribute the other backend's behaviour to this one. Every failure
+    // below therefore terminates rather than degrades.
+    const selected_adapter = if (configured_gpu) |name|
+        swap_chain_mod.findHardwareAdapterByName(name) orelse std.debug.panic(
+            "renderer = d3d12: configured GPU '{s}' was not found among hardware adapters",
+            .{name},
+        )
+    else
+        null;
+    defer if (selected_adapter) |a| {
+        _ = a.IUnknown.Release();
+    };
+
+    var device: *win32.ID3D12Device = undefined;
+    {
+        const hr = win32.D3D12CreateDevice(
+            if (selected_adapter) |a| @ptrCast(a) else null,
+            .@"11_0",
+            win32.IID_ID3D12Device,
+            @ptrCast(&device),
+        );
+        if (hr < 0) std.debug.panic(
+            "renderer = d3d12: no D3D12 device at feature level 11_0 (hresult=0x{x}); " ++
+                "this environment does not meet the backend's baseline",
+            .{@as(u32, @bitCast(hr))},
+        );
+    }
+
+    var queue: *win32.ID3D12CommandQueue = undefined;
+    {
+        const desc = win32.D3D12_COMMAND_QUEUE_DESC{
+            .Type = .DIRECT,
+            .Priority = 0,
+            .Flags = .{},
+            .NodeMask = 0,
+        };
+        const hr = device.CreateCommandQueue(&desc, win32.IID_ID3D12CommandQueue, @ptrCast(&queue));
+        if (hr < 0) fatal("CreateCommandQueue", hr);
+    }
+
+    var command_allocator: *win32.ID3D12CommandAllocator = undefined;
+    {
+        const hr = device.CreateCommandAllocator(
+            .DIRECT,
+            win32.IID_ID3D12CommandAllocator,
+            @ptrCast(&command_allocator),
+        );
+        if (hr < 0) fatal("CreateCommandAllocator", hr);
+    }
+
+    var command_list: *win32.ID3D12GraphicsCommandList = undefined;
+    {
+        const hr = device.CreateCommandList(
+            0,
+            .DIRECT,
+            command_allocator,
+            null,
+            win32.IID_ID3D12GraphicsCommandList,
+            @ptrCast(&command_list),
+        );
+        if (hr < 0) fatal("CreateCommandList", hr);
+        // Created open; close it so the first `beginRecording` starts from a
+        // known state like every later frame does.
+        if (command_list.Close() < 0) fatal("CreateCommandList/Close", 0);
+    }
+
+    var fence: *win32.ID3D12Fence = undefined;
+    {
+        const hr = device.CreateFence(0, .{}, win32.IID_ID3D12Fence, @ptrCast(&fence));
+        if (hr < 0) fatal("CreateFence", hr);
+    }
+    const fence_event = win32.CreateEventW(null, 0, 0, null) orelse
+        fatal("CreateEventW(fence)", 0);
+
+    const root_signature = pipeline.createRootSignature(device) catch |err| std.debug.panic(
+        "renderer = d3d12: resource binding layout rejected ({s})",
+        .{@errorName(err)},
+    );
+    const pso_grid = pipeline.createPipeline(
+        device,
+        root_signature,
+        shader_assets.pixel.dxil,
+        .opaque_write,
+    ) catch |err| std.debug.panic(
+        "renderer = d3d12: grid pipeline state rejected ({s}); the generated " ++
+            "Shader Model 6 assets are not usable in this environment",
+        .{@errorName(err)},
+    );
+    const pso_inline_image = pipeline.createPipeline(
+        device,
+        root_signature,
+        shader_assets.image_pixel.dxil,
+        .premultiplied_over,
+    ) catch |err| std.debug.panic(
+        "renderer = d3d12: inline-image pipeline state rejected ({s})",
+        .{@errorName(err)},
+    );
+    const descriptors = pipeline.Descriptors.init(device, pipeline.initial_table_count) catch |err| std.debug.panic(
+        "renderer = d3d12: descriptor heap unavailable ({s})",
+        .{@errorName(err)},
+    );
+    const render_targets = pipeline.RenderTargets.init(device) catch |err| std.debug.panic(
+        "renderer = d3d12: render-target descriptor heap unavailable ({s})",
+        .{@errorName(err)},
+    );
+
+    // The other backend classifies the adapter for its present policy; do the
+    // same so the shared throttle decision sees identical inputs.
+    common.remote_or_software_adapter = detectRemoteOrSoftware(selected_adapter);
+    log.info(
+        "D3D12 device created (research backend): selection={s}, remote_or_software={}",
+        .{ if (configured_gpu != null) "explicit" else "automatic", common.remote_or_software_adapter },
+    );
+
+    return .{
+        .common = common,
+        .font_service = font_service,
+        .device = device,
+        .queue = queue,
+        .command_allocator = command_allocator,
+        .command_list = command_list,
+        .fence = fence,
+        .fence_event = fence_event,
+        .root_signature = root_signature,
+        .pso_grid = pso_grid,
+        .pso_inline_image = pso_inline_image,
+        .descriptors = descriptors,
+        .render_targets = render_targets,
+    };
+}
+
+fn fatal(what: []const u8, hr: i32) noreturn {
+    std.debug.panic("renderer = d3d12: {s} failed (hresult=0x{x})", .{ what, @as(u32, @bitCast(hr)) });
+}
+
+fn detectRemoteOrSoftware(adapter: ?*win32.IDXGIAdapter1) bool {
+    const a = adapter orelse return false;
+    var desc: win32.DXGI_ADAPTER_DESC1 = undefined;
+    if (a.GetDesc1(&desc) < 0) return false;
+    const software_flag: u32 = @bitCast(win32.DXGI_ADAPTER_FLAG_SOFTWARE);
+    return desc.Flags & software_flag != 0;
+}
+
+pub fn deinit(self: *D3d12Renderer) void {
+    self.waitForGpu();
+    if (self.recording) {
+        _ = self.command_list.Close();
+        self.recording = false;
+    }
+
+    self.kitty_images.deinit(std.heap.page_allocator);
+    if (self.glyph_cache) |*c| {
+        c.deinit(self.glyph_cache_arena.allocator());
+        self.glyph_cache = null;
+    }
+    _ = self.glyph_cache_arena.reset(.free_all);
+    std.heap.page_allocator.free(self.shadow_cells);
+    self.shadow_cells = &.{};
+
+    self.background_image.release();
+    self.atlas.release();
+    self.cells.release();
+    self.back_buffer.release();
+    self.grid_target.release();
+    self.arena.deinit();
+
+    self.render_targets.release();
+    self.descriptors.release();
+    _ = self.pso_inline_image.IUnknown.Release();
+    _ = self.pso_grid.IUnknown.Release();
+    _ = self.root_signature.IUnknown.Release();
+
+    if (self.surface) |*s| s.deinit();
+    self.surface = null;
+
+    _ = win32.CloseHandle(self.fence_event);
+    _ = self.fence.IUnknown.Release();
+    _ = self.command_list.IUnknown.Release();
+    _ = self.command_allocator.IUnknown.Release();
+    _ = self.queue.IUnknown.Release();
+    _ = self.device.IUnknown.Release();
+    self.* = undefined;
+}
+
+pub fn onFontStateChanged(self: *D3d12Renderer) void {
+    self.cache_gen +%= 1;
+    if (self.glyph_cache) |*cache| {
+        cache.deinit(self.glyph_cache_arena.allocator());
+        self.glyph_cache = null;
+    }
+    _ = self.glyph_cache_arena.reset(.free_all);
+    self.glyph_cache_cell_size = null;
+    self.grid_force_full = true;
+}
+
+// --- Explicit synchronization ---
+
+fn beginRecording(self: *D3d12Renderer) void {
+    if (self.recording) return;
+    if (self.command_list.Reset(self.command_allocator, null) < 0) fatal("CommandList.Reset", 0);
+    self.recording = true;
+}
+
+/// Submit whatever has been recorded and block until the GPU is done with it.
+///
+/// Blocking is the whole conservative-upload model: once this returns, every
+/// upload region the GPU could have been reading is provably free, so the
+/// arena can rewind without tracking per-region lifetimes. Trading throughput
+/// for a correctness property that is otherwise only observable as
+/// intermittent corruption is the point of this slice.
+fn flushGpu(self: *D3d12Renderer) void {
+    if (!self.recording) return;
+    if (self.command_list.Close() < 0) fatal("CommandList.Close", 0);
+    self.recording = false;
+
+    var lists = [_]?*win32.ID3D12CommandList{@ptrCast(self.command_list)};
+    self.queue.ExecuteCommandLists(lists.len, &lists);
+    self.waitForGpu();
+    if (self.command_allocator.Reset() < 0) fatal("CommandAllocator.Reset", 0);
+    self.arena.rewind();
+}
+
+/// Make it safe to release a resource that recorded work may reference.
+///
+/// A D3D12 command list does not keep the resources it names alive, so
+/// waiting on the fence is not enough on its own: anything already recorded
+/// but not yet submitted would execute against freed memory. Submitting first
+/// and only then waiting is what closes that window.
+fn settleBeforeRelease(self: *D3d12Renderer) void {
+    if (!self.recording) {
+        self.waitForGpu();
+        return;
+    }
+    self.flushGpu();
+    // Reopen: callers record immediately afterwards, and a closed list would
+    // swallow everything they record until the next flush skipped submission
+    // entirely for want of an open list.
+    self.beginRecording();
+}
+
+fn waitForGpu(self: *D3d12Renderer) void {
+    self.fence_value += 1;
+    if (self.queue.Signal(self.fence, self.fence_value) < 0) fatal("Queue.Signal", 0);
+    if (self.fence.GetCompletedValue() >= self.fence_value) return;
+    if (self.fence.SetEventOnCompletion(self.fence_value, self.fence_event) < 0) {
+        fatal("SetEventOnCompletion", 0);
+    }
+    // Bounded so a wedged GPU surfaces as a hang we can see rather than an
+    // unkillable message pump.
+    if (win32.WaitForSingleObject(self.fence_event, 10_000) != .NO_ERROR) {
+        fatal("WaitForSingleObject(fence)", 0);
+    }
+}
+
+fn flushTrampoline(ctx: *anyopaque) void {
+    const self: *D3d12Renderer = @ptrCast(@alignCast(ctx));
+    self.flushGpu();
+    self.beginRecording();
+}
+
+fn reserve(self: *D3d12Renderer, len: u64, alignment: u64) upload.Arena.Reservation {
+    return self.arena.reserve(self.device, len, alignment, self, flushTrampoline) catch |err| {
+        std.debug.panic("renderer = d3d12: upload staging failed ({s})", .{@errorName(err)});
+    };
+}
+
+// --- Shared-layer GPU contract ---
+
+pub fn cellsResize(self: *D3d12Renderer, count: u32) bool {
+    if (count == self.cells_count and self.cells.resource != null) return false;
+    self.settleBeforeRelease();
+    self.cells.release();
+    self.cells_count = count;
+    if (count == 0) {
+        // The table stays bound even with no cells, and D3D12 requires every
+        // descriptor it covers to be valid — a stale one would point at the
+        // buffer just released.
+        self.refreshSharedDescriptors();
+        return true;
+    }
+
+    const bytes: u64 = @as(u64, count) * @sizeOf(shader.Cell);
+    var resource: *win32.ID3D12Resource = undefined;
+    const props = upload.heapProps(.DEFAULT);
+    const desc = upload.bufferDesc(bytes);
+    if (self.device.CreateCommittedResource(
+        &props,
+        .{},
+        &desc,
+        win32.D3D12_RESOURCE_STATE_COPY_DEST,
+        null,
+        win32.IID_ID3D12Resource,
+        @ptrCast(&resource),
+    ) < 0) fatal("CreateCommittedResource(cells)", 0);
+    self.cells = .{ .resource = resource, .state = win32.D3D12_RESOURCE_STATE_COPY_DEST };
+
+    self.refreshSharedDescriptors();
+    return true;
+}
+
+pub fn cellsUpload(self: *D3d12Renderer, first_cell: u32, cells: []const shader.Cell) void {
+    const resource = self.cells.resource orelse return;
+    self.beginRecording();
+    self.cells.moveTo(self.command_list, win32.D3D12_RESOURCE_STATE_COPY_DEST);
+
+    const bytes = std.mem.sliceAsBytes(cells);
+    const res = self.reserve(bytes.len, 4);
+    @memcpy(res.bytes, bytes);
+    self.command_list.CopyBufferRegion(
+        resource,
+        @as(u64, first_cell) * @sizeOf(shader.Cell),
+        self.arena.buffer.?,
+        res.offset,
+        bytes.len,
+    );
+}
+
+pub fn atlasEnsure(self: *D3d12Renderer, tex_pixel: CellXY) bool {
+    if (self.atlas_size) |s| {
+        if (s.eql(tex_pixel)) return true;
+    }
+    self.settleBeforeRelease();
+    self.atlas.release();
+
+    var resource: *win32.ID3D12Resource = undefined;
+    const props = upload.heapProps(.DEFAULT);
+    const desc = upload.texture2dDesc(.B8G8R8A8_UNORM, tex_pixel.x, tex_pixel.y, .{});
+    if (self.device.CreateCommittedResource(
+        &props,
+        .{},
+        &desc,
+        win32.D3D12_RESOURCE_STATE_COPY_DEST,
+        null,
+        win32.IID_ID3D12Resource,
+        @ptrCast(&resource),
+    ) < 0) fatal("CreateCommittedResource(glyph atlas)", 0);
+    self.atlas = .{ .resource = resource, .state = win32.D3D12_RESOURCE_STATE_COPY_DEST };
+    self.atlas_size = tex_pixel;
+
+    self.refreshSharedDescriptors();
+    return false;
+}
+
+pub fn atlasWriteCpu(
+    self: *D3d12Renderer,
+    dst_coord: CellXY,
+    region: CellXY,
+    src_ptr: [*]const u8,
+    src_row_pitch: u32,
+) void {
+    const resource = self.atlas.resource orelse return;
+    self.beginRecording();
+    self.atlas.moveTo(self.command_list, win32.D3D12_RESOURCE_STATE_COPY_DEST);
+
+    // D3D12 requires each staged row to start on a 256-byte boundary, so the
+    // caller's rows are repacked rather than copied wholesale.
+    const dst_pitch: u32 = @intCast(upload.alignUp(@as(u64, region.x) * 4, upload.texture_row_alignment));
+    const total: u64 = @as(u64, dst_pitch) * region.y;
+    const res = self.reserve(total, upload.texture_placement_alignment);
+    const row_bytes: usize = @as(usize, region.x) * 4;
+    var y: u32 = 0;
+    while (y < region.y) : (y += 1) {
+        const src = src_ptr[y * src_row_pitch ..][0..row_bytes];
+        @memcpy(res.bytes[y * dst_pitch ..][0..row_bytes], src);
+    }
+
+    const src_loc = win32.D3D12_TEXTURE_COPY_LOCATION{
+        .pResource = self.arena.buffer.?,
+        .Type = .PLACED_FOOTPRINT,
+        .Anonymous = .{ .PlacedFootprint = .{
+            .Offset = res.offset,
+            .Footprint = .{
+                .Format = .B8G8R8A8_UNORM,
+                .Width = region.x,
+                .Height = region.y,
+                .Depth = 1,
+                .RowPitch = dst_pitch,
+            },
+        } },
+    };
+    const dst_loc = win32.D3D12_TEXTURE_COPY_LOCATION{
+        .pResource = resource,
+        .Type = .SUBRESOURCE_INDEX,
+        .Anonymous = .{ .SubresourceIndex = 0 },
+    };
+    self.command_list.CopyTextureRegion(&dst_loc, dst_coord.x, dst_coord.y, 0, &src_loc, null);
+}
+
+pub fn atlasClear(self: *D3d12Renderer, dst_coord: CellXY) void {
+    const cs = self.font_service.cell_size_xy;
+    const row_bytes: usize = @as(usize, cs.x) * 4;
+    const zeros = std.heap.page_allocator.alloc(u8, row_bytes * cs.y) catch return;
+    defer std.heap.page_allocator.free(zeros);
+    @memset(zeros, 0);
+    self.atlasWriteCpu(dst_coord, cs, zeros.ptr, @intCast(row_bytes));
+}
+
+/// Unreachable for this backend: it declares `cpu_pixels`, so the shared
+/// glyph path never takes the shared-surface branch. Present only so the
+/// contract surface is identical for both backends.
+pub fn atlasCopyStaging(
+    self: *D3d12Renderer,
+    staging: *gpu.StagingTexture.Cached,
+    first: ?gpu.AtlasCopy,
+    second: ?gpu.AtlasCopy,
+) void {
+    _ = .{ self, staging, first, second };
+    unreachable;
+}
+
+/// Drop the background image and re-point every t2 descriptor at nothing.
+/// Leaving them addressing a released resource is exactly the kind of stale
+/// descriptor D3D12 will happily sample from.
+pub fn backgroundImageRelease(self: *D3d12Renderer) void {
+    if (!self.background_image.loaded()) return;
+    self.settleBeforeRelease();
+    self.background_image.release();
+    self.refreshSharedDescriptors();
+}
+
+pub fn backgroundImageUpload(self: *D3d12Renderer, decoded: gpu.DecodedBackground) void {
+    self.backgroundImageRelease();
+    const resource = self.uploadTexture(
+        .B8G8R8A8_UNORM,
+        decoded.w,
+        decoded.h,
+        decoded.pixels,
+        decoded.w * 4,
+    ) orelse {
+        log.warn("background-image: D3D12 upload failed", .{});
+        return;
+    };
+    self.background_image = .{ .resource = resource, .src_w = decoded.w, .src_h = decoded.h };
+    self.refreshSharedDescriptors();
+}
+
+pub fn kittyImageUpload(
+    self: *D3d12Renderer,
+    width: u32,
+    height: u32,
+    rgba: []const u8,
+) ?KittyImage {
+    const resource = self.uploadTexture(.R8G8B8A8_UNORM, width, height, rgba, width * 4) orelse
+        return null;
+    return .{ .resource = resource };
+}
+
+/// Create a texture, stage its pixels and leave it shader-readable.
+fn uploadTexture(
+    self: *D3d12Renderer,
+    format: win32.DXGI_FORMAT,
+    width: u32,
+    height: u32,
+    pixels: []const u8,
+    src_pitch: u32,
+) ?*win32.ID3D12Resource {
+    var resource: *win32.ID3D12Resource = undefined;
+    const props = upload.heapProps(.DEFAULT);
+    const desc = upload.texture2dDesc(format, width, height, .{});
+    if (self.device.CreateCommittedResource(
+        &props,
+        .{},
+        &desc,
+        win32.D3D12_RESOURCE_STATE_COPY_DEST,
+        null,
+        win32.IID_ID3D12Resource,
+        @ptrCast(&resource),
+    ) < 0) return null;
+
+    self.beginRecording();
+    const dst_pitch: u32 = @intCast(upload.alignUp(@as(u64, width) * 4, upload.texture_row_alignment));
+    const res = self.reserve(@as(u64, dst_pitch) * height, upload.texture_placement_alignment);
+    const row_bytes: usize = @as(usize, width) * 4;
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        @memcpy(res.bytes[y * dst_pitch ..][0..row_bytes], pixels[y * src_pitch ..][0..row_bytes]);
+    }
+
+    const src_loc = win32.D3D12_TEXTURE_COPY_LOCATION{
+        .pResource = self.arena.buffer.?,
+        .Type = .PLACED_FOOTPRINT,
+        .Anonymous = .{ .PlacedFootprint = .{
+            .Offset = res.offset,
+            .Footprint = .{
+                .Format = format,
+                .Width = width,
+                .Height = height,
+                .Depth = 1,
+                .RowPitch = dst_pitch,
+            },
+        } },
+    };
+    const dst_loc = win32.D3D12_TEXTURE_COPY_LOCATION{
+        .pResource = resource,
+        .Type = .SUBRESOURCE_INDEX,
+        .Anonymous = .{ .SubresourceIndex = 0 },
+    };
+    self.command_list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, null);
+
+    var barrier = [_]win32.D3D12_RESOURCE_BARRIER{upload.transition(
+        resource,
+        win32.D3D12_RESOURCE_STATE_COPY_DEST,
+        win32.D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    )};
+    self.command_list.ResourceBarrier(barrier.len, &barrier);
+    return resource;
+}
+
+// --- Facade contract ---
+
+pub fn render(
+    self: *D3d12Renderer,
+    hwnd: win32.HWND,
+    tab_id: types.TabId,
+    term: *vt.Terminal,
+    tabbar: types.TabBarDraw,
+    resizing: bool,
+    mouse_in_scrollbar: bool,
+    selection_fade: f32,
+    cursor_text: ?u24,
+    selection_bg: ?u24,
+    selection_fg: ?u24,
+    background_opacity: f32,
+    remote_session: bool,
+    url_highlight: ?types.UrlHighlight,
+) void {
+    const prepared = self.prepareFrame(hwnd, term, mouse_in_scrollbar) orelse return;
+
+    const cell_count = prepared.shader_col * prepared.term_shader_row;
+    if (self.kitty_images.sync(std.heap.page_allocator, self, tab_id, term)) {
+        self.grid_force_full = true;
+    }
+    const inline_images_present = self.kitty_images.hasVisibleAboveTextPlacements();
+
+    const build = cell_buffer.buildAndUpload(
+        self,
+        term,
+        prepared.shader_col,
+        prepared.term_shader_row,
+        prepared.tex_cell_count,
+        prepared.atlas,
+        resizing,
+        selection_fade,
+        cursor_text,
+        selection_bg,
+        selection_fg,
+        background_opacity,
+        url_highlight,
+    );
+    if (build.has_blink) {
+        _ = win32.SetTimer(hwnd, types.TIMER_TEXT_BLINK, 250, null);
+    } else {
+        _ = win32.KillTimer(hwnd, types.TIMER_TEXT_BLINK);
+    }
+
+    self.drawAndPresent(prepared, tabbar, remote_session, .{
+        .cell_count = cell_count,
+        .dirty_min_row = build.dirty_min_row,
+        .dirty_max_row = build.dirty_max_row,
+        .resizing = resizing,
+        .inline_images_present = inline_images_present,
+    });
+}
+
+const PreparedFrame = struct {
+    client_w: u32,
+    client_h: u32,
+    cs: CellXY,
+    shader_col: u32,
+    tab_bar_h: u32,
+    term_pixel_h: u32,
+    term_shader_row: u32,
+    atlas: gpu.AtlasFrame,
+    tex_cell_count: CellXY,
+    /// Staged into the upload arena only once every upload for this frame is
+    /// recorded. Reserving it earlier would risk a mid-frame arena rewind
+    /// handing the same bytes to something else before the draw reads them.
+    config: shader.GridConfig,
+};
+
+fn prepareFrame(
+    self: *D3d12Renderer,
+    hwnd: win32.HWND,
+    term: *vt.Terminal,
+    mouse_in_scrollbar: bool,
+) ?PreparedFrame {
+    const sz = win32.getClientSize(hwnd);
+    const client_w: u32 = @intCast(sz.cx);
+    const client_h: u32 = @intCast(sz.cy);
+    if (client_w == 0 or client_h == 0) return null;
+
+    if (self.surface == null) {
+        self.surface = present.Surface.init(self.queue, hwnd, client_w, client_h) catch |err|
+            std.debug.panic(
+                "renderer = d3d12: presentation surface could not be attached to desktop " ++
+                    "composition ({s}); the backend cannot complete a first frame",
+                .{@errorName(err)},
+            );
+    }
+    const surface = &self.surface.?;
+
+    const surface_size = surface.size() orelse std.debug.panic(
+        "renderer = d3d12: presentation surface size is unreadable; the grid would be " ++
+            "copied into a back buffer of unknown extent",
+        .{},
+    );
+    {
+        const current = surface_size;
+        if (current.w != client_w or current.h != client_h) {
+            // Every view onto the old buffers has to be gone before DXGI will
+            // resize, and the GPU has to be done with them first.
+            // Submit rather than discard: glyph and image uploads recorded
+            // between frames are already reflected in the tracked resource
+            // states, so dropping them would leave those states describing
+            // barriers the GPU never saw.
+            self.settleBeforeRelease();
+            self.back_buffer.release();
+            self.grid_target.release();
+            self.grid_size = .{ .cx = 0, .cy = 0 };
+            surface.resize(client_w, client_h) catch |err| std.debug.panic(
+                "renderer = d3d12: presentation surface resize failed ({s})",
+                .{@errorName(err)},
+            );
+        }
+    }
+
+    if (self.occluded) {
+        const hr = surface.swap_chain.IDXGISwapChain.Present(0, win32.DXGI_PRESENT_TEST);
+        if (hr == present.DXGI_STATUS_OCCLUDED) {
+            self.grid_force_full = true;
+            return null;
+        }
+        if (hr < 0) std.debug.panic(
+            "renderer = d3d12: occlusion probe failed (hresult=0x{x}); the backend can no " ++
+                "longer meet its baseline and recovery is out of scope",
+            .{@as(u32, @bitCast(hr))},
+        );
+        self.occluded = false;
+        self.grid_force_full = true;
+    }
+
+    // The existing presentation-latency gate is reused unchanged. This
+    // backend's own completion signal stays out of the throttle decision:
+    // merging the two synchronization lines is a later concern, and doing it
+    // here would make this slice answer for latency as well as correctness.
+    surface.waitForFrameLatency();
+
+    self.ensureGridTarget(client_w, client_h);
+
+    const cs = self.font_service.cell_size_xy;
+    const sb_px: u32 = scrollbarWidth(win32.dpiFromHwnd(hwnd));
+    const grid_w: u32 = client_w -| sb_px;
+    const shader_col: u32 = @divTrunc(grid_w + cs.x - 1, cs.x);
+    const tab_bar_h: u32 = @intCast(@max(0, self.common.tab_bar_height));
+    const term_pixel_h: u32 = client_h -| tab_bar_h;
+    const term_shader_row: u32 = @divTrunc(term_pixel_h + cs.y - 1, cs.y);
+    if (shader_col > cell_buffer.max_shader_col) return null;
+
+    const atlas = glyph_mod.setupGlyphAtlas(self);
+    const tex_cell_count = atlas.tex_cell_count;
+
+    var sb_geom: struct { x: f32, y: f32, w: f32, h: f32 } = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    {
+        const sb = term.screens.active.pages.scrollbar();
+        const show = sb.total > sb.len and
+            (!term.screens.active.viewportIsBottom() or mouse_in_scrollbar);
+        if (show) {
+            const origin_y: f32 = @floatFromInt(tab_bar_h);
+            const win_h: f32 = @floatFromInt(client_h -| tab_bar_h);
+            const min_track: f32 = 20.0;
+            const track_h = @max(min_track, @as(f32, @floatFromInt(sb.len)) /
+                @as(f32, @floatFromInt(sb.total)) * win_h);
+            const max_offset = sb.total - sb.len;
+            const track_y = origin_y + @as(f32, @floatFromInt(sb.offset)) /
+                @as(f32, @floatFromInt(max_offset)) * (win_h - track_h);
+            sb_geom = .{
+                .x = @floatFromInt(grid_w),
+                .y = track_y,
+                .w = @floatFromInt(sb_px),
+                .h = track_h,
+            };
+        }
+    }
+
+    const snapshot: grid.ConfigSnapshot = .{
+        .cell_w = cs.x,
+        .cell_h = cs.y,
+        .col_count = shader_col,
+        .row_count = term_shader_row,
+        .cells_per_row = tex_cell_count.x,
+        .tab_bar_height = tab_bar_h,
+        .scrollbar_x = sb_geom.x,
+        .scrollbar_y = sb_geom.y,
+        .scrollbar_width = sb_geom.w,
+        .scrollbar_height = sb_geom.h,
+    };
+    if (!snapshot.eql(self.last_const_snapshot)) {
+        self.grid_force_full = true;
+        self.last_const_snapshot = snapshot;
+    }
+
+    var config: shader.GridConfig = .{
+        .cell_size = .{ cs.x, cs.y },
+        .col_count = shader_col,
+        .row_count = term_shader_row,
+        .scrollbar_y = sb_geom.y,
+        .scrollbar_height = sb_geom.h,
+        .scrollbar_x = sb_geom.x,
+        .scrollbar_width = sb_geom.w,
+        .cells_per_row = tex_cell_count.x,
+        .tab_bar_height = tab_bar_h,
+    };
+    if (self.background_image.loaded()) {
+        config.bg_image_flags = 1 | @as(u32, if (self.bg_image_repeat) 2 else 0);
+        config.bg_image_opacity = self.bg_image_opacity;
+        config.bg_image_dest = bg_image.computeDest(
+            self,
+            @floatFromInt(shader_col * cs.x),
+            @floatFromInt(term_shader_row * cs.y),
+        );
+    }
+
+    self.beginRecording();
+    return .{
+        .client_w = client_w,
+        .client_h = client_h,
+        .cs = cs,
+        .shader_col = shader_col,
+        .tab_bar_h = tab_bar_h,
+        .term_pixel_h = term_pixel_h,
+        .term_shader_row = term_shader_row,
+        .atlas = atlas,
+        .tex_cell_count = tex_cell_count,
+        .config = config,
+    };
+}
+
+/// The grid is drawn into a texture we own rather than straight into the back
+/// buffer, because flip-model back-buffer contents are undefined after each
+/// present and partial redraws would have nothing valid to build on.
+fn ensureGridTarget(self: *D3d12Renderer, width: u32, height: u32) void {
+    if (self.grid_target.resource != null and
+        self.grid_size.cx == @as(i32, @intCast(width)) and
+        self.grid_size.cy == @as(i32, @intCast(height)))
+    {
+        return;
+    }
+    self.settleBeforeRelease();
+    self.grid_target.release();
+
+    var resource: *win32.ID3D12Resource = undefined;
+    const props = upload.heapProps(.DEFAULT);
+    const desc = upload.texture2dDesc(
+        pipeline.grid_resource_format,
+        width,
+        height,
+        .{ .ALLOW_RENDER_TARGET = 1 },
+    );
+    if (self.device.CreateCommittedResource(
+        &props,
+        .{},
+        &desc,
+        win32.D3D12_RESOURCE_STATE_RENDER_TARGET,
+        null,
+        win32.IID_ID3D12Resource,
+        @ptrCast(&resource),
+    ) < 0) fatal("CreateCommittedResource(grid)", 0);
+    self.grid_target = .{
+        .resource = resource,
+        .state = win32.D3D12_RESOURCE_STATE_RENDER_TARGET,
+    };
+    self.grid_size = .{ .cx = @intCast(width), .cy = @intCast(height) };
+
+    const rtv_desc = win32.D3D12_RENDER_TARGET_VIEW_DESC{
+        .Format = pipeline.render_target_view_format,
+        .ViewDimension = .TEXTURE2D,
+        .Anonymous = .{ .Texture2D = .{ .MipSlice = 0, .PlaneSlice = 0 } },
+    };
+    self.device.CreateRenderTargetView(resource, &rtv_desc, self.render_targets.cpu());
+    // Fresh contents are undefined, so the next frame has to cover every
+    // pixel rather than just the dirty rows.
+    self.grid_force_full = true;
+}
+
+const DrawInputs = struct {
+    cell_count: u32,
+    dirty_min_row: ?u32,
+    dirty_max_row: ?u32,
+    resizing: bool,
+    inline_images_present: bool,
+};
+
+fn drawAndPresent(
+    self: *D3d12Renderer,
+    prepared: PreparedFrame,
+    tabbar: types.TabBarDraw,
+    remote_session: bool,
+    in: DrawInputs,
+) void {
+    const surface = &self.surface.?;
+    self.beginRecording();
+    const list = self.command_list;
+
+    // Everything this frame will still stage is reserved before any pipeline
+    // state is set, then the arena is sealed. A flush part-way through would
+    // reset the command list and silently drop the state recorded draws
+    // depend on; a growth would free the buffer they point into. Forcing both
+    // to happen here, or not at all, closes that window.
+    const visible_placements = self.countVisiblePlacements();
+    self.ensureDescriptorCapacity(visible_placements);
+    const band_bytes: u64 = if (prepared.tab_bar_h > 0) blk: {
+        const pitch = upload.alignUp(@as(u64, prepared.client_w) * 4, upload.texture_row_alignment);
+        break :blk pitch * @min(prepared.tab_bar_h, prepared.client_h) +
+            upload.texture_placement_alignment;
+    } else 0;
+    const constant_bytes: u64 = upload.constant_buffer_alignment * (1 + visible_placements);
+    self.arena.ensureCapacityFor(
+        self.device,
+        constant_bytes + band_bytes,
+        upload.texture_placement_alignment,
+        self,
+        flushTrampoline,
+    ) catch |err| std.debug.panic(
+        "renderer = d3d12: could not stage a frame's uploads ({s})",
+        .{@errorName(err)},
+    );
+    self.arena.sealed = true;
+    defer self.arena.sealed = false;
+
+    // Uploads recorded during cell building must finish before the shader
+    // reads them; these two transitions are what make that ordering explicit
+    // rather than a driver's problem.
+    self.cells.moveTo(list, win32.D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    self.atlas.moveTo(list, win32.D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    const full_redraw = self.grid_force_full or in.resizing or
+        (in.inline_images_present and in.dirty_min_row != null);
+    const do_draw = full_redraw or in.dirty_min_row != null;
+
+    if (do_draw) {
+        self.grid_target.moveTo(list, win32.D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const rtv = self.render_targets.cpu();
+        list.OMSetRenderTargets(1, &rtv, win32.FALSE, null);
+
+        var heaps = [_]?*win32.ID3D12DescriptorHeap{self.descriptors.heap};
+        list.SetDescriptorHeaps(heaps.len, &heaps);
+        list.SetGraphicsRootSignature(self.root_signature);
+        var config = prepared.config;
+        const config_bytes = std.mem.asBytes(&config);
+        const config_res = self.reserve(config_bytes.len, upload.constant_buffer_alignment);
+        @memcpy(config_res.bytes, config_bytes);
+        list.SetGraphicsRootConstantBufferView(
+            0,
+            self.arena.buffer.?.GetGPUVirtualAddress() + config_res.offset,
+        );
+        list.SetGraphicsRootDescriptorTable(1, self.descriptors.gpu(0));
+        list.SetPipelineState(self.pso_grid);
+        list.IASetPrimitiveTopology(._PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+        // Viewport offsets the grid below the tab-bar band; the shader
+        // subtracts the same offset when mapping pixels to cells.
+        var viewport = [_]win32.D3D12_VIEWPORT{.{
+            .TopLeftX = 0,
+            .TopLeftY = @floatFromInt(prepared.tab_bar_h),
+            .Width = @floatFromInt(prepared.client_w),
+            .Height = @floatFromInt(prepared.term_pixel_h),
+            .MinDepth = 0.0,
+            .MaxDepth = 0.0,
+        }};
+        list.RSSetViewports(1, &viewport);
+
+        var scissor = [_]win32.RECT{if (full_redraw) .{
+            .left = 0,
+            .top = 0,
+            .right = @intCast(prepared.client_w),
+            .bottom = @intCast(prepared.client_h),
+        } else blk: {
+            const last_row = prepared.term_shader_row -| 1;
+            const lo = @min(in.dirty_min_row.?, last_row);
+            const hi = @min(in.dirty_max_row.?, last_row);
+            break :blk .{
+                .left = 0,
+                .top = @intCast(prepared.tab_bar_h + lo * prepared.cs.y),
+                .right = @intCast(prepared.client_w),
+                .bottom = @intCast(@min(
+                    prepared.tab_bar_h + (hi + 1) * prepared.cs.y,
+                    prepared.client_h,
+                )),
+            };
+        }};
+        list.RSSetScissorRects(1, &scissor);
+
+        // No clear: the shader writes every pixel inside the scissor,
+        // including blank cells' background, and outside it the texture still
+        // holds last frame's correct pixels.
+        list.DrawInstanced(4, 1, 0, 0);
+
+        if (in.inline_images_present) self.drawInlineImages(prepared);
+        self.grid_force_full = false;
+    }
+
+    const back_buffer = surface.currentBackBuffer() orelse {
+        // Submit what was recorded so the list does not carry into the next
+        // frame, then stop: without a back buffer this backend cannot present
+        // at all, and quietly dropping frames forever is precisely the
+        // partially-capable state that must not be allowed to persist.
+        self.flushGpu();
+        std.debug.panic(
+            "renderer = d3d12: the swap chain yielded no back buffer; the backend can no " ++
+                "longer meet its baseline and recovery is out of scope",
+            .{},
+        );
+    };
+    self.back_buffer.release();
+    self.back_buffer = .{
+        .resource = back_buffer,
+        .state = win32.D3D12_RESOURCE_STATE_PRESENT,
+    };
+
+    self.grid_target.moveTo(list, win32.D3D12_RESOURCE_STATE_COPY_SOURCE);
+    self.back_buffer.moveTo(list, win32.D3D12_RESOURCE_STATE_COPY_DEST);
+    list.CopyResource(back_buffer, self.grid_target.resource.?);
+
+    self.copyTabBarBand(prepared, tabbar);
+
+    self.back_buffer.moveTo(list, win32.D3D12_RESOURCE_STATE_PRESENT);
+    self.flushGpu();
+
+    const sync_interval: u32 = if (self.common.remote_or_software_adapter or remote_session) 1 else 0;
+    const hr = surface.swap_chain.IDXGISwapChain.Present(sync_interval, 0);
+    if (hr == present.DXGI_STATUS_OCCLUDED) {
+        self.occluded = true;
+    } else if (hr < 0) {
+        // Device removal and presentation failure are outside this slice's
+        // recovery scope. Carrying on would leave a backend that was asked
+        // for by name running in a state it cannot draw from, which is worse
+        // than stopping: a comparison study would record its output as this
+        // backend's real behaviour.
+        std.debug.panic(
+            "renderer = d3d12: Present failed (hresult=0x{x}); the backend can no longer " ++
+                "meet its baseline and recovery is out of scope",
+            .{@as(u32, @bitCast(hr))},
+        );
+    }
+}
+
+/// Placements that will actually be drawn this frame. Counted before any
+/// staging so descriptor and upload capacity can both be sized exactly.
+fn countVisiblePlacements(self: *D3d12Renderer) u32 {
+    var n: u32 = 0;
+    for (self.kitty_images.placements.items) |p| {
+        if (p.z >= 0) n += 1;
+    }
+    return n;
+}
+
+/// Grow the descriptor heap so every placement can have its own table.
+///
+/// Sharing one table between placements is not an option — the GPU reads
+/// descriptors when the work runs, so all of them would sample whichever
+/// image was written last — and silently dropping placements past a fixed
+/// limit would make real terminal content disappear.
+fn ensureDescriptorCapacity(self: *D3d12Renderer, placements: u32) void {
+    const wanted = 1 + placements;
+    if (wanted <= self.descriptors.table_count) return;
+    self.settleBeforeRelease();
+    self.descriptors.release();
+    self.descriptors = pipeline.Descriptors.init(self.device, wanted) catch |err|
+        std.debug.panic(
+            "renderer = d3d12: descriptor heap for {d} inline images unavailable ({s})",
+            .{ placements, @errorName(err) },
+        );
+    self.refreshSharedDescriptors();
+}
+
+/// (Re)write the descriptors every table shares. Slot 3 is filled with a null
+/// view so the table is complete even when nothing is bound there: D3D12
+/// requires every descriptor a bound table covers to be initialized, whether
+/// or not the shader ends up reading it.
+fn refreshSharedDescriptors(self: *D3d12Renderer) void {
+    const cell_view = win32.D3D12_SHADER_RESOURCE_VIEW_DESC{
+        .Format = .UNKNOWN,
+        .ViewDimension = .BUFFER,
+        .Shader4ComponentMapping = win32.D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        .Anonymous = .{ .Buffer = .{
+            .FirstElement = 0,
+            .NumElements = @max(1, self.cells_count),
+            .StructureByteStride = @sizeOf(shader.Cell),
+            .Flags = .{},
+        } },
+    };
+    const texture_view = win32.D3D12_SHADER_RESOURCE_VIEW_DESC{
+        .Format = .B8G8R8A8_UNORM,
+        .ViewDimension = .TEXTURE2D,
+        .Shader4ComponentMapping = win32.D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        .Anonymous = .{ .Texture2D = .{
+            .MostDetailedMip = 0,
+            .MipLevels = 1,
+            .PlaneSlice = 0,
+            .ResourceMinLODClamp = 0,
+        } },
+    };
+    const inline_view = win32.D3D12_SHADER_RESOURCE_VIEW_DESC{
+        .Format = .R8G8B8A8_UNORM,
+        .ViewDimension = .TEXTURE2D,
+        .Shader4ComponentMapping = win32.D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        .Anonymous = .{ .Texture2D = .{
+            .MostDetailedMip = 0,
+            .MipLevels = 1,
+            .PlaneSlice = 0,
+            .ResourceMinLODClamp = 0,
+        } },
+    };
+    var table: u32 = 0;
+    while (table < self.descriptors.table_count) : (table += 1) {
+        self.device.CreateShaderResourceView(self.cells.resource, &cell_view, self.descriptors.cpu(table, 0));
+        self.device.CreateShaderResourceView(self.atlas.resource, &texture_view, self.descriptors.cpu(table, 1));
+        self.device.CreateShaderResourceView(self.background_image.resource, &texture_view, self.descriptors.cpu(table, 2));
+        self.device.CreateShaderResourceView(null, &inline_view, self.descriptors.cpu(table, 3));
+    }
+}
+
+/// Paint the tab bar into ordinary memory and stage it onto the back buffer.
+///
+/// The font service owns this drawing for both backends; only the destination
+/// differs. It is repainted every frame because its content tracks tab state
+/// that the renderer does not diff.
+fn copyTabBarBand(self: *D3d12Renderer, prepared: PreparedFrame, tabbar: types.TabBarDraw) void {
+    if (prepared.tab_bar_h == 0) return;
+    const band = self.font_service.cpuBand(prepared.client_w, prepared.tab_bar_h);
+    tabbar_paint.paint(
+        band.render_target,
+        band.brush,
+        &self.font_service.dwrite_factory.IDWriteFactory,
+        self.font_service.tabbar_text_format,
+        self.font_service.tabbar_trimming_sign,
+        tabbar,
+        prepared.cs.x,
+        prepared.tab_bar_h,
+    );
+    const pixels = band.readPixels();
+
+    const copy_h = @min(prepared.tab_bar_h, prepared.client_h);
+    const dst_pitch: u32 = @intCast(upload.alignUp(
+        @as(u64, prepared.client_w) * 4,
+        upload.texture_row_alignment,
+    ));
+    const res = self.reserve(@as(u64, dst_pitch) * copy_h, upload.texture_placement_alignment);
+    const row_bytes: usize = @as(usize, prepared.client_w) * 4;
+    var y: u32 = 0;
+    while (y < copy_h) : (y += 1) {
+        @memcpy(res.bytes[y * dst_pitch ..][0..row_bytes], pixels[y * band.stride() ..][0..row_bytes]);
+    }
+
+    const src_loc = win32.D3D12_TEXTURE_COPY_LOCATION{
+        .pResource = self.arena.buffer.?,
+        .Type = .PLACED_FOOTPRINT,
+        .Anonymous = .{ .PlacedFootprint = .{
+            .Offset = res.offset,
+            .Footprint = .{
+                .Format = pipeline.render_target_format,
+                .Width = prepared.client_w,
+                .Height = copy_h,
+                .Depth = 1,
+                .RowPitch = dst_pitch,
+            },
+        } },
+    };
+    const dst_loc = win32.D3D12_TEXTURE_COPY_LOCATION{
+        .pResource = self.back_buffer.resource.?,
+        .Type = .SUBRESOURCE_INDEX,
+        .Anonymous = .{ .SubresourceIndex = 0 },
+    };
+    self.command_list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, null);
+}
+
+fn drawInlineImages(self: *D3d12Renderer, prepared: PreparedFrame) void {
+    const list = self.command_list;
+    list.SetPipelineState(self.pso_inline_image);
+
+    var table: u32 = 1;
+    for (self.kitty_images.placements.items) |p| {
+        if (p.z < 0) continue;
+        std.debug.assert(table < self.descriptors.table_count);
+        const entry = self.kitty_images.images.get(.{
+            .tab_id = self.kitty_images.last_tab_id,
+            .image_id = p.image_id,
+        }) orelse continue;
+
+        const dest_x: i64 = @as(i64, p.x) * prepared.cs.x + p.cell_offset_x;
+        const dest_y: i64 = @as(i64, p.y) * prepared.cs.y + p.cell_offset_y;
+        const left = std.math.clamp(dest_x, 0, @as(i64, prepared.client_w));
+        const top = std.math.clamp(dest_y, 0, @as(i64, prepared.term_pixel_h));
+        const right = std.math.clamp(dest_x + @as(i64, p.width), 0, @as(i64, prepared.client_w));
+        const bottom = std.math.clamp(dest_y + @as(i64, p.height), 0, @as(i64, prepared.term_pixel_h));
+        if (right <= left or bottom <= top) continue;
+
+        // Each placement gets its own descriptor table: the GPU reads
+        // descriptors when the work runs, so rewriting one table between
+        // draws would make every placement sample the last image.
+        const view = win32.D3D12_SHADER_RESOURCE_VIEW_DESC{
+            .Format = .R8G8B8A8_UNORM,
+            .ViewDimension = .TEXTURE2D,
+            .Shader4ComponentMapping = win32.D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .Anonymous = .{ .Texture2D = .{
+                .MostDetailedMip = 0,
+                .MipLevels = 1,
+                .PlaneSlice = 0,
+                .ResourceMinLODClamp = 0,
+            } },
+        };
+        self.device.CreateShaderResourceView(
+            entry.image.resource,
+            &view,
+            self.descriptors.cpu(table, 3),
+        );
+
+        var config: kitty_image_mod.ImageConfig = .{
+            .dest = .{
+                @floatFromInt(dest_x),
+                @floatFromInt(dest_y),
+                @floatFromInt(p.width),
+                @floatFromInt(p.height),
+            },
+            .source = .{
+                @floatFromInt(p.source_x),
+                @floatFromInt(p.source_y),
+                @floatFromInt(p.source_width),
+                @floatFromInt(p.source_height),
+            },
+            .image_size = .{
+                @floatFromInt(entry.width),
+                @floatFromInt(entry.height),
+            },
+            .tab_bar_height = @floatFromInt(prepared.tab_bar_h),
+        };
+        const bytes = std.mem.asBytes(&config);
+        const res = self.reserve(bytes.len, upload.constant_buffer_alignment);
+        @memcpy(res.bytes, bytes);
+
+        var scissor = [_]win32.RECT{.{
+            .left = @intCast(left),
+            .top = @intCast(@as(i64, prepared.tab_bar_h) + top),
+            .right = @intCast(right),
+            .bottom = @intCast(@as(i64, prepared.tab_bar_h) + bottom),
+        }};
+        list.RSSetScissorRects(1, &scissor);
+        list.SetGraphicsRootConstantBufferView(
+            0,
+            self.arena.buffer.?.GetGPUVirtualAddress() + res.offset,
+        );
+        list.SetGraphicsRootDescriptorTable(1, self.descriptors.gpu(table));
+        list.DrawInstanced(4, 1, 0, 0);
+        table += 1;
+    }
+}
+
+pub fn applyGlyphResult(self: *D3d12Renderer, result: *RasterResult) bool {
+    return glyph_mod.applyRasterResult(self, result);
+}
+
+pub fn reloadBackgroundImage(
+    self: *D3d12Renderer,
+    gpa: std.mem.Allocator,
+    cfg: *const Config,
+    hwnd: win32.HWND,
+) void {
+    bg_image.reload(self, gpa, cfg, hwnd);
+}
+
+pub fn applyDecodedBackgroundImage(self: *D3d12Renderer, result: *const BgImageDecoded) void {
+    bg_image.applyDecoded(self, result);
+}
+
+pub fn releaseKittyImagesForTab(self: *D3d12Renderer, tab_id: types.TabId) void {
+    self.waitForGpu();
+    self.kitty_images.releaseForTab(std.heap.page_allocator, tab_id);
+}
+
+comptime {
+    _ = cell_buffer;
+    _ = tabbar_paint;
+    _ = present;
+}

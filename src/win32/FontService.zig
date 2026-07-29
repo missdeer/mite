@@ -57,6 +57,14 @@ tabbar_font_size_pt: f32,
 staging_texture: gpu.StagingTexture = .{},
 band_texture: gpu.BandTexture = .{},
 
+// CPU-addressable output form, for a backend that cannot open the shared
+// surfaces above. Created lazily on first use, so a process running only the
+// shared-surface backend never allocates any of it and its behaviour is
+// untouched by this path existing.
+cpu_band: gpu.CpuBandTexture = .{},
+wic_factory: ?*win32.IWICImagingFactory = null,
+sync_rasterizer: glyph_worker_mod.SyncRasterizer = .{},
+
 glyph_worker: glyph_worker_mod.Worker = undefined,
 glyph_worker_started: bool = false,
 
@@ -164,6 +172,33 @@ pub fn init(
     };
 }
 
+/// WIC factory for the CPU-addressable output form. Lazily created because
+/// only a backend on the `cpu_pixels` handoff ever needs it.
+fn wicFactory(self: *FontService) *win32.IWICImagingFactory {
+    if (self.wic_factory) |f| return f;
+    var factory: *win32.IWICImagingFactory = undefined;
+    const hr = win32.CoCreateInstance(
+        &win32.CLSID_WICImagingFactory,
+        null,
+        win32.CLSCTX_INPROC_SERVER,
+        win32.IID_IWICImagingFactory,
+        @ptrCast(&factory),
+    );
+    if (hr < 0) com.fatalHr("CoCreateInstance(WIC, font service)", hr);
+    self.wic_factory = factory;
+    return factory;
+}
+
+/// Tab-bar band rendered into ordinary memory. The returned target carries
+/// the same D2D properties as the shared-surface band, so the caller paints
+/// it with the identical routine; the bytes come back via `readPixels`.
+///
+/// The GPU never sees this memory: ownership of it stays here and the
+/// consumer's obligation ends when it has copied the bytes out.
+pub fn cpuBand(self: *FontService, width: u32, height: u32) *gpu.CpuBandTexture.Cached {
+    return self.cpu_band.getOrCreate(self.d2d_factory, self.wicFactory(), width, height);
+}
+
 pub fn cellSizeForDpi(self: *FontService, dpi: u32) win32.SIZE {
     if (dpi == self.dpi) return self.common.cell_size;
     return font_mod.measureCellSize(&self.dwrite_factory.IDWriteFactory, dpi, self.effective_primary, self.font_size_pt);
@@ -202,6 +237,10 @@ pub fn deinit(self: *FontService) void {
     }
     self.staging_texture.release();
     self.band_texture.release();
+    self.cpu_band.release();
+    self.sync_rasterizer.deinit();
+    if (self.wic_factory) |f| _ = f.IUnknown.Release();
+    self.wic_factory = null;
     _ = self.d2d_factory.IUnknown.Release();
     font_mod.releaseTextFormatSet(&self.text_formats, &self.font_fallbacks);
     {

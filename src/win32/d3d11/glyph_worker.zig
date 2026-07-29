@@ -92,6 +92,62 @@ const CachedRt = struct {
     }
 };
 
+/// Caller-driven rasterization into ordinary memory, for a backend that
+/// cannot open the font service's shared surfaces.
+///
+/// This is deliberately the *same* rasterizer the worker thread runs, not a
+/// second one: text coverage has to come from one place or visual equivalence
+/// between backends becomes a coincidence. Only the destination differs, and
+/// that destination is memory the GPU never reads — the caller copies the
+/// bytes into its own upload resource and the handoff is over.
+///
+/// The returned result is owned by `gpa`; caller calls `deinit`.
+pub const SyncRasterizer = struct {
+    mask_cached: ?CachedRt = null,
+    color_cached: ?CachedRt = null,
+    wic_factory: ?*win32.IWICImagingFactory = null,
+
+    pub fn deinit(self: *SyncRasterizer) void {
+        if (self.mask_cached) |*c| c.release();
+        if (self.color_cached) |*c| c.release();
+        if (self.wic_factory) |f| _ = f.IUnknown.Release();
+        self.* = .{};
+    }
+
+    fn wicFactory(self: *SyncRasterizer) *win32.IWICImagingFactory {
+        if (self.wic_factory) |f| return f;
+        var factory: *win32.IWICImagingFactory = undefined;
+        const hr = win32.CoCreateInstance(
+            &win32.CLSID_WICImagingFactory,
+            null,
+            win32.CLSCTX_INPROC_SERVER,
+            win32.IID_IWICImagingFactory,
+            @ptrCast(&factory),
+        );
+        if (hr < 0) com.fatalHr("CoCreateInstance(WIC, sync raster)", hr);
+        self.wic_factory = factory;
+        return factory;
+    }
+
+    pub fn raster(
+        self: *SyncRasterizer,
+        gpa: std.mem.Allocator,
+        dwrite_factory: *win32.IDWriteFactory2,
+        d2d_factory: *win32.ID2D1Factory,
+        job: *RasterJob,
+    ) ?*RasterResult {
+        return rasterToWicBuffer(
+            gpa,
+            dwrite_factory,
+            d2d_factory,
+            self.wicFactory(),
+            &self.mask_cached,
+            &self.color_cached,
+            job,
+        );
+    }
+};
+
 pub const Worker = struct {
     gpa: std.mem.Allocator,
     // SHARED dwrite factory is safe across threads; AddRef'd at start, Release'd at shutdown.

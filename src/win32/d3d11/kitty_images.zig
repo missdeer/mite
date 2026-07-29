@@ -5,6 +5,7 @@ const win32 = @import("win32").everything;
 const D3d11Renderer = @import("../d3d11.zig");
 const bg_image = @import("background_image.zig");
 const com = @import("com.zig");
+const gpu = @import("gpu.zig");
 const types = @import("../types.zig");
 
 const log = std.log.scoped(.kitty_images);
@@ -14,18 +15,21 @@ const Key = struct {
     image_id: u32,
 };
 
-const Entry = struct {
-    texture: *win32.ID3D11Texture2D,
-    view: *win32.ID3D11ShaderResourceView,
-    transmit_time: std.time.Instant,
-    width: u32,
-    height: u32,
+/// One cached inline image, wrapping whatever GPU resource the backend made
+/// for it. The placement bookkeeping around it is identical for every
+/// backend, so only the resource type varies.
+pub fn Entry(comptime Image: type) type {
+    return struct {
+        image: Image,
+        transmit_time: std.time.Instant,
+        width: u32,
+        height: u32,
 
-    fn release(self: *Entry) void {
-        _ = self.view.IUnknown.Release();
-        _ = self.texture.IUnknown.Release();
-    }
-};
+        pub fn release(self: *@This()) void {
+            self.image.release();
+        }
+    };
+}
 
 const Placement = struct {
     image_id: u32,
@@ -50,113 +54,118 @@ pub const ImageConfig = extern struct {
     _pad: f32 = 0,
 };
 
-pub const Cache = struct {
-    images: std.AutoHashMapUnmanaged(Key, Entry) = .{},
-    placements: std.ArrayListUnmanaged(Placement) = .{},
-    last_hash: u64 = 0,
-    last_tab_id: types.TabId = 0,
-    last_tab_valid: bool = false,
+pub fn Cache(comptime Image: type) type {
+    return struct {
+        const Self = @This();
+        pub const CachedImage = Image;
 
-    pub fn deinit(self: *Cache, alloc: std.mem.Allocator) void {
-        var it = self.images.iterator();
-        while (it.next()) |kv| kv.value_ptr.release();
-        self.images.deinit(alloc);
-        self.placements.deinit(alloc);
-        self.* = .{};
-    }
+        images: std.AutoHashMapUnmanaged(Key, Entry(Image)) = .{},
+        placements: std.ArrayListUnmanaged(Placement) = .{},
+        last_hash: u64 = 0,
+        last_tab_id: types.TabId = 0,
+        last_tab_valid: bool = false,
 
-    pub fn releaseForTab(self: *Cache, alloc: std.mem.Allocator, tab_id: types.TabId) void {
-        var keys_to_remove: std.ArrayListUnmanaged(Key) = .{};
-        defer keys_to_remove.deinit(alloc);
-
-        var it = self.images.iterator();
-        while (it.next()) |kv| {
-            if (kv.key_ptr.tab_id != tab_id) continue;
-            keys_to_remove.append(alloc, kv.key_ptr.*) catch |err| {
-                log.warn("leaking Kitty image during tab close after key collection failed: {s}", .{@errorName(err)});
-            };
+        pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
+            var it = self.images.iterator();
+            while (it.next()) |kv| kv.value_ptr.release();
+            self.images.deinit(alloc);
+            self.placements.deinit(alloc);
+            self.* = .{};
         }
 
-        for (keys_to_remove.items) |key| {
-            if (self.images.fetchRemove(key)) |removed| {
-                var entry = removed.value;
-                entry.release();
+        pub fn releaseForTab(self: *Self, alloc: std.mem.Allocator, tab_id: types.TabId) void {
+            var keys_to_remove: std.ArrayListUnmanaged(Key) = .{};
+            defer keys_to_remove.deinit(alloc);
+
+            var it = self.images.iterator();
+            while (it.next()) |kv| {
+                if (kv.key_ptr.tab_id != tab_id) continue;
+                keys_to_remove.append(alloc, kv.key_ptr.*) catch |err| {
+                    log.warn("leaking Kitty image during tab close after key collection failed: {s}", .{@errorName(err)});
+                };
+            }
+
+            for (keys_to_remove.items) |key| {
+                if (self.images.fetchRemove(key)) |removed| {
+                    var entry = removed.value;
+                    entry.release();
+                }
+            }
+            if (self.last_tab_valid and self.last_tab_id == tab_id) {
+                self.placements.clearRetainingCapacity();
+                self.last_hash = 0;
+                self.last_tab_valid = false;
             }
         }
-        if (self.last_tab_valid and self.last_tab_id == tab_id) {
+
+        pub fn sync(
+            self: *Self,
+            alloc: std.mem.Allocator,
+            renderer: anytype,
+            tab_id: types.TabId,
+            term: *const vt.Terminal,
+        ) bool {
+            const storage = &term.screens.active.kitty_images;
+            var invalidated = storage.dirty or !self.last_tab_valid or self.last_tab_id != tab_id;
+
+            pruneRemovedImages(self, alloc, tab_id, storage, &invalidated);
+
             self.placements.clearRetainingCapacity();
-            self.last_hash = 0;
-            self.last_tab_valid = false;
-        }
-    }
+            var virtual_seen = false;
 
-    pub fn sync(
-        self: *Cache,
-        alloc: std.mem.Allocator,
-        renderer: *D3d11Renderer,
-        tab_id: types.TabId,
-        term: *const vt.Terminal,
-    ) bool {
-        const storage = &term.screens.active.kitty_images;
-        var invalidated = storage.dirty or !self.last_tab_valid or self.last_tab_id != tab_id;
+            const top = term.screens.active.pages.getTopLeft(.viewport);
+            const bot = term.screens.active.pages.getBottomRight(.viewport) orelse return invalidated;
+            const top_y = term.screens.active.pages.pointFromPin(.screen, top).?.screen.y;
+            const bot_y = term.screens.active.pages.pointFromPin(.screen, bot).?.screen.y;
 
-        pruneRemovedImages(self, alloc, tab_id, storage, &invalidated);
-
-        self.placements.clearRetainingCapacity();
-        var virtual_seen = false;
-
-        const top = term.screens.active.pages.getTopLeft(.viewport);
-        const bot = term.screens.active.pages.getBottomRight(.viewport) orelse return invalidated;
-        const top_y = term.screens.active.pages.pointFromPin(.screen, top).?.screen.y;
-        const bot_y = term.screens.active.pages.pointFromPin(.screen, bot).?.screen.y;
-
-        var it = storage.placements.iterator();
-        while (it.next()) |kv| {
-            const placement = kv.value_ptr;
-            switch (placement.location) {
-                .pin => {},
-                .virtual => {
-                    virtual_seen = true;
-                    continue;
-                },
+            var it = storage.placements.iterator();
+            while (it.next()) |kv| {
+                const placement = kv.value_ptr;
+                switch (placement.location) {
+                    .pin => {},
+                    .virtual => {
+                        virtual_seen = true;
+                        continue;
+                    },
+                }
+                const image = storage.imageById(kv.key_ptr.image_id) orelse continue;
+                tryPreparePlacement(self, alloc, renderer, tab_id, term, top_y, bot_y, image, placement, &invalidated) catch |err| {
+                    log.warn("skipping Kitty image placement: {s}", .{@errorName(err)});
+                };
             }
-            const image = storage.imageById(kv.key_ptr.image_id) orelse continue;
-            tryPreparePlacement(self, alloc, renderer, tab_id, term, top_y, bot_y, image, placement, &invalidated) catch |err| {
-                log.warn("skipping Kitty image placement: {s}", .{@errorName(err)});
-            };
-        }
 
-        if (virtual_seen) {
-            // Virtual placeholder placement is deliberately outside this first
-            // pass. Rebuild next frame if it remains present.
-            invalidated = true;
-        }
-
-        std.mem.sortUnstable(Placement, self.placements.items, {}, struct {
-            fn lessThan(_: void, lhs: Placement, rhs: Placement) bool {
-                return lhs.z < rhs.z or (lhs.z == rhs.z and lhs.image_id < rhs.image_id);
+            if (virtual_seen) {
+                // Virtual placeholder placement is deliberately outside this first
+                // pass. Rebuild next frame if it remains present.
+                invalidated = true;
             }
-        }.lessThan);
 
-        const new_hash = hashPlacements(tab_id, self.placements.items);
-        if (new_hash != self.last_hash) invalidated = true;
-        self.last_hash = new_hash;
-        self.last_tab_id = tab_id;
-        self.last_tab_valid = true;
-        storage.dirty = false;
-        return invalidated;
-    }
+            std.mem.sortUnstable(Placement, self.placements.items, {}, struct {
+                fn lessThan(_: void, lhs: Placement, rhs: Placement) bool {
+                    return lhs.z < rhs.z or (lhs.z == rhs.z and lhs.image_id < rhs.image_id);
+                }
+            }.lessThan);
 
-    pub fn hasVisibleAboveTextPlacements(self: *const Cache) bool {
-        for (self.placements.items) |p| {
-            if (p.z >= 0) return true;
+            const new_hash = hashPlacements(tab_id, self.placements.items);
+            if (new_hash != self.last_hash) invalidated = true;
+            self.last_hash = new_hash;
+            self.last_tab_id = tab_id;
+            self.last_tab_valid = true;
+            storage.dirty = false;
+            return invalidated;
         }
-        return false;
-    }
-};
+
+        pub fn hasVisibleAboveTextPlacements(self: *const Self) bool {
+            for (self.placements.items) |p| {
+                if (p.z >= 0) return true;
+            }
+            return false;
+        }
+    };
+}
 
 fn pruneRemovedImages(
-    self: *Cache,
+    self: anytype,
     alloc: std.mem.Allocator,
     tab_id: types.TabId,
     storage: *const vt.kitty.graphics.ImageStorage,
@@ -184,9 +193,9 @@ fn pruneRemovedImages(
 }
 
 fn tryPreparePlacement(
-    self: *Cache,
+    self: anytype,
     alloc: std.mem.Allocator,
-    renderer: *D3d11Renderer,
+    renderer: anytype,
     tab_id: types.TabId,
     term: *const vt.Terminal,
     top_y: u32,
@@ -235,9 +244,9 @@ fn tryPreparePlacement(
 }
 
 fn uploadImageIfNeeded(
-    self: *Cache,
+    self: anytype,
     alloc: std.mem.Allocator,
-    renderer: *D3d11Renderer,
+    renderer: anytype,
     tab_id: types.TabId,
     image: vt.kitty.graphics.Image,
     invalidated: *bool,
@@ -250,16 +259,17 @@ fn uploadImageIfNeeded(
     const rgba = try imageToRgba(alloc, image);
     defer alloc.free(rgba);
 
-    const entry = uploadTexture(renderer.device, image.width, image.height, rgba) orelse return error.UploadFailed;
-    errdefer {
-        var cleanup = entry;
-        cleanup.release();
-    }
+    // Secure the map slot before any GPU work is recorded. Uploading first
+    // and releasing on a failed insert would destroy a resource the backend
+    // has already named in commands it has not submitted yet.
     const gop = try self.images.getOrPut(alloc, key);
+    const uploaded = renderer.kittyImageUpload(image.width, image.height, rgba) orelse {
+        if (!gop.found_existing) _ = self.images.remove(key);
+        return error.UploadFailed;
+    };
     if (gop.found_existing) gop.value_ptr.release();
     gop.value_ptr.* = .{
-        .texture = entry.texture,
-        .view = entry.view,
+        .image = uploaded,
         .transmit_time = image.transmit_time,
         .width = image.width,
         .height = image.height,
@@ -312,7 +322,12 @@ fn imageToRgba(alloc: std.mem.Allocator, image: vt.kitty.graphics.Image) ![]u8 {
     return out;
 }
 
-fn uploadTexture(device: *win32.ID3D11Device, width: u32, height: u32, rgba: []const u8) ?Entry {
+pub fn uploadTexture(
+    device: *win32.ID3D11Device,
+    width: u32,
+    height: u32,
+    rgba: []const u8,
+) ?gpu.KittyImage {
     const desc: win32.D3D11_TEXTURE2D_DESC = .{
         .Width = width,
         .Height = height,
@@ -337,13 +352,7 @@ fn uploadTexture(device: *win32.ID3D11Device, width: u32, height: u32, rgba: []c
         _ = texture.IUnknown.Release();
         return null;
     }
-    return .{
-        .texture = texture,
-        .view = view,
-        .transmit_time = undefined,
-        .width = width,
-        .height = height,
-    };
+    return .{ .texture = texture, .view = view };
 }
 
 fn hashPlacements(tab_id: types.TabId, placements: []const Placement) u64 {
@@ -459,7 +468,7 @@ pub fn draw(
         self.context.Unmap(&self.image_const_buf.ID3D11Resource, 0);
 
         self.context.PSSetConstantBuffers(0, 1, @ptrCast(@constCast(&self.image_const_buf)));
-        var resource = [_]?*win32.ID3D11ShaderResourceView{image.view};
+        var resource = [_]?*win32.ID3D11ShaderResourceView{image.image.view};
         self.context.PSSetShaderResources(3, resource.len, &resource);
         self.context.Draw(4, 0);
     }

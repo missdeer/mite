@@ -1,6 +1,10 @@
-//! Per-frame atlas setup and glyph rasterization. Methods take the parent
-//! `D3d11Renderer` because they touch many of its fields (cell size, atlas
-//! texture, staging textures, glyph cache, DirectWrite + D2D factories).
+//! Per-frame atlas setup and glyph rasterization. Backend-agnostic: methods
+//! take `self: anytype` and reach the GPU only through the narrow contract in
+//! `shared.zig`, so both renderer backends run this one source and cannot
+//! drift apart in how glyphs reach the atlas.
+//!
+//! The one place the backends genuinely differ is how the font service hands
+//! over synchronously rasterized pixels — see `glyph_handoff`.
 
 const std = @import("std");
 const win32 = @import("win32").everything;
@@ -11,10 +15,18 @@ const sprite = @import("../sprite.zig");
 const GlyphIndexCache = @import("../GlyphIndexCache.zig");
 const font = @import("font.zig");
 const glyph_worker = @import("glyph_worker.zig");
+const shared = @import("../shared.zig");
 
-const D3d11Renderer = @import("../d3d11.zig");
 const CellXY = gpu.CellXY;
 pub const max_ligature_run_cells = glyph_worker.max_run_cells;
+
+/// Allocator for synchronously rasterized glyphs.
+///
+/// Deliberately not the raster worker's allocator: the synchronous path is
+/// what runs when that worker could not be started at all, so its allocator
+/// field may never have been initialized. Allocating and freeing here through
+/// one allocator that always exists keeps that case from corrupting the heap.
+const sync_raster_allocator = std.heap.page_allocator;
 
 pub const RunGlyphs = struct {
     glyphs: [max_ligature_run_cells]u32,
@@ -32,7 +44,7 @@ const RunPending = struct {
 // per-cell generateGlyph path does only the cache lookup + miss work.
 // Recreates the cache if the cell size changed or the atlas texture
 // was reallocated.
-pub fn setupGlyphAtlas(self: *D3d11Renderer) gpu.AtlasFrame {
+pub fn setupGlyphAtlas(self: anytype) gpu.AtlasFrame {
     const cs = self.font_service.cell_size_xy;
     const tex_cell_count = gpu.getTextureMaxCellCount(cs);
     const tex_total: u32 = @as(u32, tex_cell_count.x) * @as(u32, tex_cell_count.y);
@@ -41,7 +53,7 @@ pub fn setupGlyphAtlas(self: *D3d11Renderer) gpu.AtlasFrame {
         .x = tex_cell_count.x * cs.x,
         .y = tex_cell_count.y * cs.y,
     };
-    const tex_retained = self.glyph_texture.updateSize(self.device, tex_pixel);
+    const tex_retained = self.atlasEnsure(tex_pixel);
 
     const cache_valid = if (self.glyph_cache_cell_size) |s| s.eql(cs) else false;
     self.glyph_cache_cell_size = cs;
@@ -79,7 +91,7 @@ pub fn setupGlyphAtlas(self: *D3d11Renderer) gpu.AtlasFrame {
 }
 
 pub fn generateGlyph(
-    self: *D3d11Renderer,
+    self: anytype,
     cache: *GlyphIndexCache,
     tex_cell_count: CellXY,
     codepoint: u21,
@@ -154,8 +166,14 @@ pub fn generateGlyph(
             // worker failed to spawn, so the renderer still produces
             // correct pixels (just on the UI thread, like pre-Stage-C).
             if (is_blank or !self.font_service.glyph_worker_started) {
-                const staging = renderGlyphToStaging(self, codepoint, grapheme, style, false);
-                copyStagingHalfToAtlas(self, staging, 0, coord);
+                if (!rasterSyncToAtlas(self, codepoint, grapheme, style, coord)) {
+                    // Release the reservation rather than marking it ready:
+                    // a slot marked ready is never revisited, so caching this
+                    // failure would make the glyph blank for the rest of the
+                    // cache's life instead of for one frame.
+                    cache.unreserve(reserved.index, reserved.slot_gen);
+                    return if (is_blank) 0 else blankGlyphSlot(self, cache, tex_cell_count);
+                }
                 std.debug.assert(cache.markReady(reserved.index, reserved.slot_gen, key));
                 return reserved.index;
             }
@@ -172,7 +190,33 @@ pub fn generateGlyph(
     }
 }
 
-fn blankGlyphSlot(self: *D3d11Renderer, cache: *GlyphIndexCache, tex_cell_count: CellXY) u32 {
+/// Land an asynchronously rasterized glyph in its reserved atlas slot.
+///
+/// Both guards matter and neither is redundant: `cache_gen` rejects results
+/// aimed at an atlas that has since been thrown out entirely, while the
+/// slot's own generation rejects results aimed at a slot that has since been
+/// reused for a different glyph. Without them a late result paints the wrong
+/// character into a slot that now belongs to someone else.
+pub fn applyRasterResult(self: anytype, result: *glyph_worker.RasterResult) bool {
+    if (result.cache_gen != self.cache_gen) return false;
+    if (self.glyph_cache == null) return false;
+    const cache = &self.glyph_cache.?;
+    if (result.failed) return cache.cancelPending(result.slot, result.slot_gen, result.key);
+    if (!cache.markReady(result.slot, result.slot_gen, result.key)) return false;
+
+    const cs = self.font_service.cell_size_xy;
+    const tex_cell_count = gpu.getTextureMaxCellCount(cs);
+    const pos = gpu.cellPosFromIndex(result.slot, tex_cell_count.x);
+    self.atlasWriteCpu(
+        .{ .x = cs.x * pos.x, .y = cs.y * pos.y },
+        .{ .x = @intCast(result.w), .y = @intCast(result.h) },
+        result.bytes.ptr,
+        result.w * 4,
+    );
+    return true;
+}
+
+fn blankGlyphSlot(self: anytype, cache: *GlyphIndexCache, tex_cell_count: CellXY) u32 {
     return generateGlyph(self, cache, tex_cell_count, ' ', &.{}, .single, .regular);
 }
 
@@ -181,7 +225,7 @@ fn blankGlyphSlot(self: *D3d11Renderer, cache: *GlyphIndexCache, tex_cell_count:
 // `RasterJob.destroy` if the queue rejects); dupes the grapheme onto the
 // worker's gpa so it survives the UI-thread arena reset.
 fn submitRasterJob(
-    self: *D3d11Renderer,
+    self: anytype,
     key: GlyphIndexCache.Key,
     codepoint: u21,
     grapheme: []const u21,
@@ -238,7 +282,7 @@ fn submitRasterJob(
 }
 
 pub fn generateRun(
-    self: *D3d11Renderer,
+    self: anytype,
     cache: *GlyphIndexCache,
     tex_cell_count: CellXY,
     text: []const u8,
@@ -301,7 +345,7 @@ fn rollbackRunReservations(cache: *GlyphIndexCache, pending: []const RunPending)
 }
 
 fn submitRunRasterJob(
-    self: *D3d11Renderer,
+    self: anytype,
     text: []const u8,
     style: GlyphIndexCache.Style,
     pending: []const RunPending,
@@ -372,14 +416,17 @@ fn dupeFontFeatures(
 // sprite.render) twice with identical pixels — only the half copied out
 // differs. One render + up-to-two copies cuts the first-paint cost for CJK,
 // emoji, and sprite wide tiles when either half is uncached.
+/// Atlas slots for the two halves of a wide glyph.
+pub const WidePair = struct { left: u32, right: u32 };
+
 pub fn generateWidePair(
-    self: *D3d11Renderer,
+    self: anytype,
     cache: *GlyphIndexCache,
     tex_cell_count: CellXY,
     codepoint: u21,
     grapheme: []const u21,
     style: GlyphIndexCache.Style,
-) struct { left: u32, right: u32 } {
+) WidePair {
     const arena = self.glyph_cache_arena.allocator();
     // Wide-pair stays fully synchronous: one DirectWrite raster fills both
     // halves, so there's no win to splitting them across the worker. The
@@ -444,31 +491,53 @@ pub fn generateWidePair(
             error.OutOfMemory => com.oom(error.OutOfMemory),
             else => {
                 std.log.warn("sprite render U+{X} failed ({s}); falling back to DirectWrite", .{ codepoint, @errorName(err) });
-                const staging = renderGlyphToStaging(self, codepoint, grapheme, style, true);
-                copyStagingPairToAtlas(
+                if (!rasterSyncPairToAtlas(
                     self,
-                    staging,
+                    codepoint,
+                    grapheme,
+                    style,
                     tex_cell_count,
                     if (left_miss) left.index else null,
                     if (right_miss) right.index else null,
-                );
+                )) return blankWidePair(self, cache, tex_cell_count, left, right);
             },
         };
         markPairReady(cache, codepoint, grapheme, style, left, right);
         return .{ .left = left.index, .right = right.index };
     }
 
-    const staging = renderGlyphToStaging(self, codepoint, grapheme, style, true);
-    copyStagingPairToAtlas(
+    if (!rasterSyncPairToAtlas(
         self,
-        staging,
+        codepoint,
+        grapheme,
+        style,
         tex_cell_count,
         if (left_miss) left.index else null,
         if (right_miss) right.index else null,
-    );
+    )) return blankWidePair(self, cache, tex_cell_count, left, right);
 
     markPairReady(cache, codepoint, grapheme, style, left, right);
     return .{ .left = left.index, .right = right.index };
+}
+
+/// Give up on a wide pair whose rasterization failed.
+///
+/// The reservations are released so the glyph is retried on a later frame
+/// rather than cached blank for the life of the cache — but the released
+/// indices must not be handed back to the caller, because a released slot can
+/// be reallocated to a different glyph before the frame draws. The placeholder
+/// is returned for both halves instead.
+fn blankWidePair(
+    self: anytype,
+    cache: *GlyphIndexCache,
+    tex_cell_count: CellXY,
+    left: anytype,
+    right: anytype,
+) WidePair {
+    if (left.slot_gen) |gen| cache.unreserve(left.index, gen);
+    if (right.slot_gen) |gen| cache.unreserve(right.index, gen);
+    const blank = blankGlyphSlot(self, cache, tex_cell_count);
+    return .{ .left = blank, .right = blank };
 }
 
 // Clear pending on the halves that we just synchronously rasterized. Halves
@@ -495,7 +564,7 @@ fn markPairReady(
 // wide; single glyphs occupy [0, cs.x), wide glyphs occupy the full width.
 // Returns the staging so the caller can copy the half(ves) it needs.
 fn renderGlyphToStaging(
-    self: *D3d11Renderer,
+    self: anytype,
     codepoint: u21,
     grapheme: []const u21,
     style: GlyphIndexCache.Style,
@@ -749,37 +818,129 @@ fn renderGlyphToStaging(
     return staging;
 }
 
-fn copyStagingHalfToAtlas(
-    self: *D3d11Renderer,
-    staging: *gpu.StagingTexture.Cached,
-    src_left: u32,
+/// Rasterize one glyph now and land it in `dst_coord`, in whichever handoff
+/// form this backend takes. Both forms run the font service's own
+/// rasterization; they differ only in where the pixels are written and how
+/// they reach the atlas.
+fn rasterSyncToAtlas(
+    self: anytype,
+    codepoint: u21,
+    grapheme: []const u21,
+    style: GlyphIndexCache.Style,
     dst_coord: CellXY,
-) void {
-    const cs = self.font_service.cell_size_xy;
-    const box: win32.D3D11_BOX = .{
-        .left = src_left,
-        .top = 0,
-        .front = 0,
-        .right = src_left + cs.x,
-        .bottom = cs.y,
-        .back = 1,
+) bool {
+    const Backend = @typeInfo(@TypeOf(self)).pointer.child;
+    switch (comptime Backend.glyph_handoff) {
+        .shared_surface => {
+            const staging = renderGlyphToStaging(self, codepoint, grapheme, style, false);
+            self.atlasCopyStaging(staging, .{ .src_left = 0, .dst = dst_coord }, null);
+            return true;
+        },
+        .cpu_pixels => {
+            const cs = self.font_service.cell_size_xy;
+            const result = rasterSyncToCpu(self, codepoint, grapheme, style, false) orelse {
+                // Blank the slot but report failure. Leaving the evicted
+                // occupant's pixels would render a plausible-looking wrong
+                // character, yet marking the slot ready would cache the blank
+                // forever — a transient failure has to stay retryable.
+                self.atlasClear(dst_coord);
+                return false;
+            };
+            defer result.deinit(sync_raster_allocator);
+            if (result.failed) {
+                self.atlasClear(dst_coord);
+                return false;
+            }
+            self.atlasWriteCpu(dst_coord, cs, result.bytes.ptr, cs.x * 4);
+            return true;
+        },
+    }
+}
+
+/// Wide glyphs rasterize once across two cells; this places whichever halves
+/// the caller still needs.
+fn rasterSyncPairToAtlas(
+    self: anytype,
+    codepoint: u21,
+    grapheme: []const u21,
+    style: GlyphIndexCache.Style,
+    tex_cell_count: CellXY,
+    left_index: ?u32,
+    right_index: ?u32,
+) bool {
+    std.debug.assert(left_index != null or right_index != null);
+    const Backend = @typeInfo(@TypeOf(self)).pointer.child;
+    switch (comptime Backend.glyph_handoff) {
+        .shared_surface => {
+            const staging = renderGlyphToStaging(self, codepoint, grapheme, style, true);
+            copyStagingPairToAtlas(self, staging, tex_cell_count, left_index, right_index);
+            return true;
+        },
+        .cpu_pixels => {
+            const cs = self.font_service.cell_size_xy;
+            const pitch: u32 = @as(u32, cs.x) * 2 * 4;
+            const result = rasterSyncToCpu(self, codepoint, grapheme, style, true);
+            if (result == null or result.?.failed) {
+                if (result) |r| r.deinit(sync_raster_allocator);
+                if (left_index) |i| self.atlasClear(slotCoord(cs, i, tex_cell_count));
+                if (right_index) |i| self.atlasClear(slotCoord(cs, i, tex_cell_count));
+                return false;
+            }
+            defer result.?.deinit(sync_raster_allocator);
+            if (left_index) |i| {
+                self.atlasWriteCpu(slotCoord(cs, i, tex_cell_count), cs, result.?.bytes.ptr, pitch);
+            }
+            if (right_index) |i| {
+                const src = result.?.bytes.ptr + (@as(u32, cs.x) * 4);
+                self.atlasWriteCpu(slotCoord(cs, i, tex_cell_count), cs, src, pitch);
+            }
+            return true;
+        },
+    }
+}
+
+fn slotCoord(cs: CellXY, index: u32, tex_cell_count: CellXY) CellXY {
+    const pos = gpu.cellPosFromIndex(index, tex_cell_count.x);
+    return .{ .x = cs.x * pos.x, .y = cs.y * pos.y };
+}
+
+/// Build the same job description the async worker consumes and run it inline.
+fn rasterSyncToCpu(
+    self: anytype,
+    codepoint: u21,
+    grapheme: []const u21,
+    style: GlyphIndexCache.Style,
+    is_wide: bool,
+) ?*glyph_worker.RasterResult {
+    const fs = self.font_service;
+    var job: glyph_worker.RasterJob = .{
+        .key = undefined,
+        .codepoint = codepoint,
+        // Borrowed for the duration of this call only; the inline rasterizer
+        // never outlives it, so nothing is duplicated the way the async
+        // submit path has to.
+        .grapheme = @constCast(grapheme),
+        .run_text = &.{},
+        .run_slot_count = 0,
+        .is_wide = is_wide,
+        .is_color = emoji.isColorGlyphRun(codepoint, grapheme),
+        .is_ambiguous = sprite.isAmbiguousOverflow(codepoint),
+        .slot = 0,
+        .slot_gen = 0,
+        .cache_gen = self.cache_gen,
+        .cs = fs.cell_size_xy,
+        .text_format = if (emoji.shouldForceEmojiFont(codepoint, grapheme))
+            fs.emoji_text_format
+        else
+            fs.text_formats[@intFromEnum(style)],
+        .rendering_params = fs.rendering_params,
+        .font_features = @constCast(fs.font_features),
     };
-    const imported = self.glyph_staging_bridge.acquireRead(self.device, staging.texture);
-    self.context.CopySubresourceRegion(
-        &self.glyph_texture.obj.?.ID3D11Resource,
-        0,
-        dst_coord.x,
-        dst_coord.y,
-        0,
-        &imported.ID3D11Resource,
-        0,
-        &box,
-    );
-    self.glyph_staging_bridge.releaseRead();
+    return fs.sync_rasterizer.raster(sync_raster_allocator, fs.dwrite_factory, fs.d2d_factory, &job);
 }
 
 fn copyStagingPairToAtlas(
-    self: *D3d11Renderer,
+    self: anytype,
     staging: *gpu.StagingTexture.Cached,
     tex_cell_count: CellXY,
     left_index: ?u32,
@@ -787,51 +948,13 @@ fn copyStagingPairToAtlas(
 ) void {
     std.debug.assert(left_index != null or right_index != null);
     const cs = self.font_service.cell_size_xy;
-    const imported = self.glyph_staging_bridge.acquireRead(self.device, staging.texture);
-    defer self.glyph_staging_bridge.releaseRead();
-
-    if (left_index) |index| {
-        const pos = gpu.cellPosFromIndex(index, tex_cell_count.x);
-        const box = win32.D3D11_BOX{
-            .left = 0,
-            .top = 0,
-            .front = 0,
-            .right = cs.x,
-            .bottom = cs.y,
-            .back = 1,
-        };
-        self.context.CopySubresourceRegion(
-            &self.glyph_texture.obj.?.ID3D11Resource,
-            0,
-            cs.x * pos.x,
-            cs.y * pos.y,
-            0,
-            &imported.ID3D11Resource,
-            0,
-            &box,
-        );
-    }
-    if (right_index) |index| {
-        const pos = gpu.cellPosFromIndex(index, tex_cell_count.x);
-        const box = win32.D3D11_BOX{
-            .left = cs.x,
-            .top = 0,
-            .front = 0,
-            .right = @as(u32, cs.x) * 2,
-            .bottom = cs.y,
-            .back = 1,
-        };
-        self.context.CopySubresourceRegion(
-            &self.glyph_texture.obj.?.ID3D11Resource,
-            0,
-            cs.x * pos.x,
-            cs.y * pos.y,
-            0,
-            &imported.ID3D11Resource,
-            0,
-            &box,
-        );
-    }
+    // One call, not two: the surface handoff alternates keys, so a second
+    // acquisition without an intervening write would never be satisfied.
+    self.atlasCopyStaging(
+        staging,
+        if (left_index) |i| .{ .src_left = 0, .dst = slotCoord(cs, i, tex_cell_count) } else null,
+        if (right_index) |i| .{ .src_left = cs.x, .dst = slotCoord(cs, i, tex_cell_count) } else null,
+    );
 }
 
 // Render a sprite (Block Elements / Box Drawing / Braille / Powerline /
@@ -842,7 +965,7 @@ fn copyStagingPairToAtlas(
 // half is uploaded; matches the same .wide_left / .wide_right split used by
 // the DirectWrite path.
 fn uploadSpriteToAtlas(
-    self: *D3d11Renderer,
+    self: anytype,
     codepoint: u21,
     half: GlyphIndexCache.Half,
     coord: CellXY,
@@ -871,22 +994,7 @@ fn uploadSpriteToAtlas(
     const src_row_pitch: u32 = sprite_cell_w * 4;
     const src_ptr: [*]const u8 = scratch.ptr + (src_offset_x * 4);
 
-    const dst_box: win32.D3D11_BOX = .{
-        .left = coord.x,
-        .top = coord.y,
-        .front = 0,
-        .right = coord.x + cs.x,
-        .bottom = coord.y + cs.y,
-        .back = 1,
-    };
-    self.context.UpdateSubresource(
-        &self.glyph_texture.obj.?.ID3D11Resource,
-        0,
-        &dst_box,
-        @ptrCast(src_ptr),
-        src_row_pitch,
-        0,
-    );
+    self.atlasWriteCpu(coord, cs, src_ptr, src_row_pitch);
 }
 
 // Wide-pair sprite upload: rasterize the full 2*cs.x tile once into scratch,
@@ -896,7 +1004,7 @@ fn uploadSpriteToAtlas(
 // OOM propagates as OutOfMemory; other sprite.render failures propagate so
 // the caller can fall back to DirectWrite without leaving stale slot pixels.
 fn uploadSpriteWidePairToAtlas(
-    self: *D3d11Renderer,
+    self: anytype,
     codepoint: u21,
     tex_cell_count: CellXY,
     left_cell_index: ?u32,
@@ -929,28 +1037,12 @@ fn uploadSpriteWidePairToAtlas(
 }
 
 fn uploadAtlasHalfFromScratch(
-    self: *D3d11Renderer,
+    self: anytype,
     src_ptr: [*]const u8,
     src_row_pitch: u32,
     dst_coord: CellXY,
 ) void {
-    const cs = self.font_service.cell_size_xy;
-    const dst_box: win32.D3D11_BOX = .{
-        .left = dst_coord.x,
-        .top = dst_coord.y,
-        .front = 0,
-        .right = dst_coord.x + cs.x,
-        .bottom = dst_coord.y + cs.y,
-        .back = 1,
-    };
-    self.context.UpdateSubresource(
-        &self.glyph_texture.obj.?.ID3D11Resource,
-        0,
-        &dst_box,
-        @ptrCast(src_ptr),
-        src_row_pitch,
-        0,
-    );
+    self.atlasWriteCpu(dst_coord, self.font_service.cell_size_xy, src_ptr, src_row_pitch);
 }
 
 // Ordinal MUST match GlyphIndexCache.Style. Kept here (not in

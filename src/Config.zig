@@ -71,6 +71,15 @@ pub const BackgroundImagePosition = enum {
     bottom_right,
 };
 
+// Renderer backend selected by `renderer`. Selecting a backend that cannot
+// meet its baseline capabilities is a hard failure at startup, never a silent
+// fallback to another backend: a silent fallback would let a comparison study
+// attribute D3D11's behaviour to D3D12.
+pub const RendererBackend = enum {
+    d3d11,
+    d3d12,
+};
+
 // Scaling mode for `background-image-fit`. Mirrors Ghostty's values.
 pub const BackgroundImageFit = enum {
     contain,
@@ -253,6 +262,12 @@ render_interval_remote_ms: u32 = 50,
 // Optional Windows display-adapter name. `null` keeps D3D's automatic
 // hardware-adapter selection; the renderer consumes this at process startup.
 gpu: ?[]const u8 = null,
+// Which renderer backend to build at startup. D3D11 is the default and the
+// only fully-validated path; D3D12 is a research option that is verified
+// only for static and low-frequency correctness (MOSTTY-25) and must be
+// asked for explicitly. An unrecognized value keeps the default rather than
+// failing, matching how every other enum key here degrades.
+renderer: RendererBackend = .d3d11,
 
 arena: ?std.heap.ArenaAllocator = null,
 
@@ -340,6 +355,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
     var render_interval_local_ms: u32 = 16;
     var render_interval_remote_ms: u32 = 50;
     var gpu: ?[]const u8 = null;
+    var renderer: RendererBackend = .d3d11;
     var codepoint_maps: std.ArrayListUnmanaged(CodepointMap) = .empty;
     var launchers: std.ArrayListUnmanaged(Launcher) = .empty;
     var envs: std.ArrayListUnmanaged(EnvEntry) = .empty;
@@ -489,6 +505,11 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
             render_interval_remote_ms = n;
         } else if (std.mem.eql(u8, key, "gpu")) {
             gpu = if (value.len == 0) null else a.dupe(u8, value) catch oom();
+        } else if (std.mem.eql(u8, key, "renderer")) {
+            renderer = std.meta.stringToEnum(RendererBackend, value) orelse {
+                std.log.warn("config: {s}:{}: invalid renderer '{s}' (expect d3d11 or d3d12)", .{ source_name, line_no, value });
+                continue;
+            };
         } else if (std.mem.eql(u8, key, "background-opacity")) {
             const n = std.fmt.parseFloat(f32, value) catch {
                 std.log.warn("config: {s}:{}: invalid background-opacity '{s}'", .{ source_name, line_no, value });
@@ -603,6 +624,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
         .render_interval_local_ms = render_interval_local_ms,
         .render_interval_remote_ms = render_interval_remote_ms,
         .gpu = gpu,
+        .renderer = renderer,
         .arena = arena,
     };
 }
@@ -1492,6 +1514,28 @@ test "parse gpu treats missing and whitespace-only values as automatic selection
         );
         defer cfg.deinit();
         try std.testing.expectEqual(@as(?[]const u8, null), cfg.gpu);
+    }
+}
+
+test "renderer defaults to d3d11 so an untouched config keeps the validated path" {
+    var cfg = parse(std.testing.allocator, "", "test");
+    defer cfg.deinit();
+    try std.testing.expectEqual(RendererBackend.d3d11, cfg.renderer);
+}
+
+test "selecting d3d12 requires spelling it out" {
+    // D3D12 is verified only for static and low-frequency correctness, so it
+    // must never be reachable by accident — neither by a typo nor by a value
+    // that merely resembles it.
+    {
+        var cfg = parse(std.testing.allocator, "renderer = d3d12\n", "test");
+        defer cfg.deinit();
+        try std.testing.expectEqual(RendererBackend.d3d12, cfg.renderer);
+    }
+    for ([_][]const u8{ "renderer = D3D12\n", "renderer = dx12\n", "renderer = d3d12x\n", "renderer =\n" }) |src| {
+        var cfg = parse(std.testing.allocator, src, "test");
+        defer cfg.deinit();
+        try std.testing.expectEqual(RendererBackend.d3d11, cfg.renderer);
     }
 }
 

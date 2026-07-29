@@ -44,7 +44,7 @@ pub const BgImageDecoded = struct {
 // message loop. The currently-displayed image stays visible until the worker
 // delivers the new one, avoiding a brief "no image" flash mid-reload.
 pub fn reload(
-    self: *D3d11Renderer,
+    self: anytype,
     gpa: std.mem.Allocator,
     cfg: *const Config,
     hwnd: win32.HWND,
@@ -69,7 +69,7 @@ pub fn reload(
 
         if (path.len == 0) {
             // Clearing the image is cheap — apply directly, no worker.
-            self.background_image.release();
+            self.backgroundImageRelease();
             if (self.bg_image_path.len != 0) gpa.free(self.bg_image_path);
             self.bg_image_path = &.{};
             self.grid_force_full = true;
@@ -139,15 +139,15 @@ pub fn reload(
 // req_id no longer matches the latest reload) are ignored — only the
 // currently-targeted image gets uploaded and displayed.
 pub fn applyDecoded(
-    self: *D3d11Renderer,
+    self: anytype,
     result: *const BgImageDecoded,
 ) void {
     if (result.req_id != self.bg_image_req_id) return;
 
-    self.background_image.release();
+    self.backgroundImageRelease();
     if (result.pixels) |pixels| {
         const decoded: gpu.DecodedBackground = .{ .pixels = pixels, .w = result.w, .h = result.h };
-        self.background_image = gpu.uploadBackground(self.device, decoded);
+        self.backgroundImageUpload(decoded);
         if (self.background_image.loaded()) {
             log.info("background-image: loaded '{s}' ({}x{})", .{ result.path, result.w, result.h });
         }
@@ -185,7 +185,7 @@ fn decodeWorker(
 // Computes the fitted/positioned destination rectangle of the background image
 // within a `container_w` x `container_h` pixel area (the terminal grid region
 // below the tab bar). Returns offset.xy + size.xy in that space. Pure geometry.
-pub fn computeDest(self: *D3d11Renderer, container_w: f32, container_h: f32) [4]f32 {
+pub fn computeDest(self: anytype, container_w: f32, container_h: f32) [4]f32 {
     const sw: f32 = @floatFromInt(self.background_image.src_w);
     const sh: f32 = @floatFromInt(self.background_image.src_h);
     if (sw <= 0 or sh <= 0) return .{ 0, 0, 0, 0 };

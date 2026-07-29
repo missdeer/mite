@@ -23,6 +23,7 @@ const cell_buffer = @import("d3d11/cell_buffer.zig");
 const grid = @import("d3d11/grid.zig");
 const diag = @import("diag.zig");
 const shader_assets = @import("shader_assets.zig");
+const shared = @import("shared.zig");
 
 // Re-exported so external callers (window message handlers) stay agnostic
 // to the internal module layout.
@@ -170,7 +171,7 @@ bg_sampler: ?*win32.ID3D11SamplerState = null,
 // id no longer matches, so a fast burst of hot-reloads doesn't paint a
 // stale image. Only ever read/written from the UI thread.
 bg_image_req_id: u32 = 0,
-kitty_images: kitty_image_mod.Cache = .{},
+kitty_images: kitty_image_mod.Cache(gpu.KittyImage) = .{},
 
 // Monotonic counter bumped whenever the glyph cache / atlas is rebuilt
 // (font reload, DPI change, atlas resize). In-flight raster jobs carry
@@ -301,6 +302,143 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
         .image_const_buf = image_const_buf,
         .image_blend_state = kitty_image_mod.createBlendState(device),
     };
+}
+
+// --- Narrow GPU contract consumed by the backend-agnostic shared layer ---
+//
+// Everything above this line is D3D11's own business. These are the only
+// operations `cell_buffer`, `glyph` and `background_image` need from a
+// backend, so those modules are written against this contract instead of
+// against D3D11 — the same source then serves both backends and cannot drift
+// between them.
+
+/// How the font service hands rasterized glyphs to this backend. D3D11 can
+/// open the font service's shared surfaces because both live on the same
+/// graphics API; D3D12 cannot, and takes CPU pixels instead.
+pub const glyph_handoff: shared.GlyphHandoff = .shared_surface;
+
+pub fn atlasEnsure(self: *D3d11Renderer, tex_pixel: CellXY) bool {
+    return self.glyph_texture.updateSize(self.device, tex_pixel);
+}
+
+pub fn atlasWriteCpu(
+    self: *D3d11Renderer,
+    dst_coord: CellXY,
+    region: CellXY,
+    src_ptr: [*]const u8,
+    src_row_pitch: u32,
+) void {
+    const dst_box: win32.D3D11_BOX = .{
+        .left = dst_coord.x,
+        .top = dst_coord.y,
+        .front = 0,
+        .right = dst_coord.x + region.x,
+        .bottom = dst_coord.y + region.y,
+        .back = 1,
+    };
+    self.context.UpdateSubresource(
+        &self.glyph_texture.obj.?.ID3D11Resource,
+        0,
+        &dst_box,
+        @ptrCast(src_ptr),
+        src_row_pitch,
+        0,
+    );
+}
+
+/// Blank one atlas slot. Used when a rasterization fails: leaving the
+/// evicted occupant's pixels behind would render a plausible-looking but
+/// wrong character, which is harder to notice than a blank.
+pub fn atlasClear(self: *D3d11Renderer, dst_coord: CellXY) void {
+    const cs = self.font_service.cell_size_xy;
+    const row_bytes: usize = @as(usize, cs.x) * 4;
+    const zeros = std.heap.page_allocator.alloc(u8, row_bytes * cs.y) catch return;
+    defer std.heap.page_allocator.free(zeros);
+    @memset(zeros, 0);
+    self.atlasWriteCpu(dst_coord, cs, zeros.ptr, @intCast(row_bytes));
+}
+
+/// Copy up to two cell-sized regions out of one font-service surface.
+///
+/// Both halves are taken under a single read acquisition on purpose. The
+/// handoff alternates keys — releasing hands the surface back to the font
+/// service — so acquiring twice in a row would block forever waiting for a
+/// writer that has not run. Wide glyphs need both halves from one surface,
+/// which is why this takes a pair rather than being called twice.
+pub fn atlasCopyStaging(
+    self: *D3d11Renderer,
+    staging: *gpu.StagingTexture.Cached,
+    first: ?gpu.AtlasCopy,
+    second: ?gpu.AtlasCopy,
+) void {
+    if (first == null and second == null) return;
+    const cs = self.font_service.cell_size_xy;
+    const imported = self.glyph_staging_bridge.acquireRead(self.device, staging.texture);
+    defer self.glyph_staging_bridge.releaseRead();
+
+    for ([_]?gpu.AtlasCopy{ first, second }) |maybe| {
+        const copy = maybe orelse continue;
+        const box: win32.D3D11_BOX = .{
+            .left = copy.src_left,
+            .top = 0,
+            .front = 0,
+            .right = copy.src_left + cs.x,
+            .bottom = cs.y,
+            .back = 1,
+        };
+        self.context.CopySubresourceRegion(
+            &self.glyph_texture.obj.?.ID3D11Resource,
+            0,
+            copy.dst.x,
+            copy.dst.y,
+            0,
+            &imported.ID3D11Resource,
+            0,
+            &box,
+        );
+    }
+}
+
+pub fn cellsResize(self: *D3d11Renderer, count: u32) bool {
+    return self.shader_cells.updateCount(self.device, count);
+}
+
+pub fn cellsUpload(self: *D3d11Renderer, first_cell: u32, cells: []const shader.Cell) void {
+    const cell_bytes: u32 = @sizeOf(shader.Cell);
+    const box: win32.D3D11_BOX = .{
+        .left = first_cell * cell_bytes,
+        .right = (first_cell + @as(u32, @intCast(cells.len))) * cell_bytes,
+        .top = 0,
+        .bottom = 1,
+        .front = 0,
+        .back = 1,
+    };
+    self.context.UpdateSubresource(
+        &self.shader_cells.cell_buf.ID3D11Resource,
+        0,
+        &box,
+        @ptrCast(cells.ptr),
+        0,
+        0,
+    );
+}
+
+pub fn backgroundImageRelease(self: *D3d11Renderer) void {
+    self.background_image.release();
+}
+
+pub fn backgroundImageUpload(self: *D3d11Renderer, decoded: gpu.DecodedBackground) void {
+    self.background_image.release();
+    self.background_image = gpu.uploadBackground(self.device, decoded);
+}
+
+pub fn kittyImageUpload(
+    self: *D3d11Renderer,
+    width: u32,
+    height: u32,
+    rgba: []const u8,
+) ?gpu.KittyImage {
+    return kitty_image_mod.uploadTexture(self.device, width, height, rgba);
 }
 
 pub fn onFontStateChanged(self: *D3d11Renderer) void {
@@ -834,34 +972,7 @@ fn maybeLogDiag(self: *D3d11Renderer, client_w: u32, client_h: u32, cols: u32, r
 // true iff renderer/cache state changed and the dispatcher should request a
 // render. The caller still owns `result` and frees it after we return.
 pub fn applyGlyphResult(self: *D3d11Renderer, result: *RasterResult) bool {
-    if (result.cache_gen != self.cache_gen) return false;
-    if (self.glyph_cache == null) return false;
-    const cache = &self.glyph_cache.?;
-    if (result.failed) return cache.cancelPending(result.slot, result.slot_gen, result.key);
-    if (!cache.markReady(result.slot, result.slot_gen, result.key)) return false;
-
-    const cs = self.font_service.cell_size_xy;
-    const tex_cell_count = gpu.getTextureMaxCellCount(cs);
-    const pos = gpu.cellPosFromIndex(result.slot, tex_cell_count.x);
-    const dst_x: u32 = @as(u32, cs.x) * pos.x;
-    const dst_y: u32 = @as(u32, cs.y) * pos.y;
-    const dst_box: win32.D3D11_BOX = .{
-        .left = dst_x,
-        .top = dst_y,
-        .front = 0,
-        .right = dst_x + result.w,
-        .bottom = dst_y + result.h,
-        .back = 1,
-    };
-    self.context.UpdateSubresource(
-        &self.glyph_texture.obj.?.ID3D11Resource,
-        0,
-        &dst_box,
-        @ptrCast(result.bytes.ptr),
-        result.w * 4,
-        0,
-    );
-    return true;
+    return glyph_mod.applyRasterResult(self, result);
 }
 
 pub fn reloadBackgroundImage(

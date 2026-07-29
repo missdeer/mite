@@ -10,6 +10,10 @@ const std = @import("std");
 const win32 = @import("win32").everything;
 
 const shader_assets = @import("shader_assets.zig");
+pub const upload = @import("d3d12/upload.zig");
+pub const pipeline = @import("d3d12/pipeline.zig");
+pub const present = @import("d3d12/present.zig");
+pub const Renderer = @import("d3d12/renderer.zig");
 
 pub const Error = error{
     AdapterUnavailable,
@@ -160,8 +164,8 @@ pub const Skeleton = struct {
         defer _ = root_signature.IUnknown.Release();
 
         inline for (.{ shader_assets.pixel, shader_assets.image_pixel }) |pixel_targets| {
-            const pipeline = try self.createVerificationPipeline(root_signature, pixel_targets.dxil);
-            _ = pipeline.IUnknown.Release();
+            const verified = try self.createVerificationPipeline(root_signature, pixel_targets.dxil);
+            _ = verified.IUnknown.Release();
         }
     }
 
@@ -274,15 +278,15 @@ pub const Skeleton = struct {
         desc.RTVFormats[0] = render_target_format;
         desc.SampleDesc = .{ .Count = 1, .Quality = 0 };
 
-        var pipeline: *win32.ID3D12PipelineState = undefined;
+        var created: *win32.ID3D12PipelineState = undefined;
         if (self.device.CreateGraphicsPipelineState(
             &desc,
             win32.IID_ID3D12PipelineState,
-            @ptrCast(&pipeline),
+            @ptrCast(&created),
         ) < 0) {
             return error.ShaderAssetRejected;
         }
-        return pipeline;
+        return created;
     }
 };
 
