@@ -65,8 +65,15 @@ pub const glyph_handoff: shared.GlyphHandoff = .cpu_pixels;
 /// whole life, so drawing never has to transition it.
 pub const KittyImage = struct {
     resource: *win32.ID3D12Resource,
+    owner: *D3d12Renderer,
 
+    /// The shared cache drops images whenever the terminal stops referencing
+    /// them, which can happen while submitted work is still sampling this
+    /// texture. Retiring a GPU-visible resource is one of the lifecycle points
+    /// that stays conservative: it is rare, so settling first costs nothing in
+    /// the sustained path and is the only thing that makes the release safe.
     pub fn release(self: *KittyImage) void {
+        self.owner.settleBeforeRelease();
         _ = self.resource.IUnknown.Release();
     }
 };
@@ -112,7 +119,7 @@ kitty_images: kitty_image_mod.Cache(KittyImage) = .{},
 // --- D3D12 device and explicit synchronization ---
 device: *win32.ID3D12Device,
 queue: *win32.ID3D12CommandQueue,
-command_allocator: *win32.ID3D12CommandAllocator,
+command_allocators: [upload.Ring.generations]*win32.ID3D12CommandAllocator,
 command_list: *win32.ID3D12GraphicsCommandList,
 fence: *win32.ID3D12Fence,
 fence_event: win32.HANDLE,
@@ -121,13 +128,24 @@ fence_value: u64 = 0,
 /// async glyph landing, say) accumulate in the same list and are carried by
 /// the next present.
 recording: bool = false,
+/// True while a generation is held. A batch spans everything recorded between
+/// two presents, which may be several submissions if a resource has to be
+/// retired part-way through; it passes the throttle decision exactly once.
+batch_open: bool = false,
 
 root_signature: *win32.ID3D12RootSignature,
 pso_grid: *win32.ID3D12PipelineState,
 pso_inline_image: *win32.ID3D12PipelineState,
-descriptors: pipeline.Descriptors,
+/// One shader-visible descriptor heap per generation. The GPU reads
+/// descriptors when the work runs, so a single heap rewritten every frame
+/// would be read by the previous frame's still-running work — the same hazard
+/// as staged bytes, and equally invisible on screen.
+descriptor_heaps: [upload.Ring.generations]pipeline.Descriptors,
 render_targets: pipeline.RenderTargets,
-arena: upload.Arena = .{},
+/// One staging arena per generation, plus the bookkeeping that decides which
+/// generation may be handed out.
+arenas: [upload.Ring.generations]upload.Arena = @splat(.{}),
+ring: upload.Ring = .{},
 
 surface: ?present.Surface = null,
 occluded: bool = false,
@@ -188,12 +206,16 @@ pub fn init(
         if (hr < 0) fatal("CreateCommandQueue", hr);
     }
 
-    var command_allocator: *win32.ID3D12CommandAllocator = undefined;
-    {
+    // One allocator per generation. An allocator may only be reset once the
+    // GPU is done with everything recorded from it, so sharing a single one
+    // across generations would force a full wait every frame — the very thing
+    // the generation ring exists to remove.
+    var command_allocators: [upload.Ring.generations]*win32.ID3D12CommandAllocator = undefined;
+    for (&command_allocators) |*slot| {
         const hr = device.CreateCommandAllocator(
             .DIRECT,
             win32.IID_ID3D12CommandAllocator,
-            @ptrCast(&command_allocator),
+            @ptrCast(slot),
         );
         if (hr < 0) fatal("CreateCommandAllocator", hr);
     }
@@ -203,7 +225,7 @@ pub fn init(
         const hr = device.CreateCommandList(
             0,
             .DIRECT,
-            command_allocator,
+            command_allocators[0],
             null,
             win32.IID_ID3D12GraphicsCommandList,
             @ptrCast(&command_list),
@@ -245,10 +267,14 @@ pub fn init(
         "renderer = d3d12: inline-image pipeline state rejected ({s})",
         .{@errorName(err)},
     );
-    const descriptors = pipeline.Descriptors.init(device, pipeline.initial_table_count) catch |err| std.debug.panic(
-        "renderer = d3d12: descriptor heap unavailable ({s})",
-        .{@errorName(err)},
-    );
+    var descriptor_heaps: [upload.Ring.generations]pipeline.Descriptors = undefined;
+    for (&descriptor_heaps) |*slot| {
+        slot.* = pipeline.Descriptors.init(device, pipeline.initial_table_count) catch |err|
+            std.debug.panic(
+                "renderer = d3d12: descriptor heap unavailable ({s})",
+                .{@errorName(err)},
+            );
+    }
     const render_targets = pipeline.RenderTargets.init(device) catch |err| std.debug.panic(
         "renderer = d3d12: render-target descriptor heap unavailable ({s})",
         .{@errorName(err)},
@@ -267,14 +293,14 @@ pub fn init(
         .font_service = font_service,
         .device = device,
         .queue = queue,
-        .command_allocator = command_allocator,
+        .command_allocators = command_allocators,
         .command_list = command_list,
         .fence = fence,
         .fence_event = fence_event,
         .root_signature = root_signature,
         .pso_grid = pso_grid,
         .pso_inline_image = pso_inline_image,
-        .descriptors = descriptors,
+        .descriptor_heaps = descriptor_heaps,
         .render_targets = render_targets,
     };
 }
@@ -297,6 +323,10 @@ pub fn deinit(self: *D3d12Renderer) void {
         _ = self.command_list.Close();
         self.recording = false;
     }
+    // End the batch before anything is retired: the releases below settle as
+    // they go, and an open batch would have them reopen a command list that is
+    // about to be released.
+    self.batch_open = false;
 
     self.kitty_images.deinit(std.heap.page_allocator);
     if (self.glyph_cache) |*c| {
@@ -312,10 +342,10 @@ pub fn deinit(self: *D3d12Renderer) void {
     self.cells.release();
     self.back_buffer.release();
     self.grid_target.release();
-    self.arena.deinit();
+    for (&self.arenas) |*a| a.deinit();
 
     self.render_targets.release();
-    self.descriptors.release();
+    for (&self.descriptor_heaps) |*d| d.release();
     _ = self.pso_inline_image.IUnknown.Release();
     _ = self.pso_grid.IUnknown.Release();
     _ = self.root_signature.IUnknown.Release();
@@ -326,7 +356,7 @@ pub fn deinit(self: *D3d12Renderer) void {
     _ = win32.CloseHandle(self.fence_event);
     _ = self.fence.IUnknown.Release();
     _ = self.command_list.IUnknown.Release();
-    _ = self.command_allocator.IUnknown.Release();
+    for (self.command_allocators) |a| _ = a.IUnknown.Release();
     _ = self.queue.IUnknown.Release();
     _ = self.device.IUnknown.Release();
     self.* = undefined;
@@ -345,29 +375,137 @@ pub fn onFontStateChanged(self: *D3d12Renderer) void {
 
 // --- Explicit synchronization ---
 
+/// How long the presentation gate is allowed to hold a frame up. Matches the
+/// other backend: it is a best-effort gate on DXGI queue availability, so a
+/// DWM hiccup must not be able to freeze the message pump.
+const presentation_gate_ms: u32 = 100;
+/// How long the completion signal is allowed to take before we call the GPU
+/// wedged. Unlike the gate above this is a correctness wait, so it is generous
+/// and fatal rather than short and best-effort.
+const completion_wait_ms: u32 = 10_000;
+
+fn commandAllocator(self: *D3d12Renderer) *win32.ID3D12CommandAllocator {
+    return self.command_allocators[self.ring.cursor];
+}
+
+fn arena(self: *D3d12Renderer) *upload.Arena {
+    return &self.arenas[self.ring.cursor];
+}
+
+fn descriptors(self: *D3d12Renderer) *pipeline.Descriptors {
+    return &self.descriptor_heaps[self.ring.cursor];
+}
+
+/// Take ownership of a generation for a new submission batch.
+///
+/// Every batch passes through here before anything is recorded into it, which
+/// is what keeps the throttle decision below the only one on the frame path:
+/// work arriving between frames — an async glyph landing, say — joins a batch
+/// that has already been let through rather than opening an ungated one.
+fn beginBatch(self: *D3d12Renderer) void {
+    if (self.batch_open) {
+        self.beginRecording();
+        return;
+    }
+    self.awaitNextGeneration();
+    self.ring.advance();
+    if (!self.ring.currentIsSafe(self.fence.GetCompletedValue())) std.debug.panic(
+        "renderer = d3d12: staging generation {d} was handed out while the GPU may still " ++
+            "be reading it",
+        .{self.ring.cursor},
+    );
+    if (self.commandAllocator().Reset() < 0) fatal("CommandAllocator.Reset", 0);
+    self.arena().recycle();
+    self.batch_open = true;
+    self.beginRecording();
+}
+
+/// The single throttle decision.
+///
+/// Presentation readiness and the completion of the generation about to be
+/// reused are solved together, before any ownership is taken. Deciding them in
+/// two places would either serialize two conditions that can progress at once
+/// or leave a hidden idle wait in one of them, and that stacked delay is what
+/// this backend has to avoid to stay level with the other one.
+fn awaitNextGeneration(self: *D3d12Renderer) void {
+    const owed = self.ring.blocking();
+    var handles: [2]win32.HANDLE = undefined;
+    var count: u32 = 0;
+    if (self.surface) |*s| {
+        handles[count] = s.frame_latency_waitable;
+        count += 1;
+    }
+    const armed = if (owed) |value| self.armCompletion(value) else false;
+    if (armed) {
+        handles[count] = self.fence_event;
+        count += 1;
+    }
+    if (count == 0) return;
+
+    // One wait for both conditions: whichever is slower sets the cost, and
+    // neither is observed behind the other.
+    _ = win32.WaitForMultipleObjects(count, &handles, 1, presentation_gate_ms);
+
+    // The presentation gate is best-effort and is now done with either way.
+    // The completion signal is not: handing this generation out early is the
+    // corruption this backend exists to avoid, so it gets the rest of the
+    // budget. In the ordinary case where the GPU is the slower of the two,
+    // the wait above already covered most of it.
+    if (owed) |value| self.awaitCompletion(value);
+}
+
+/// Block until the fence has reached `value`.
+///
+/// One event serves every wait site here, so a wake is not by itself proof
+/// that this value was reached — an earlier registration for a lower value can
+/// signal the same event. The fence is therefore rechecked rather than
+/// trusted, which keeps this correct locally instead of depending on no other
+/// site ever leaving a registration outstanding.
+fn awaitCompletion(self: *D3d12Renderer, value: u64) void {
+    while (self.fence.GetCompletedValue() < value) {
+        if (!self.armCompletion(value)) return;
+        // Bounded so a wedged GPU surfaces as a hang we can see rather than an
+        // unkillable message pump.
+        if (win32.WaitForSingleObject(self.fence_event, completion_wait_ms) != .NO_ERROR) {
+            fatal("WaitForSingleObject(fence)", 0);
+        }
+    }
+}
+
+/// Arm the completion event for `value`, reporting whether a wait is needed.
+///
+/// The event is reset first because it is auto-reset: an earlier arming whose
+/// signal nobody consumed would otherwise let the next wait return at once,
+/// which reads as "the GPU is done" when it is not.
+fn armCompletion(self: *D3d12Renderer, value: u64) bool {
+    if (self.fence.GetCompletedValue() >= value) return false;
+    _ = win32.ResetEvent(self.fence_event);
+    if (self.fence.SetEventOnCompletion(value, self.fence_event) < 0) {
+        fatal("SetEventOnCompletion", 0);
+    }
+    return true;
+}
+
 fn beginRecording(self: *D3d12Renderer) void {
     if (self.recording) return;
-    if (self.command_list.Reset(self.command_allocator, null) < 0) fatal("CommandList.Reset", 0);
+    if (self.command_list.Reset(self.commandAllocator(), null) < 0) fatal("CommandList.Reset", 0);
     self.recording = true;
 }
 
-/// Submit whatever has been recorded and block until the GPU is done with it.
+/// Close and submit whatever is recorded, binding this generation to a new
+/// completion value.
 ///
-/// Blocking is the whole conservative-upload model: once this returns, every
-/// upload region the GPU could have been reading is provably free, so the
-/// arena can rewind without tracking per-region lifetimes. Trading throughput
-/// for a correctness property that is otherwise only observable as
-/// intermittent corruption is the point of this slice.
-fn flushGpu(self: *D3d12Renderer) void {
+/// It does not wait. The wait belongs to the single decision point that hands
+/// the generation out again, which is what lets the CPU record the next frame
+/// while the GPU is still reading this one.
+fn submit(self: *D3d12Renderer) void {
     if (!self.recording) return;
     if (self.command_list.Close() < 0) fatal("CommandList.Close", 0);
     self.recording = false;
 
     var lists = [_]?*win32.ID3D12CommandList{@ptrCast(self.command_list)};
     self.queue.ExecuteCommandLists(lists.len, &lists);
-    self.waitForGpu();
-    if (self.command_allocator.Reset() < 0) fatal("CommandAllocator.Reset", 0);
-    self.arena.rewind();
+    self.signalCompletion();
 }
 
 /// Make it safe to release a resource that recorded work may reference.
@@ -376,40 +514,37 @@ fn flushGpu(self: *D3d12Renderer) void {
 /// waiting on the fence is not enough on its own: anything already recorded
 /// but not yet submitted would execute against freed memory. Submitting first
 /// and only then waiting is what closes that window.
+///
+/// This is one of the lifecycle points kept deliberately conservative: it
+/// retires GPU-visible resources and is rare, so a full wait costs nothing in
+/// the sustained path. The batch stays open across it — it has already passed
+/// the throttle decision and must not take it a second time.
 fn settleBeforeRelease(self: *D3d12Renderer) void {
-    if (!self.recording) {
-        self.waitForGpu();
-        return;
-    }
-    self.flushGpu();
-    // Reopen: callers record immediately afterwards, and a closed list would
-    // swallow everything they record until the next flush skipped submission
-    // entirely for want of an open list.
+    self.submit();
+    self.waitForGpu();
+    if (!self.batch_open) return;
+    // Everything staged in this generation has now executed, so the arena can
+    // be handed back and the allocator reset without leaving the batch.
+    if (self.commandAllocator().Reset() < 0) fatal("CommandAllocator.Reset", 0);
+    self.arena().recycle();
     self.beginRecording();
 }
 
-fn waitForGpu(self: *D3d12Renderer) void {
+fn signalCompletion(self: *D3d12Renderer) void {
     self.fence_value += 1;
     if (self.queue.Signal(self.fence, self.fence_value) < 0) fatal("Queue.Signal", 0);
-    if (self.fence.GetCompletedValue() >= self.fence_value) return;
-    if (self.fence.SetEventOnCompletion(self.fence_value, self.fence_event) < 0) {
-        fatal("SetEventOnCompletion", 0);
-    }
-    // Bounded so a wedged GPU surfaces as a hang we can see rather than an
-    // unkillable message pump.
-    if (win32.WaitForSingleObject(self.fence_event, 10_000) != .NO_ERROR) {
-        fatal("WaitForSingleObject(fence)", 0);
-    }
+    self.ring.bind(self.fence_value);
 }
 
-fn flushTrampoline(ctx: *anyopaque) void {
-    const self: *D3d12Renderer = @ptrCast(@alignCast(ctx));
-    self.flushGpu();
-    self.beginRecording();
+/// Block until the queue has drained. Reserved for lifecycle points that
+/// retire or replace GPU-visible resources.
+fn waitForGpu(self: *D3d12Renderer) void {
+    self.signalCompletion();
+    self.awaitCompletion(self.fence_value);
 }
 
 fn reserve(self: *D3d12Renderer, len: u64, alignment: u64) upload.Arena.Reservation {
-    return self.arena.reserve(self.device, len, alignment, self, flushTrampoline) catch |err| {
+    return self.arena().reserve(self.device, len, alignment) catch |err| {
         std.debug.panic("renderer = d3d12: upload staging failed ({s})", .{@errorName(err)});
     };
 }
@@ -450,7 +585,7 @@ pub fn cellsResize(self: *D3d12Renderer, count: u32) bool {
 
 pub fn cellsUpload(self: *D3d12Renderer, first_cell: u32, cells: []const shader.Cell) void {
     const resource = self.cells.resource orelse return;
-    self.beginRecording();
+    self.beginBatch();
     self.cells.moveTo(self.command_list, win32.D3D12_RESOURCE_STATE_COPY_DEST);
 
     const bytes = std.mem.sliceAsBytes(cells);
@@ -459,7 +594,7 @@ pub fn cellsUpload(self: *D3d12Renderer, first_cell: u32, cells: []const shader.
     self.command_list.CopyBufferRegion(
         resource,
         @as(u64, first_cell) * @sizeOf(shader.Cell),
-        self.arena.buffer.?,
+        self.arena().buffer.?,
         res.offset,
         bytes.len,
     );
@@ -499,7 +634,7 @@ pub fn atlasWriteCpu(
     src_row_pitch: u32,
 ) void {
     const resource = self.atlas.resource orelse return;
-    self.beginRecording();
+    self.beginBatch();
     self.atlas.moveTo(self.command_list, win32.D3D12_RESOURCE_STATE_COPY_DEST);
 
     // D3D12 requires each staged row to start on a 256-byte boundary, so the
@@ -515,7 +650,7 @@ pub fn atlasWriteCpu(
     }
 
     const src_loc = win32.D3D12_TEXTURE_COPY_LOCATION{
-        .pResource = self.arena.buffer.?,
+        .pResource = self.arena().buffer.?,
         .Type = .PLACED_FOOTPRINT,
         .Anonymous = .{ .PlacedFootprint = .{
             .Offset = res.offset,
@@ -592,7 +727,7 @@ pub fn kittyImageUpload(
 ) ?KittyImage {
     const resource = self.uploadTexture(.R8G8B8A8_UNORM, width, height, rgba, width * 4) orelse
         return null;
-    return .{ .resource = resource };
+    return .{ .resource = resource, .owner = self };
 }
 
 /// Create a texture, stage its pixels and leave it shader-readable.
@@ -617,7 +752,7 @@ fn uploadTexture(
         @ptrCast(&resource),
     ) < 0) return null;
 
-    self.beginRecording();
+    self.beginBatch();
     const dst_pitch: u32 = @intCast(upload.alignUp(@as(u64, width) * 4, upload.texture_row_alignment));
     const res = self.reserve(@as(u64, dst_pitch) * height, upload.texture_placement_alignment);
     const row_bytes: usize = @as(usize, width) * 4;
@@ -627,7 +762,7 @@ fn uploadTexture(
     }
 
     const src_loc = win32.D3D12_TEXTURE_COPY_LOCATION{
-        .pResource = self.arena.buffer.?,
+        .pResource = self.arena().buffer.?,
         .Type = .PLACED_FOOTPRINT,
         .Anonymous = .{ .PlacedFootprint = .{
             .Offset = res.offset,
@@ -722,9 +857,6 @@ const PreparedFrame = struct {
     term_shader_row: u32,
     atlas: gpu.AtlasFrame,
     tex_cell_count: CellXY,
-    /// Staged into the upload arena only once every upload for this frame is
-    /// recorded. Reserving it earlier would risk a mid-frame arena rewind
-    /// handing the same bytes to something else before the draw reads them.
     config: shader.GridConfig,
 };
 
@@ -789,11 +921,11 @@ fn prepareFrame(
         self.grid_force_full = true;
     }
 
-    // The existing presentation-latency gate is reused unchanged. This
-    // backend's own completion signal stays out of the throttle decision:
-    // merging the two synchronization lines is a later concern, and doing it
-    // here would make this slice answer for latency as well as correctness.
-    surface.waitForFrameLatency();
+    // Take the generation for this frame. The presentation-latency gate lives
+    // inside that decision now, together with the completion signal, so the
+    // frame is held up once by whichever of the two is slower rather than
+    // twice in a row.
+    self.beginBatch();
 
     self.ensureGridTarget(client_w, client_h);
 
@@ -870,7 +1002,6 @@ fn prepareFrame(
         );
     }
 
-    self.beginRecording();
     return .{
         .client_w = client_w,
         .client_h = client_h,
@@ -948,34 +1079,12 @@ fn drawAndPresent(
     in: DrawInputs,
 ) void {
     const surface = &self.surface.?;
-    self.beginRecording();
+    self.beginBatch();
     const list = self.command_list;
 
-    // Everything this frame will still stage is reserved before any pipeline
-    // state is set, then the arena is sealed. A flush part-way through would
-    // reset the command list and silently drop the state recorded draws
-    // depend on; a growth would free the buffer they point into. Forcing both
-    // to happen here, or not at all, closes that window.
-    const visible_placements = self.countVisiblePlacements();
-    self.ensureDescriptorCapacity(visible_placements);
-    const band_bytes: u64 = if (prepared.tab_bar_h > 0) blk: {
-        const pitch = upload.alignUp(@as(u64, prepared.client_w) * 4, upload.texture_row_alignment);
-        break :blk pitch * @min(prepared.tab_bar_h, prepared.client_h) +
-            upload.texture_placement_alignment;
-    } else 0;
-    const constant_bytes: u64 = upload.constant_buffer_alignment * (1 + visible_placements);
-    self.arena.ensureCapacityFor(
-        self.device,
-        constant_bytes + band_bytes,
-        upload.texture_placement_alignment,
-        self,
-        flushTrampoline,
-    ) catch |err| std.debug.panic(
-        "renderer = d3d12: could not stage a frame's uploads ({s})",
-        .{@errorName(err)},
-    );
-    self.arena.sealed = true;
-    defer self.arena.sealed = false;
+    // Descriptor growth retires the old heap, so it has to happen before any
+    // pipeline state is set: it submits and reopens the command list.
+    self.ensureDescriptorCapacity(self.countVisiblePlacements());
 
     // Uploads recorded during cell building must finish before the shader
     // reads them; these two transitions are what make that ordering explicit
@@ -992,7 +1101,7 @@ fn drawAndPresent(
         const rtv = self.render_targets.cpu();
         list.OMSetRenderTargets(1, &rtv, win32.FALSE, null);
 
-        var heaps = [_]?*win32.ID3D12DescriptorHeap{self.descriptors.heap};
+        var heaps = [_]?*win32.ID3D12DescriptorHeap{self.descriptors().heap};
         list.SetDescriptorHeaps(heaps.len, &heaps);
         list.SetGraphicsRootSignature(self.root_signature);
         var config = prepared.config;
@@ -1001,9 +1110,9 @@ fn drawAndPresent(
         @memcpy(config_res.bytes, config_bytes);
         list.SetGraphicsRootConstantBufferView(
             0,
-            self.arena.buffer.?.GetGPUVirtualAddress() + config_res.offset,
+            self.arena().buffer.?.GetGPUVirtualAddress() + config_res.offset,
         );
-        list.SetGraphicsRootDescriptorTable(1, self.descriptors.gpu(0));
+        list.SetGraphicsRootDescriptorTable(1, self.descriptors().gpu(0));
         list.SetPipelineState(self.pso_grid);
         list.IASetPrimitiveTopology(._PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
@@ -1054,7 +1163,7 @@ fn drawAndPresent(
         // frame, then stop: without a back buffer this backend cannot present
         // at all, and quietly dropping frames forever is precisely the
         // partially-capable state that must not be allowed to persist.
-        self.flushGpu();
+        self.submit();
         std.debug.panic(
             "renderer = d3d12: the swap chain yielded no back buffer; the backend can no " ++
                 "longer meet its baseline and recovery is out of scope",
@@ -1074,7 +1183,11 @@ fn drawAndPresent(
     self.copyTabBarBand(prepared, tabbar);
 
     self.back_buffer.moveTo(list, win32.D3D12_RESOURCE_STATE_PRESENT);
-    self.flushGpu();
+    // Submit without waiting, and end the batch here: the next one takes the
+    // other generation and passes the throttle decision on its way in, so the
+    // CPU can build the next frame while the GPU is still reading this one.
+    self.submit();
+    self.batch_open = false;
 
     const sync_interval: u32 = if (self.common.remote_or_software_adapter or remote_session) 1 else 0;
     const hr = surface.swap_chain.IDXGISwapChain.Present(sync_interval, 0);
@@ -1112,22 +1225,32 @@ fn countVisiblePlacements(self: *D3d12Renderer) u32 {
 /// limit would make real terminal content disappear.
 fn ensureDescriptorCapacity(self: *D3d12Renderer, placements: u32) void {
     const wanted = 1 + placements;
-    if (wanted <= self.descriptors.table_count) return;
+    if (wanted <= self.descriptors().table_count) return;
+    // Every generation's heap is replaced together so they stay
+    // interchangeable, which the settle below also makes safe: no submitted
+    // work can still be reading the heaps being released.
     self.settleBeforeRelease();
-    self.descriptors.release();
-    self.descriptors = pipeline.Descriptors.init(self.device, wanted) catch |err|
-        std.debug.panic(
+    for (&self.descriptor_heaps) |*d| {
+        d.release();
+        d.* = pipeline.Descriptors.init(self.device, wanted) catch |err| std.debug.panic(
             "renderer = d3d12: descriptor heap for {d} inline images unavailable ({s})",
             .{ placements, @errorName(err) },
         );
+    }
     self.refreshSharedDescriptors();
 }
 
-/// (Re)write the descriptors every table shares. Slot 3 is filled with a null
-/// view so the table is complete even when nothing is bound there: D3D12
-/// requires every descriptor a bound table covers to be initialized, whether
-/// or not the shader ends up reading it.
+/// (Re)write the descriptors every table shares, in every generation. Slot 3
+/// is filled with a null view so the table is complete even when nothing is
+/// bound there: D3D12 requires every descriptor a bound table covers to be
+/// initialized, whether or not the shader ends up reading it.
+///
+/// This rewrites heaps other generations own, so it settles first: a heap that
+/// submitted work may still be reading must not be written by the CPU. Every
+/// caller reaches here because a shared resource was just replaced, which is
+/// rare enough that the wait does not touch the sustained path.
 fn refreshSharedDescriptors(self: *D3d12Renderer) void {
+    self.settleBeforeRelease();
     const cell_view = win32.D3D12_SHADER_RESOURCE_VIEW_DESC{
         .Format = .UNKNOWN,
         .ViewDimension = .BUFFER,
@@ -1161,12 +1284,14 @@ fn refreshSharedDescriptors(self: *D3d12Renderer) void {
             .ResourceMinLODClamp = 0,
         } },
     };
-    var table: u32 = 0;
-    while (table < self.descriptors.table_count) : (table += 1) {
-        self.device.CreateShaderResourceView(self.cells.resource, &cell_view, self.descriptors.cpu(table, 0));
-        self.device.CreateShaderResourceView(self.atlas.resource, &texture_view, self.descriptors.cpu(table, 1));
-        self.device.CreateShaderResourceView(self.background_image.resource, &texture_view, self.descriptors.cpu(table, 2));
-        self.device.CreateShaderResourceView(null, &inline_view, self.descriptors.cpu(table, 3));
+    for (self.descriptor_heaps) |heap| {
+        var table: u32 = 0;
+        while (table < heap.table_count) : (table += 1) {
+            self.device.CreateShaderResourceView(self.cells.resource, &cell_view, heap.cpu(table, 0));
+            self.device.CreateShaderResourceView(self.atlas.resource, &texture_view, heap.cpu(table, 1));
+            self.device.CreateShaderResourceView(self.background_image.resource, &texture_view, heap.cpu(table, 2));
+            self.device.CreateShaderResourceView(null, &inline_view, heap.cpu(table, 3));
+        }
     }
 }
 
@@ -1203,7 +1328,7 @@ fn copyTabBarBand(self: *D3d12Renderer, prepared: PreparedFrame, tabbar: types.T
     }
 
     const src_loc = win32.D3D12_TEXTURE_COPY_LOCATION{
-        .pResource = self.arena.buffer.?,
+        .pResource = self.arena().buffer.?,
         .Type = .PLACED_FOOTPRINT,
         .Anonymous = .{ .PlacedFootprint = .{
             .Offset = res.offset,
@@ -1231,7 +1356,7 @@ fn drawInlineImages(self: *D3d12Renderer, prepared: PreparedFrame) void {
     var table: u32 = 1;
     for (self.kitty_images.placements.items) |p| {
         if (p.z < 0) continue;
-        std.debug.assert(table < self.descriptors.table_count);
+        std.debug.assert(table < self.descriptors().table_count);
         const entry = self.kitty_images.images.get(.{
             .tab_id = self.kitty_images.last_tab_id,
             .image_id = p.image_id,
@@ -1262,7 +1387,7 @@ fn drawInlineImages(self: *D3d12Renderer, prepared: PreparedFrame) void {
         self.device.CreateShaderResourceView(
             entry.image.resource,
             &view,
-            self.descriptors.cpu(table, 3),
+            self.descriptors().cpu(table, 3),
         );
 
         var config: kitty_image_mod.ImageConfig = .{
@@ -1297,9 +1422,9 @@ fn drawInlineImages(self: *D3d12Renderer, prepared: PreparedFrame) void {
         list.RSSetScissorRects(1, &scissor);
         list.SetGraphicsRootConstantBufferView(
             0,
-            self.arena.buffer.?.GetGPUVirtualAddress() + res.offset,
+            self.arena().buffer.?.GetGPUVirtualAddress() + res.offset,
         );
-        list.SetGraphicsRootDescriptorTable(1, self.descriptors.gpu(table));
+        list.SetGraphicsRootDescriptorTable(1, self.descriptors().gpu(table));
         list.DrawInstanced(4, 1, 0, 0);
         table += 1;
     }
@@ -1323,8 +1448,31 @@ pub fn applyDecodedBackgroundImage(self: *D3d12Renderer, result: *const BgImageD
 }
 
 pub fn releaseKittyImagesForTab(self: *D3d12Renderer, tab_id: types.TabId) void {
-    self.waitForGpu();
+    // Each image settles as it is retired, so there is nothing to wait for
+    // here when the tab owns none.
     self.kitty_images.releaseForTab(std.heap.page_allocator, tab_id);
+}
+
+test "each generation owns its own submission-scoped state" {
+    // The full-idle wait this backend used to take every frame protected more
+    // than staged bytes: a command allocator may only be reset once the GPU is
+    // done with everything recorded from it. Sharing one allocator across
+    // generations would silently bring that wait back — the picture would stay
+    // correct and only the latency would regress — so the two counts have to
+    // move together.
+    // Shader-visible descriptors belong to the same class: the GPU reads them
+    // when the work runs, so one heap rewritten every frame would be read by
+    // the previous frame's work and sample the wrong texture.
+    const allocators = @typeInfo(@FieldType(D3d12Renderer, "command_allocators")).array.len;
+    const arenas = @typeInfo(@FieldType(D3d12Renderer, "arenas")).array.len;
+    const heaps = @typeInfo(@FieldType(D3d12Renderer, "descriptor_heaps")).array.len;
+    try std.testing.expectEqual(@as(usize, upload.Ring.generations), allocators);
+    try std.testing.expectEqual(@as(usize, upload.Ring.generations), arenas);
+    try std.testing.expectEqual(@as(usize, upload.Ring.generations), heaps);
+
+    // Fewer than two leaves nothing for the CPU to record into while the GPU
+    // reads the other, which is the same as having no pipelining at all.
+    try std.testing.expect(upload.Ring.generations >= 2);
 }
 
 comptime {

@@ -7,6 +7,11 @@
 //! backend would risk an appearance regression for no benefit. The only
 //! difference is what the swap chain is created against: D3D12 presents from
 //! a command queue rather than a device.
+//!
+//! The frame-latency waitable is handed out as a handle rather than wrapped in
+//! a wait of its own: it is one of the two conditions the renderer's single
+//! throttle decision solves together, and a wait primitive here would be a
+//! second place to stall the frame path.
 
 const std = @import("std");
 const win32 = @import("win32").everything;
@@ -146,12 +151,6 @@ pub const Surface = struct {
             @ptrCast(&buffer),
         ) < 0) return null;
         return buffer;
-    }
-
-    /// Best-effort gate on DXGI queue availability. Bounded rather than
-    /// infinite so a stuck waitable cannot freeze the message pump.
-    pub fn waitForFrameLatency(self: *Surface) void {
-        _ = win32.WaitForSingleObjectEx(self.frame_latency_waitable, 100, 0);
     }
 };
 

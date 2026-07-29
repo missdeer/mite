@@ -1,16 +1,12 @@
 //! Explicit upload staging and resource-state transitions for D3D12.
 //!
-//! This is the first of the two levels the D3D12 work is split into: a
-//! direct, conservative upload path that is enough to carry a correct static
-//! picture. Every byte the GPU will read is bump-allocated out of one upload
-//! buffer; when that buffer runs out, the recorded work is executed and
-//! awaited before the allocator rewinds.
-//!
-//! The conservative wait is the point, not an oversight. Reusing a region the
+//! Staging is organised into generations. Each generation owns an upload
+//! buffer and is bound, at submission, to a completion value; it may only be
+//! handed out again once that value has been reached. Reusing a region the
 //! GPU may still be reading is the failure mode that shows up as intermittent
-//! corruption rather than a reproducible error, so this slice buys correctness
-//! by paying throughput. Ring reuse driven by the completion signal replaces
-//! this wait later, and only once it can be judged on its own.
+//! corruption rather than a reproducible error, so the decision of when a
+//! generation is free is kept as `Ring` — plain bookkeeping with no GPU types
+//! in it, decidable and testable without observing a picture.
 
 const std = @import("std");
 const win32 = @import("win32").everything;
@@ -20,7 +16,6 @@ const com = @import("../d3d11/com.zig");
 pub const Error = error{
     DeviceUnavailable,
     UploadFailed,
-    SealedArenaExhausted,
 };
 
 /// D3D12 requires each row of a texture upload to start on a 256-byte
@@ -129,31 +124,70 @@ pub const Tracked = struct {
     }
 };
 
-/// Bump allocator over one mapped upload buffer.
+/// Which generation may be handed out, decided from bookkeeping alone.
+///
+/// This deliberately carries no GPU types. "A staging region is reused only
+/// after the GPU is done with it" is the one invariant of this slice whose
+/// violation does not reliably reach the screen, so the rule that discharges
+/// it has to be decidable — and exhaustively testable — without rendering
+/// anything.
+pub const Ring = struct {
+    /// Two is what pipelining needs: the CPU records into one generation while
+    /// the GPU still reads the other. More would only deepen the queue the
+    /// presentation gate already caps.
+    pub const generations: u32 = 2;
+
+    /// Completion value each generation's last submission was bound to. Zero
+    /// means the generation has never been submitted, so nothing is owed.
+    bound: [generations]u64 = @splat(0),
+    cursor: u32 = 0,
+
+    pub fn next(self: Ring) u32 {
+        return (self.cursor + 1) % generations;
+    }
+
+    /// Completion value that must be reached before the next generation may be
+    /// handed out, or null when it owes nothing.
+    pub fn blocking(self: Ring) ?u64 {
+        const value = self.bound[self.next()];
+        return if (value == 0) null else value;
+    }
+
+    pub fn advance(self: *Ring) void {
+        self.cursor = self.next();
+    }
+
+    pub fn bind(self: *Ring, value: u64) void {
+        self.bound[self.cursor] = value;
+    }
+
+    /// Whether handing out the current generation is safe at `completed`.
+    pub fn currentIsSafe(self: Ring, completed: u64) bool {
+        return completed >= self.bound[self.cursor];
+    }
+};
+
+/// Bump allocator over one mapped upload buffer, owned by one generation.
 ///
 /// `reserve` hands back a slice to write into plus the offset to copy from.
-/// It never returns a region the GPU might still be reading: when the buffer
-/// cannot satisfy a request, the caller's `flush` runs first and the GPU is
-/// known idle before the head rewinds.
+/// It never waits: the only point at which staged bytes become overwritable
+/// is `recycle`, which the renderer may call solely once the owning
+/// generation's bound completion value has been reached.
 pub const Arena = struct {
     buffer: ?*win32.ID3D12Resource = null,
     mapped: [*]u8 = undefined,
     capacity: u64 = 0,
     head: u64 = 0,
-    /// While sealed, `reserve` must be satisfiable from space already secured —
-    /// it may not flush or grow.
-    ///
-    /// A flush mid-frame would submit and reset the command list, silently
-    /// discarding the pipeline state, root arguments, descriptor heaps,
-    /// viewport and render target that recorded draws still depend on; a
-    /// growth would release the buffer those draws point into. Both failures
-    /// are invisible at the call site, so the seal turns them into a loud
-    /// error at the moment the assumption breaks.
-    sealed: bool = false,
+    /// Buffers replaced by growth. Recorded copies still name them and a D3D12
+    /// command list does not keep its resources alive, so they outlive the
+    /// growth and are only released when the generation is recycled.
+    retired: std.ArrayListUnmanaged(*win32.ID3D12Resource) = .empty,
 
     pub const initial_capacity: u64 = 4 * 1024 * 1024;
 
     pub fn deinit(self: *Arena) void {
+        self.releaseRetired();
+        self.retired.deinit(std.heap.page_allocator);
         if (self.buffer) |b| {
             b.Unmap(0, null);
             _ = b.IUnknown.Release();
@@ -161,7 +195,22 @@ pub const Arena = struct {
         self.* = .{};
     }
 
-    fn allocate(self: *Arena, device: *win32.ID3D12Device, bytes: u64) Error!void {
+    fn releaseRetired(self: *Arena) void {
+        for (self.retired.items) |r| _ = r.IUnknown.Release();
+        self.retired.clearRetainingCapacity();
+    }
+
+    /// Hand the whole arena back for reuse.
+    ///
+    /// This is the single place the "no CPU overwrite of a region the GPU may
+    /// still read" invariant is discharged, so it is only legal once the
+    /// owning generation's bound completion value has been reached.
+    pub fn recycle(self: *Arena) void {
+        self.releaseRetired();
+        self.head = 0;
+    }
+
+    fn grow(self: *Arena, device: *win32.ID3D12Device, bytes: u64) Error!void {
         var resource: *win32.ID3D12Resource = undefined;
         const props = heapProps(.UPLOAD);
         const desc = bufferDesc(bytes);
@@ -184,7 +233,13 @@ pub const Arena = struct {
             return error.UploadFailed;
         }
 
-        self.deinit();
+        if (self.buffer) |old| {
+            self.retired.append(std.heap.page_allocator, old) catch {
+                resource.Unmap(0, null);
+                _ = resource.IUnknown.Release();
+                return error.UploadFailed;
+            };
+        }
         self.buffer = resource;
         self.mapped = @ptrCast(mapped.?);
         self.capacity = bytes;
@@ -196,58 +251,25 @@ pub const Arena = struct {
         offset: u64,
     };
 
-    /// Reserve `len` bytes aligned to `alignment`. `flush_fn` is invoked with
-    /// `flush_ctx` when the current buffer cannot satisfy the request; it must
-    /// make every previously reserved region safe to overwrite.
+    /// Reserve `len` bytes aligned to `alignment`.
+    ///
+    /// A request the buffer cannot hold is answered by growth, never by a
+    /// wait: a wait here would be a second throttle on the frame path, which
+    /// is exactly the stacked delay this backend has to avoid.
     pub fn reserve(
         self: *Arena,
         device: *win32.ID3D12Device,
         len: u64,
         alignment: u64,
-        flush_ctx: *anyopaque,
-        flush_fn: *const fn (*anyopaque) void,
     ) Error!Reservation {
-        if (self.buffer == null) {
-            if (self.sealed) return error.SealedArenaExhausted;
-            try self.allocate(device, @max(len, initial_capacity));
-        }
-        var start = alignUp(self.head, alignment);
-        if (start + len > self.capacity) {
-            if (self.sealed) return error.SealedArenaExhausted;
-            flush_fn(flush_ctx);
-            self.head = 0;
-            start = 0;
-            if (len > self.capacity) {
-                // Grow past the point where a flush alone would help. The
-                // previous buffer is only released after the flush above, so
-                // nothing in flight still references it.
-                try self.allocate(device, alignUp(len, initial_capacity));
-                start = 0;
-            }
+        const start = alignUp(self.head, alignment);
+        if (self.buffer == null or start + len > self.capacity) {
+            try self.grow(device, @max(@max(len, self.capacity * 2), initial_capacity));
+            self.head = len;
+            return .{ .bytes = self.mapped[0..@intCast(len)], .offset = 0 };
         }
         self.head = start + len;
         return .{ .bytes = self.mapped[@intCast(start)..@intCast(start + len)], .offset = start };
-    }
-
-    /// Make room for `len` bytes without handing any out, so a following
-    /// sealed run of reservations cannot need to flush or grow.
-    pub fn ensureCapacityFor(
-        self: *Arena,
-        device: *win32.ID3D12Device,
-        len: u64,
-        alignment: u64,
-        flush_ctx: *anyopaque,
-        flush_fn: *const fn (*anyopaque) void,
-    ) Error!void {
-        std.debug.assert(!self.sealed);
-        const probe = try self.reserve(device, len, alignment, flush_ctx, flush_fn);
-        // Hand the space straight back: the point was to force any flush or
-        // growth to happen now rather than part-way through a frame.
-        self.head = probe.offset;
-    }
-
-    pub fn rewind(self: *Arena) void {
-        self.head = 0;
     }
 };
 
@@ -262,42 +284,116 @@ test "aligning up never moves an already aligned value" {
     try std.testing.expectEqual(@as(u64, 256), alignUp(255, texture_row_alignment));
 }
 
-test "a sealed arena refuses to flush rather than silently invalidating a frame" {
-    // Sealing exists because a flush or growth part-way through a frame is
-    // invisible where it happens and only surfaces as a wrong picture: the
-    // command list loses the state recorded draws need, or the buffer they
-    // point into is freed. Refusing loudly is the whole point of the flag.
-    const Ctx = struct {
-        fn onFlush(ctx: *anyopaque) void {
-            const flag: *bool = @ptrCast(@alignCast(ctx));
-            flag.* = true;
-        }
-    };
-    var flushed = false;
-    var arena: Arena = .{ .capacity = 0, .head = 0, .sealed = true };
-    try std.testing.expectError(error.SealedArenaExhausted, arena.reserve(
-        @ptrFromInt(0x1000),
-        16,
-        16,
-        &flushed,
-        Ctx.onFlush,
-    ));
-    try std.testing.expect(!flushed);
-
-    // With room already secured the request is served: the seal constrains
-    // growth, not ordinary use.
-    var backing: [64]u8 = undefined;
-    var stocked: Arena = .{
+test "reservations bump within a generation and never overlap" {
+    // Two live reservations sharing bytes is the corruption this whole module
+    // exists to prevent, and it would show up as a wrong glyph rather than as
+    // an error, so pin the non-overlap directly.
+    var backing: [256]u8 = undefined;
+    var arena: Arena = .{
         .buffer = @ptrFromInt(0x1000),
         .mapped = &backing,
         .capacity = backing.len,
         .head = 0,
-        .sealed = true,
     };
-    const res = try stocked.reserve(@ptrFromInt(0x1000), 16, 16, &flushed, Ctx.onFlush);
-    try std.testing.expectEqual(@as(u64, 0), res.offset);
-    try std.testing.expectEqual(@as(usize, 16), res.bytes.len);
-    try std.testing.expect(!flushed);
+    const first = try arena.reserve(@ptrFromInt(0x1000), 16, 16);
+    const second = try arena.reserve(@ptrFromInt(0x1000), 16, 16);
+    try std.testing.expectEqual(@as(u64, 0), first.offset);
+    try std.testing.expect(second.offset >= first.offset + first.bytes.len);
+}
+
+test "recycling a generation is what frees its staged bytes, not reserving" {
+    // `reserve` must never make earlier bytes overwritable — only `recycle`
+    // may, and the renderer is allowed to call it solely after the generation's
+    // completion value has been reached. If reserving rewound on its own, the
+    // GPU could still be reading what the next reservation hands out.
+    var backing: [64]u8 = undefined;
+    var arena: Arena = .{
+        .buffer = @ptrFromInt(0x1000),
+        .mapped = &backing,
+        .capacity = backing.len,
+        .head = 0,
+    };
+    _ = try arena.reserve(@ptrFromInt(0x1000), 32, 16);
+    try std.testing.expectEqual(@as(u64, 32), arena.head);
+    arena.recycle();
+    try std.testing.expectEqual(@as(u64, 0), arena.head);
+}
+
+test "outgrowing a generation replaces its buffer instead of reusing live bytes" {
+    // This is the exhaustion path the test above cannot reach, and it is the
+    // one that matters: rewinding on overflow would hand the next caller bytes
+    // the GPU is still reading, while freeing the outgrown buffer would strand
+    // recorded copies that name it — a D3D12 command list does not keep its
+    // resources alive. Growth must therefore do neither.
+    var skeleton = @import("../d3d12.zig").Skeleton.initWarp() catch |err| switch (err) {
+        // A machine with no WARP adapter cannot judge this, and pretending it
+        // passed would be worse than saying so.
+        error.DeviceUnavailable => return error.SkipZigTest,
+        else => return err,
+    };
+    defer skeleton.deinit();
+
+    var arena: Arena = .{};
+    defer arena.deinit();
+
+    const first = try arena.reserve(skeleton.device, 1024, 256);
+    const original = arena.buffer.?;
+    try std.testing.expectEqual(@as(usize, 0), arena.retired.items.len);
+
+    // Ask for more than the whole arena holds, forcing the growth path.
+    const second = try arena.reserve(skeleton.device, arena.capacity + 1, 256);
+    try std.testing.expect(arena.buffer.? != original);
+    try std.testing.expect(second.bytes.ptr != first.bytes.ptr);
+    // The outgrown buffer is retained, not released, until the generation is
+    // recycled — that is what keeps already-recorded copies valid.
+    try std.testing.expectEqual(@as(usize, 1), arena.retired.items.len);
+    try std.testing.expectEqual(original, arena.retired.items[0]);
+
+    arena.recycle();
+    try std.testing.expectEqual(@as(usize, 0), arena.retired.items.len);
+    try std.testing.expectEqual(@as(u64, 0), arena.head);
+}
+
+test "a generation is only handed out once its bound completion value is reached" {
+    // The reuse rule decided without a GPU in sight. This is the independent
+    // means of confirming the invariant the plan requires: the failure it
+    // guards against is intermittent and often invisible, so "it looked fine"
+    // is not evidence either way.
+    var ring: Ring = .{};
+
+    // Nothing submitted yet: the first two generations owe nothing.
+    try std.testing.expectEqual(@as(?u64, null), ring.blocking());
+    ring.advance();
+    ring.bind(7);
+    try std.testing.expectEqual(@as(?u64, null), ring.blocking());
+    ring.advance();
+    ring.bind(9);
+
+    // Back around to the generation bound to 7: it is owed until 7 completes.
+    try std.testing.expectEqual(@as(?u64, 7), ring.blocking());
+    ring.advance();
+    try std.testing.expect(!ring.currentIsSafe(6));
+    try std.testing.expect(ring.currentIsSafe(7));
+    // A later completion value implies every earlier one, since the signal is
+    // monotonic — reuse must not demand an exact match.
+    try std.testing.expect(ring.currentIsSafe(100));
+
+    // The other generation is still owed at 9 even though 7 has completed.
+    try std.testing.expectEqual(@as(?u64, 9), ring.blocking());
+}
+
+test "every generation is visited before any is reused" {
+    // Reusing a generation while a sibling sits idle would shrink the pipeline
+    // to one and quietly reintroduce a wait per frame.
+    var ring: Ring = .{};
+    var seen: [Ring.generations]bool = @splat(false);
+    var i: u32 = 0;
+    while (i < Ring.generations) : (i += 1) {
+        ring.advance();
+        try std.testing.expect(!seen[ring.cursor]);
+        seen[ring.cursor] = true;
+    }
+    for (seen) |s| try std.testing.expect(s);
 }
 
 test "texture staging is placed on a stricter boundary than its rows" {
