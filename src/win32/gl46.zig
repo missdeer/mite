@@ -1,8 +1,8 @@
-//! OpenGL 4.6 baseline renderer.
+//! OpenGL 4.6 renderer with an optional DirectComposition bridge.
 //!
-//! The backend deliberately stops at the M5a boundary: WGL owns the window
-//! presentation path and the font service hands pixels over through CPU
-//! memory. DirectComposition and D3D/OpenGL interop belong to M5b.
+//! WGL remains the complete baseline and the font service hands pixels over
+//! through CPU memory. WGL_NV_DX_interop2 adds composition presentation when
+//! the current driver can establish the cross-API handoff.
 
 const Gl46Renderer = @This();
 
@@ -26,6 +26,7 @@ const kitty_image_mod = @import("d3d11/kitty_images.zig");
 const tabbar_paint = @import("d3d11/tabbar_paint.zig");
 const shader_assets = @import("shader_assets.zig");
 const gl = @import("gl46/loader.zig");
+const interop = @import("gl46/interop.zig");
 
 const CellXY = gpu.CellXY;
 const shader = gpu.shader;
@@ -135,6 +136,8 @@ hwnd: ?win32.HWND = null,
 dc: ?win32.HDC = null,
 context: ?win32.HGLRC = null,
 procs: gl.ProcTable = undefined,
+interop_state: interop.State = .untried,
+interop_bridge: ?interop.Bridge = null,
 
 grid_program: gl.uint = 0,
 image_program: gl.uint = 0,
@@ -167,7 +170,7 @@ pub fn init(
     configured_gpu: ?[]const u8,
 ) Gl46Renderer {
     if (configured_gpu) |name| std.debug.panic(
-        "renderer = opengl: gpu override '{s}' cannot be honored by the M5a WGL path; " ++
+        "renderer = opengl: gpu override '{s}' cannot be honored by the WGL path; " ++
             "remove gpu or select a D3D backend",
         .{name},
     );
@@ -181,6 +184,7 @@ pub fn deinit(self: *Gl46Renderer) void {
         }
         gl.makeProcTableCurrent(&self.procs);
         gl.Finish();
+        if (self.interop_bridge) |*bridge| bridge.deinit();
         self.kitty_images.deinit(std.heap.page_allocator);
         self.background_image.release();
         self.releaseGlyphState();
@@ -350,7 +354,7 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) void {
     self.context = context;
     self.initialized = true;
     log.info(
-        "OpenGL {d}.{d} baseline active: shared SPIR-V, swap interval 1, {d} completion slots",
+        "OpenGL {d}.{d} baseline active: shared SPIR-V, swap interval 1, {d} completion slots; composition bridge pending",
         .{ major, minor, frame_count },
     );
 }
@@ -474,10 +478,15 @@ fn waitForSlot(self: *Gl46Renderer, slot: usize) void {
     self.fences[slot] = null;
 }
 
-fn finishFrame(self: *Gl46Renderer) void {
+fn finishFrame(self: *Gl46Renderer, path: interop.Path) void {
     self.fences[self.frame_slot] = gl.FenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0) orelse
         fatal("glFenceSync failed");
-    if (win32.SwapBuffers(self.dc.?) == 0) fatal("SwapBuffers failed");
+    switch (path) {
+        .baseline => if (win32.SwapBuffers(self.dc.?) == 0) fatal("SwapBuffers failed"),
+        .direct_composition => self.interop_bridge.?.present() catch |err| {
+            self.failInterop(err);
+        },
+    }
 }
 
 pub fn cellsResize(self: *Gl46Renderer, count: u32) bool {
@@ -650,8 +659,50 @@ pub fn render(
         _ = win32.KillTimer(hwnd, types.TIMER_TEXT_BLINK);
     }
 
+    const presentation = self.beginPresentation(hwnd, prepared.client_w, prepared.client_h);
     self.drawFrame(prepared, tabbar);
-    self.finishFrame();
+    self.finishFrame(presentation);
+}
+
+fn beginPresentation(
+    self: *Gl46Renderer,
+    hwnd: win32.HWND,
+    width: u32,
+    height: u32,
+) interop.Path {
+    if (self.interop_state == .untried) {
+        self.interop_bridge = interop.Bridge.init(hwnd, width, height) catch |err| {
+            self.interop_state = .unavailable;
+            log.warn(
+                "DirectComposition bridge unavailable ({s}); using baseline WGL presentation",
+                .{@errorName(err)},
+            );
+            gl.BindFramebuffer(gl.FRAMEBUFFER, 0);
+            return .baseline;
+        };
+        self.interop_state = .active;
+        log.info("WGL_NV_DX_interop2 DirectComposition bridge active", .{});
+    }
+
+    if (self.interop_state.path() == .direct_composition) {
+        self.interop_bridge.?.begin(width, height) catch |err| {
+            self.failInterop(err);
+            return .baseline;
+        };
+    } else {
+        gl.BindFramebuffer(gl.FRAMEBUFFER, 0);
+    }
+    return self.interop_state.path();
+}
+
+fn failInterop(self: *Gl46Renderer, err: anyerror) void {
+    if (self.interop_bridge) |*bridge| bridge.disable();
+    self.interop_state = .failed;
+    gl.BindFramebuffer(gl.FRAMEBUFFER, 0);
+    log.warn(
+        "DirectComposition bridge failed ({s}); reverted to baseline WGL presentation",
+        .{@errorName(err)},
+    );
 }
 
 const PreparedFrame = struct {

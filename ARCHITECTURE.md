@@ -55,7 +55,8 @@ src/
     FontService.zig       process-lifetime DirectWrite/D2D + font D3D11 owner
     d3d11.zig              top-level renderer struct; init / render / resize / deinit
     d3d12/renderer.zig     selectable D3D12 research renderer
-    gl46.zig               selectable OpenGL 4.6 baseline renderer
+    gl46.zig               selectable OpenGL 4.6 renderer + WGL fallback
+    gl46/interop.zig       optional WGL/D3D11 DirectComposition bridge
     gl46/loader.zig        checked-in zigglgen OpenGL 4.6 core bindings
     render.zig             renderWindow orchestration (state → renderer.render)
     GlyphIndexCache.zig    circular-LRU mapping (codepoint,half,style) → atlas slot
@@ -538,13 +539,21 @@ D3D11 consumes DXBC, D3D12 consumes signed DXIL, and OpenGL 4.6 specializes the
 SPIR-V assets directly. Explicit bindings keep constant buffers, structured
 cells, textures, and the sampler in one collision-free cross-backend contract.
 
-The OpenGL M5a backend creates a WGL 4.6 core context on the window's stable
-class-owned DC, uses checked-in zigglgen bindings, and presents through the
-ordinary WGL double-buffered path. It reuses the shared cell/glyph/image
-builders and the font service's CPU-pixel handoff. Persistent mapped frame data
-is split across three completion-fenced slots; missing 4.6/SPIR-V, RDP, and a
-configured `gpu` override fail explicitly. DirectComposition and D3D/OpenGL
-interop remain the separate M5b boundary.
+The OpenGL backend creates a WGL 4.6 core context on the window's stable
+class-owned DC and uses checked-in zigglgen bindings. It reuses the shared
+cell/glyph/image builders and the font service's CPU-pixel handoff. Persistent
+mapped frame data is split across three completion-fenced slots; missing
+4.6/SPIR-V, RDP, and a configured `gpu` override fail explicitly.
+
+Presentation first attempts an optional `WGL_NV_DX_interop2` bridge. The bridge
+owns a multithread-capable D3D11 device, registers its render target with GL,
+copies completed frames into a flip-model composition swap chain, and binds
+that chain to the window's DirectComposition tree. Missing procedures, setup
+failure, or runtime handoff failure detaches the tree and permanently selects
+the ordinary WGL double-buffered path for that process. Terminal and font
+ownership never move into the bridge; glyph and tab-bar pixels retain the M5a
+CPU handoff. Observed vendor results live in
+`rad-notes/opengl-interop-matrix.md`.
 
 ### 6.2 Per-frame orchestration
 

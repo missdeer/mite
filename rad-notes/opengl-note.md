@@ -106,6 +106,9 @@ bitmap 移交方案：
   拿 CPU bitmap → `glTextureSubImage2D` 上传到 GL atlas"。慢但无兼容
   依赖。研究报告里三家驱动的 fallback 触发率是有效数据。
 
+实际测试结果记录在 `opengl-interop-matrix.md`；未取得对应硬件的厂商必须标记
+为 not tested，不能用扩展声明或其他 GPU 型号代替实测。
+
 ### 8. DirectComposition 桥接
 
 GL 无法直接喂 IDCompositionVisual，桥接路径：

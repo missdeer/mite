@@ -33,8 +33,8 @@ pub const RendererBackend = union(enum) {
     /// request for comparison work, never the default, and not to be
     /// described as fully capable until sustained-load behaviour is settled.
     d3d12: d3d12.Renderer,
-    /// M5a research path: complete baseline rendering through WGL and shared
-    /// SPIR-V, without the M5b DirectComposition interoperability bridge.
+    /// OpenGL research path: complete baseline rendering through WGL and
+    /// shared SPIR-V, with optional DirectComposition interoperability.
     opengl: gl46,
 };
 

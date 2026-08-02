@@ -437,10 +437,12 @@ renderer = d3d11
 - `d3d12` is the explicit Direct3D 12 research backend.
 - `opengl` is the explicit OpenGL 4.6 / shared-SPIR-V research backend.
 
-The OpenGL M5a baseline requires a local OpenGL 4.6 driver and does not
-support RDP, `gpu` adapter overrides, or the DirectComposition bridge. Missing
-capabilities fail startup explicitly rather than falling back to D3D11, so
-research observations cannot be attributed to the wrong backend.
+The OpenGL backend requires a local OpenGL 4.6 driver and does not support RDP
+or `gpu` adapter overrides. It automatically attempts the optional
+`WGL_NV_DX_interop2` DirectComposition bridge and retains ordinary WGL
+presentation when that bridge is unavailable or fails. Missing baseline
+OpenGL capabilities still fail startup explicitly rather than falling back to
+D3D11, so research observations cannot be attributed to the wrong backend.
 
 **Hot-reload:** no; changing the renderer requires restarting Mostty.
 
