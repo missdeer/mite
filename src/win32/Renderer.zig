@@ -6,6 +6,7 @@ const win32 = @import("win32").everything;
 
 const Config = @import("../Config.zig");
 const d3d11 = @import("d3d11.zig");
+const gl46 = @import("gl46.zig");
 const FontService = @import("FontService.zig");
 const types = @import("types.zig");
 
@@ -32,6 +33,9 @@ pub const RendererBackend = union(enum) {
     /// request for comparison work, never the default, and not to be
     /// described as fully capable until sustained-load behaviour is settled.
     d3d12: d3d12.Renderer,
+    /// M5a research path: complete baseline rendering through WGL and shared
+    /// SPIR-V, without the M5b DirectComposition interoperability bridge.
+    opengl: gl46,
 };
 
 common: RendererCommon,
@@ -64,6 +68,9 @@ pub fn init(
         .d3d11 => .{ .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu) },
         .d3d12 => .{
             .d3d12 = d3d12.Renderer.init(&self.common, &self.font_service, configured_gpu),
+        },
+        .opengl => .{
+            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu),
         },
     };
 }
@@ -196,12 +203,13 @@ test "d3d11 stays the default so an untouched install is unaffected" {
     );
 }
 
-test "both backends consume one rasterizer, differing only in handoff form" {
+test "all backends consume one rasterizer, differing only in handoff form" {
     // Text coverage compositing is judged against d3d11, and that comparison
     // only means anything while both backends render from the same glyph
     // source. Differing handoff form is expected; a second rasterizer is not.
     try std.testing.expectEqual(shared.GlyphHandoff.shared_surface, d3d11.glyph_handoff);
     try std.testing.expectEqual(shared.GlyphHandoff.cpu_pixels, d3d12.Renderer.glyph_handoff);
+    try std.testing.expectEqual(shared.GlyphHandoff.cpu_pixels, gl46.glyph_handoff);
     inline for (@typeInfo(RendererBackend).@"union".fields) |field| {
         // Neither backend may own font machinery; it belongs to the service.
         inline for (.{ "dwrite_factory", "d2d_factory", "text_formats" }) |owned_by_service| {

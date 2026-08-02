@@ -78,6 +78,7 @@ pub const BackgroundImagePosition = enum {
 pub const RendererBackend = enum {
     d3d11,
     d3d12,
+    opengl,
 };
 
 // Scaling mode for `background-image-fit`. Mirrors Ghostty's values.
@@ -263,10 +264,9 @@ render_interval_remote_ms: u32 = 50,
 // hardware-adapter selection; the renderer consumes this at process startup.
 gpu: ?[]const u8 = null,
 // Which renderer backend to build at startup. D3D11 is the default and the
-// only fully-validated path; D3D12 is a research option that is verified
-// only for static and low-frequency correctness (MOSTTY-25) and must be
-// asked for explicitly. An unrecognized value keeps the default rather than
-// failing, matching how every other enum key here degrades.
+// only fully-validated path; D3D12 and OpenGL are research options and must
+// be asked for explicitly. An unrecognized value keeps the default rather
+// than failing, matching how every other enum key here degrades.
 renderer: RendererBackend = .d3d11,
 
 arena: ?std.heap.ArenaAllocator = null,
@@ -507,7 +507,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
             gpu = if (value.len == 0) null else a.dupe(u8, value) catch oom();
         } else if (std.mem.eql(u8, key, "renderer")) {
             renderer = std.meta.stringToEnum(RendererBackend, value) orelse {
-                std.log.warn("config: {s}:{}: invalid renderer '{s}' (expect d3d11 or d3d12)", .{ source_name, line_no, value });
+                std.log.warn("config: {s}:{}: invalid renderer '{s}' (expect d3d11, d3d12, or opengl)", .{ source_name, line_no, value });
                 continue;
             };
         } else if (std.mem.eql(u8, key, "background-opacity")) {
@@ -1523,16 +1523,25 @@ test "renderer defaults to d3d11 so an untouched config keeps the validated path
     try std.testing.expectEqual(RendererBackend.d3d11, cfg.renderer);
 }
 
-test "selecting d3d12 requires spelling it out" {
-    // D3D12 is verified only for static and low-frequency correctness, so it
-    // must never be reachable by accident — neither by a typo nor by a value
-    // that merely resembles it.
-    {
-        var cfg = parse(std.testing.allocator, "renderer = d3d12\n", "test");
+test "research renderers require exact explicit names" {
+    // Research backends must never be reachable by accident, neither by a
+    // typo nor by a value that merely resembles one.
+    inline for (.{ RendererBackend.d3d12, RendererBackend.opengl }) |backend| {
+        var buf: [32]u8 = undefined;
+        const source = std.fmt.bufPrint(&buf, "renderer = {s}\n", .{@tagName(backend)}) catch unreachable;
+        var cfg = parse(std.testing.allocator, source, "test");
         defer cfg.deinit();
-        try std.testing.expectEqual(RendererBackend.d3d12, cfg.renderer);
+        try std.testing.expectEqual(backend, cfg.renderer);
     }
-    for ([_][]const u8{ "renderer = D3D12\n", "renderer = dx12\n", "renderer = d3d12x\n", "renderer =\n" }) |src| {
+    for ([_][]const u8{
+        "renderer = D3D12\n",
+        "renderer = dx12\n",
+        "renderer = d3d12x\n",
+        "renderer = OpenGL\n",
+        "renderer = gl46\n",
+        "renderer = openglx\n",
+        "renderer =\n",
+    }) |src| {
         var cfg = parse(std.testing.allocator, src, "test");
         defer cfg.deinit();
         try std.testing.expectEqual(RendererBackend.d3d11, cfg.renderer);

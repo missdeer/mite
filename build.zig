@@ -49,6 +49,8 @@ pub fn build(b: *std.Build) void {
         .win32_manifest = b.path("src/win32/mostty.manifest"),
     });
     addImports(b, exe.root_module, vt, z2d, shader_assets);
+    exe.root_module.linkSystemLibrary("opengl32", .{});
+    exe.root_module.linkSystemLibrary("gdi32", .{});
     addShaderValidationDependencies(&exe.step, shader_assets);
 
     exe.addWin32ResourceFile(.{
@@ -82,6 +84,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addImports(b, tests.root_module, vt, z2d, shader_assets);
+    tests.root_module.linkSystemLibrary("opengl32", .{});
+    tests.root_module.linkSystemLibrary("gdi32", .{});
     addShaderValidationDependencies(&tests.step, shader_assets);
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
@@ -143,12 +147,33 @@ fn buildShaders(b: *std.Build) ShaderAssets {
         .search_suffix = "Bin/dxc.exe",
         .install_hint = "install the LunarG Vulkan SDK or pass -Ddxc-path=<path>",
     });
-    const dxc_dir = std.fs.path.dirname(dxc) orelse ".";
-    const spirv_validator = requireTool(
-        b,
-        b.pathJoin(&.{ dxc_dir, "spirv-val.exe" }),
-        "use a LunarG Vulkan SDK DXC installation that includes spirv-val.exe",
-    );
+    const spirv_cross = findSdkTool(b, .{
+        .option_name = "spirv-cross-path",
+        .option_description = "Path to spirv-cross.exe used to normalize DXC output for OpenGL",
+        .env_name = "VULKAN_SDK",
+        .env_suffix = "Bin/spirv-cross.exe",
+        .search_root = "C:/VulkanSDK",
+        .search_suffix = "Bin/spirv-cross.exe",
+        .install_hint = "install the LunarG Vulkan SDK or pass -Dspirv-cross-path=<path>",
+    });
+    const glslang_validator = findSdkTool(b, .{
+        .option_name = "glslang-validator-path",
+        .option_description = "Path to glslangValidator.exe used to emit OpenGL SPIR-V",
+        .env_name = "VULKAN_SDK",
+        .env_suffix = "Bin/glslangValidator.exe",
+        .search_root = "C:/VulkanSDK",
+        .search_suffix = "Bin/glslangValidator.exe",
+        .install_hint = "install the LunarG Vulkan SDK or pass -Dglslang-validator-path=<path>",
+    });
+    const spirv_validator = findSdkTool(b, .{
+        .option_name = "spirv-val-path",
+        .option_description = "Path to spirv-val.exe used to validate Vulkan and OpenGL shader assets",
+        .env_name = "VULKAN_SDK",
+        .env_suffix = "Bin/spirv-val.exe",
+        .search_root = "C:/VulkanSDK",
+        .search_suffix = "Bin/spirv-val.exe",
+        .install_hint = "install the LunarG Vulkan SDK or pass -Dspirv-val-path=<path>",
+    });
     // DXIL needs a *different* DXC than SPIR-V: signing requires dxil.dll next
     // to the compiler, which the Vulkan SDK distribution omits. D3D12 rejects
     // unsigned DXIL outside developer mode, so `sibling` makes signing capability
@@ -170,13 +195,15 @@ fn buildShaders(b: *std.Build) ShaderAssets {
         .fxc = fxc,
         .dxc = dxc,
         .dxil_dxc = dxil_dxc,
+        .spirv_cross = spirv_cross,
+        .glslang_validator = glslang_validator,
         .spirv_validator = spirv_validator,
     };
 
     return .{
-        .vertex = compileShaderTargets(b, tools, source, "VertexMain", "vs_5_0", "vs_6_0", "terminal_vertex"),
-        .pixel = compileShaderTargets(b, tools, source, "PixelMain", "ps_5_0", "ps_6_0", "terminal_pixel"),
-        .image_pixel = compileShaderTargets(b, tools, source, "ImagePixelMain", "ps_5_0", "ps_6_0", "terminal_image_pixel"),
+        .vertex = compileShaderTargets(b, tools, source, "VertexMain", "vs_5_0", "vs_6_0", "vert", "terminal_vertex"),
+        .pixel = compileShaderTargets(b, tools, source, "PixelMain", "ps_5_0", "ps_6_0", "frag", "terminal_pixel"),
+        .image_pixel = compileShaderTargets(b, tools, source, "ImagePixelMain", "ps_5_0", "ps_6_0", "frag", "terminal_image_pixel"),
     };
 }
 
@@ -184,6 +211,8 @@ const ShaderTools = struct {
     fxc: []const u8,
     dxc: []const u8,
     dxil_dxc: []const u8,
+    spirv_cross: []const u8,
+    glslang_validator: []const u8,
     spirv_validator: []const u8,
 };
 
@@ -194,6 +223,7 @@ fn compileShaderTargets(
     entry: []const u8,
     dxbc_profile: []const u8,
     sm6_profile: []const u8,
+    glsl_stage: []const u8,
     basename: []const u8,
 ) ShaderTargets {
     const dxbc_command = b.addSystemCommand(&.{ tools.fxc, "/nologo", "/E", entry, "/T", dxbc_profile, "/Fo" });
@@ -207,7 +237,7 @@ fn compileShaderTargets(
     const spirv_command = b.addSystemCommand(&.{
         tools.dxc,
         "-spirv",
-        "-fspv-target-env=vulkan1.1",
+        "-fspv-target-env=vulkan1.0",
         "-DSPIRV=1",
         "-E",
         entry,
@@ -215,13 +245,43 @@ fn compileShaderTargets(
         sm6_profile,
         "-Fo",
     });
-    const spirv = spirv_command.addOutputFileArg(b.fmt("{s}.spv", .{basename}));
+    const spirv_raw = spirv_command.addOutputFileArg(b.fmt("{s}.raw.spv", .{basename}));
     spirv_command.addFileArg(source);
 
-    const validation_command = b.addSystemCommand(&.{ tools.spirv_validator, "--target-env", "vulkan1.1" });
-    validation_command.addFileArg(spirv);
+    const vulkan_validation_command = b.addSystemCommand(&.{ tools.spirv_validator, "--target-env", "vulkan1.0" });
+    vulkan_validation_command.addFileArg(spirv_raw);
 
-    return .{ .dxbc = dxbc, .dxil = dxil, .spirv = spirv, .validation = &validation_command.step };
+    const cross_command = b.addSystemCommand(&.{
+        tools.spirv_cross,
+        "--version",
+        "460",
+        "--combined-samplers-inherit-bindings",
+        "--output",
+    });
+    const glsl = cross_command.addOutputFileArg(b.fmt("{s}.glsl", .{basename}));
+    cross_command.addFileArg(spirv_raw);
+
+    const glslang_command = b.addSystemCommand(&.{
+        tools.glslang_validator,
+        "-G",
+        "--target-env",
+        "opengl",
+        "-S",
+        glsl_stage,
+        "--source-entrypoint",
+        "main",
+        "-e",
+        entry,
+        "-o",
+    });
+    const spirv = glslang_command.addOutputFileArg(b.fmt("{s}.spv", .{basename}));
+    glslang_command.addFileArg(glsl);
+
+    const opengl_validation_command = b.addSystemCommand(&.{ tools.spirv_validator, "--target-env", "opengl4.5" });
+    opengl_validation_command.addFileArg(spirv);
+    opengl_validation_command.step.dependOn(&vulkan_validation_command.step);
+
+    return .{ .dxbc = dxbc, .dxil = dxil, .spirv = spirv, .validation = &opengl_validation_command.step };
 }
 
 fn addShaderValidationDependencies(step: *std.Build.Step, assets: ShaderAssets) void {

@@ -48,6 +48,19 @@ fn containerHasPart(container: []const u8, fourcc: *const [4]u8) bool {
     return false;
 }
 
+fn spirvContainsOpcode(spirv: []const u8, opcode: u16) bool {
+    if (spirv.len < 20 or spirv.len % 4 != 0) return false;
+    var offset: usize = 20;
+    while (offset < spirv.len) {
+        const instruction = std.mem.readInt(u32, spirv[offset..][0..4], .little);
+        const word_count = instruction >> 16;
+        if (word_count == 0 or offset + word_count * 4 > spirv.len) return false;
+        if (@as(u16, @truncate(instruction)) == opcode) return true;
+        offset += word_count * 4;
+    }
+    return false;
+}
+
 test "every runtime shader entry has valid DirectX and SPIR-V assets" {
     inline for (.{ vertex, pixel, image_pixel }) |targets| {
         try std.testing.expect(targets.dxbc.len > 4);
@@ -56,6 +69,16 @@ test "every runtime shader entry has valid DirectX and SPIR-V assets" {
         try std.testing.expectEqualStrings("DXBC", targets.dxil[0..4]);
         try std.testing.expect(targets.spirv.len > 4);
         try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x02, 0x23, 0x07 }, targets.spirv[0..4]);
+        try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x01, 0x00 }, targets.spirv[4..8]);
+    }
+}
+
+test "OpenGL SPIR-V uses combined sampled images" {
+    // GL_ARB_gl_spirv rejects OpTypeSampler and shader-side image/sampler
+    // pairing. The build must combine each sampled texture before embedding it.
+    inline for (.{ pixel.spirv, image_pixel.spirv }) |spirv| {
+        try std.testing.expect(!spirvContainsOpcode(spirv, 26)); // OpTypeSampler
+        try std.testing.expect(spirvContainsOpcode(spirv, 27)); // OpTypeSampledImage
     }
 }
 

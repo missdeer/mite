@@ -143,7 +143,9 @@ pub fn main() !void {
             // CS_DBLCLKS: required for WM_LBUTTONDBLCLK to be delivered;
             // without it the second click of a double-click arrives as a
             // plain WM_LBUTTONDOWN and word-selection can't be distinguished.
-            .style = .{ .DBLCLKS = 1 },
+            // CS_OWNDC gives the optional WGL backend one stable device
+            // context for the window's lifetime. The D3D paths are unchanged.
+            .style = .{ .DBLCLKS = 1, .OWNDC = 1 },
             .lpfnWndProc = WndProc,
             .cbClsExtra = 0,
             .cbWndExtra = 0,

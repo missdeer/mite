@@ -425,6 +425,25 @@ restarting Mostty because all rendering resources belong to the startup
 device. With `MOSTTY_DIAG` enabled, the diagnostic log records whether the
 selection was automatic or explicit and the final adapter name.
 
+### `renderer`
+
+Selects the startup rendering backend:
+
+```
+renderer = d3d11
+```
+
+- `d3d11` is the default validated backend.
+- `d3d12` is the explicit Direct3D 12 research backend.
+- `opengl` is the explicit OpenGL 4.6 / shared-SPIR-V research backend.
+
+The OpenGL M5a baseline requires a local OpenGL 4.6 driver and does not
+support RDP, `gpu` adapter overrides, or the DirectComposition bridge. Missing
+capabilities fail startup explicitly rather than falling back to D3D11, so
+research observations cannot be attributed to the wrong backend.
+
+**Hot-reload:** no; changing the renderer requires restarting Mostty.
+
 ### `render-interval-local-ms` / `render-interval-remote-ms`
 
 Minimum interval (in milliseconds) between rendered frames. Mostty coalesces

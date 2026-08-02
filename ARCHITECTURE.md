@@ -5,7 +5,7 @@ of every key path. Mostty is a Windows-only terminal emulator that pairs Ghostty
 VT state machine (`libghostty-vt`) with a hand-rolled Win32 / D3D11 /
 DirectWrite shell.
 
-Pinned versions: Zig `0.15.2`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI only. The build also requires Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-val.exe`. Build with
+Pinned versions: Zig `0.15.2`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI only. The build also requires Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-cross.exe` / `glslangValidator.exe` / `spirv-val.exe`. Build with
 `cmd.exe /c "D:\zig-x86_64-windows-0.15.2\zig.exe build --global-cache-dir D:\zig-cache"`.
 
 ---
@@ -54,6 +54,9 @@ src/
     RendererCommon.zig    backend-independent metrics/adapter state
     FontService.zig       process-lifetime DirectWrite/D2D + font D3D11 owner
     d3d11.zig              top-level renderer struct; init / render / resize / deinit
+    d3d12/renderer.zig     selectable D3D12 research renderer
+    gl46.zig               selectable OpenGL 4.6 baseline renderer
+    gl46/loader.zig        checked-in zigglgen OpenGL 4.6 core bindings
     render.zig             renderWindow orchestration (state → renderer.render)
     GlyphIndexCache.zig    circular-LRU mapping (codepoint,half,style) → atlas slot
     sprite.zig             ghostty-sprite dispatcher + z2d canvas
@@ -137,10 +140,10 @@ Entry sequence in `mosttywindows.zig`:
    4. Converts the font family/codepoint-map strings to sentinel-terminated
       UTF-16 (allocations leaked into the process arena — they live for the
       whole renderer lifetime).
-   5. The process-global `Renderer` is initialized in place with its D3D11
-      backend. Its common state owns the cell metrics used by the rest of the
-      application; actual swap-chain creation is deferred to the first
-      `render`.
+   5. The process-global `Renderer` is initialized in place with the selected
+      backend (D3D11 by default). Its common state owns the cell metrics used
+      by the rest of the application; window-bound presentation resources are
+      deferred until the HWND exists.
    6. `window_geom.calcWindowPlacement` snaps a default 70%×80% rect to whole
       cells.
    7. Registers `MosttyWindow` class with `CS_DBLCLKS` (required for
@@ -471,15 +474,16 @@ Kitty graphics support is wired through `vt_stream.zig` and
 
 ## 6. Rendering Pipeline
 
-### 6.1 Renderer facade and D3D11 backend
+### 6.1 Renderer facade and backends
 
 The process-global `Renderer` (`Renderer.zig`) is the only boundary used by
 window, input, layout, and render orchestration code. It owns a process-lifetime
 `FontService`, a backend-independent `RendererCommon` (cell size, tab-bar
 height, ligature setting, and adapter classification), plus a tagged backend
-union. D3D11 is the only available variant today; unimplemented backends are
-not selectable. The font service publishes font/DPI metrics into the common
-state, while D3D11 borrows both and keeps no authoritative font state.
+union. D3D11 remains the default validated variant; D3D12 and OpenGL 4.6 are
+explicit research variants that still satisfy the whole facade contract. The
+font service publishes font/DPI metrics into the common state, while each
+backend borrows both and keeps no authoritative font state.
 
 `FontService` owns DirectWrite formats/fallbacks, its D2D factory, the glyph
 worker, and a dedicated D3D11 device/context used for D2D-compatible font
@@ -520,23 +524,27 @@ backend.
 The shader build graph treats `terminal.hlsl` as the single source of truth.
 For each runtime entry point it produces three assets: an SM5/DXBC asset with
 the Windows SDK `fxc` for D3D11, a signed SM6/DXIL asset with the Windows SDK
-`dxc` for D3D12, and a Vulkan 1.1 SPIR-V asset with the Vulkan SDK `dxc`. The
+`dxc` for D3D12, and a SPIR-V 1.0 asset with a SPIR-V-enabled `dxc`. DXC output
+is normalized through SPIRV-Cross and glslang into OpenGL's combined
+sampled-image form. The
 two DirectX targets are not interchangeable — D3D11 rejects SM6 and D3D12
 rejects SM5 — and they share a container format, so `shader_assets.zig` checks
 each container's parts rather than its magic. DXIL must be signed: D3D12 refuses
 unsigned bytecode outside developer mode, so the build requires `dxil.dll`
 beside the DXIL compiler and a test asserts the container digest is non-zero.
-Every SPIR-V output passes `spirv-val`; any target failing stops the build.
-D3D11 embeds and loads only the DXBC side at startup. Explicit Vulkan bindings
-keep constant buffers, structured cells, textures, and the sampler in one
-collision-free descriptor contract. SPIR-V runtime/visual equivalence is
-intentionally deferred until a backend consumes those assets.
+DXC output passes Vulkan 1.0 validation before normalization; each final asset
+passes OpenGL 4.5 validation. Any failed stage stops the build.
+D3D11 consumes DXBC, D3D12 consumes signed DXIL, and OpenGL 4.6 specializes the
+SPIR-V assets directly. Explicit bindings keep constant buffers, structured
+cells, textures, and the sampler in one collision-free cross-backend contract.
 
-`d3d12.zig` holds a device/queue/fence skeleton that proves D3D12 accepts the
-DXIL assets and completes a record→submit→signal→wait cycle. It is deliberately
-**not** a `RendererBackend` variant: the facade contract is all-or-nothing, so a
-backend that cannot draw must not be selectable. It is reachable only as
-`Renderer.d3d12`, which keeps it compiled and tested without exposing it.
+The OpenGL M5a backend creates a WGL 4.6 core context on the window's stable
+class-owned DC, uses checked-in zigglgen bindings, and presents through the
+ordinary WGL double-buffered path. It reuses the shared cell/glyph/image
+builders and the font service's CPU-pixel handoff. Persistent mapped frame data
+is split across three completion-fenced slots; missing 4.6/SPIR-V, RDP, and a
+configured `gpu` override fail explicitly. DirectComposition and D3D/OpenGL
+interop remain the separate M5b boundary.
 
 ### 6.2 Per-frame orchestration
 
