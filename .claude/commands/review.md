@@ -55,7 +55,7 @@ Each reviewer gets the same body, prefixed with its own first line:
 - **If `mcp__ccgo__ask_agents` is in your available-tools list** → single call with both(codex/agy) requests in one `requests` array (this is what the parallel-capable wrapper is for).
 - **Else (MCP not installed)** → fall back to raw CLI per `.claude/rules/{codex,antigravity}-usage.md`. Write the two messages to `./tmp/review-{codex,agy}-prompt-$(date +%s).txt`, then launch two Bash calls **in parallel** (single message, two `Bash` tool calls with `run_in_background: true`, `timeout: 1800000`):
   - Codex: `codex exec -s read-only --skip-git-repo-check "$(bat ./tmp/review-codex-prompt-<ts>.txt)"`
-  - Antigravity: `agy-wrapper --dangerously-skip-permissions --timeout 30m -p "$(bat ./tmp/review-agy-prompt-<ts>.txt)"`
+  - Antigravity: `agy-wrapper --dangerously-skip-permissions --timeout 30m  --print-timeout 30m -p "$(bat ./tmp/review-agy-prompt-<ts>.txt)"`
   - Poll all with `TaskOutput`. Wait for all to complete before step 4. Delete temp files after.
 - **Never silently skip** a reviewer just because its transport is missing — if one CLI (e.g. `agy-wrapper`) is not on PATH, report this to the user and continue with the remaining one; do not pretend the other reviewer agreed.
 

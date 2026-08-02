@@ -20,7 +20,7 @@ Antigravity took over the role formerly assigned to Gemini in this repo. See `.c
    **Transport — launch wrapper directly:**
    - Write the message to `./tmp/agy-prompt-$(date +%s).txt`, then run via Bash in background:
      ```bash
-     agy-wrapper --dangerously-skip-permissions --timeout 30m -p "$(bat ./tmp/agy-prompt-<ts>.txt)"
+     agy-wrapper --dangerously-skip-permissions --timeout 30m --print-timeout 30m -p "$(bat ./tmp/agy-prompt-<ts>.txt)"
      ```
      with `run_in_background: true` and `timeout: 1800000` (30 min). Poll with `TaskOutput`. After the run completes, delete the temp prompt file.
 
