@@ -109,6 +109,7 @@ fn addImports(
     mod.addAnonymousImport("terminal_image_pixel.dxbc", .{ .root_source_file = shader_assets.image_pixel.dxbc });
     mod.addAnonymousImport("terminal_image_pixel.dxil", .{ .root_source_file = shader_assets.image_pixel.dxil });
     mod.addAnonymousImport("terminal_image_pixel.spv", .{ .root_source_file = shader_assets.image_pixel.spirv });
+    mod.addAnonymousImport("terminal_present_pixel.dxbc", .{ .root_source_file = shader_assets.present_pixel });
     if (b.lazyDependency("win32", .{})) |win32_dep| {
         mod.addImport("win32", win32_dep.module("win32"));
         mod.addIncludePath(b.path("src/win32"));
@@ -126,6 +127,7 @@ const ShaderAssets = struct {
     vertex: ShaderTargets,
     pixel: ShaderTargets,
     image_pixel: ShaderTargets,
+    present_pixel: std.Build.LazyPath,
 };
 
 fn buildShaders(b: *std.Build) ShaderAssets {
@@ -200,10 +202,15 @@ fn buildShaders(b: *std.Build) ShaderAssets {
         .spirv_validator = spirv_validator,
     };
 
+    const present_pixel_command = b.addSystemCommand(&.{ fxc, "/nologo", "/E", "PresentPixelMain", "/T", "ps_5_0", "/Fo" });
+    const present_pixel = present_pixel_command.addOutputFileArg("terminal_present_pixel.dxbc");
+    present_pixel_command.addFileArg(source);
+
     return .{
         .vertex = compileShaderTargets(b, tools, source, "VertexMain", "vs_5_0", "vs_6_0", "vert", "terminal_vertex"),
         .pixel = compileShaderTargets(b, tools, source, "PixelMain", "ps_5_0", "ps_6_0", "frag", "terminal_pixel"),
         .image_pixel = compileShaderTargets(b, tools, source, "ImagePixelMain", "ps_5_0", "ps_6_0", "frag", "terminal_image_pixel"),
+        .present_pixel = present_pixel,
     };
 }
 

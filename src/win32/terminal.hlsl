@@ -41,6 +41,7 @@ VK_BINDING(2) Texture2D<float4> glyph_texture : register(t1);
 VK_BINDING(3) Texture2D<float4> bg_image : register(t2);
 VK_BINDING(5) Texture2D<float4> inline_image : register(t3);
 VK_BINDING(4) SamplerState bg_sampler : register(s0);
+Texture2D<float4> presentation_texture : register(t4);
 
 VK_BINDING(0) cbuffer ImageConfig : register(b0)
 {
@@ -251,4 +252,8 @@ float4 ImagePixelMain(float4 sv_pos : SV_POSITION) : SV_TARGET {
     float4 img = inline_image.SampleLevel(bg_sampler, uv, 0);
     float alpha = saturate(img.a);
     return float4(to_linear(img.rgb) * alpha, alpha);
+}
+
+float4 PresentPixelMain(float4 sv_pos : SV_POSITION) : SV_TARGET {
+    return presentation_texture.Load(int3(uint2(sv_pos.xy), 0));
 }

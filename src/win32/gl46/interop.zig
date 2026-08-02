@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const win32 = @import("win32").everything;
+const shader_assets = @import("../shader_assets.zig");
 
 const gl = @import("loader.zig");
 
@@ -14,6 +15,8 @@ const log = std.log.scoped(.gl46_interop);
 
 const WGL_ACCESS_WRITE_DISCARD_NV: gl.@"enum" = 0x0002;
 const DXGI_STATUS_OCCLUDED: i32 = 0x087A0001;
+const interop_texture_format: win32.DXGI_FORMAT = .B8G8R8A8_UNORM;
+const presentation_view_format: win32.DXGI_FORMAT = .B8G8R8A8_UNORM_SRGB;
 
 fn interopDeviceFlags() win32.D3D11_CREATE_DEVICE_FLAG {
     // Omitting SINGLETHREADED is required by the D3D11 interop contract.
@@ -39,6 +42,7 @@ pub const State = enum {
 const Error = error{
     ProceduresUnavailable,
     DeviceUnavailable,
+    ShaderUnavailable,
     InteropDeviceUnavailable,
     FactoryUnavailable,
     SwapChainUnavailable,
@@ -46,6 +50,7 @@ const Error = error{
     SurfaceUnavailable,
     RegistrationUnavailable,
     FramebufferIncomplete,
+    SurfaceViewUnavailable,
     LockFailed,
     UnlockFailed,
     PresentFailed,
@@ -94,6 +99,8 @@ pub const Bridge = struct {
     procs: Procs,
     device: *win32.ID3D11Device,
     context: *win32.ID3D11DeviceContext,
+    vertex_shader: *win32.ID3D11VertexShader,
+    present_pixel_shader: *win32.ID3D11PixelShader,
     interop_device: win32.HANDLE,
     swap_chain: *win32.IDXGISwapChain2,
     frame_latency_waitable: win32.HANDLE,
@@ -104,6 +111,7 @@ pub const Bridge = struct {
     framebuffer: gl.uint,
     renderbuffer: gl.uint = 0,
     texture: ?*win32.ID3D11Texture2D = null,
+    texture_view: ?*win32.ID3D11ShaderResourceView = null,
     interop_object: ?win32.HANDLE = null,
     width: u32 = 0,
     height: u32 = 0,
@@ -134,6 +142,24 @@ pub const Bridge = struct {
             _ = context.IUnknown.Release();
             _ = device.IUnknown.Release();
         }
+
+        var vertex_shader: *win32.ID3D11VertexShader = undefined;
+        if (device.CreateVertexShader(
+            shader_assets.vertex.dxbc.ptr,
+            shader_assets.vertex.dxbc.len,
+            null,
+            &vertex_shader,
+        ) < 0) return error.ShaderUnavailable;
+        errdefer _ = vertex_shader.IUnknown.Release();
+
+        var present_pixel_shader: *win32.ID3D11PixelShader = undefined;
+        if (device.CreatePixelShader(
+            shader_assets.present_pixel.ptr,
+            shader_assets.present_pixel.len,
+            null,
+            &present_pixel_shader,
+        ) < 0) return error.ShaderUnavailable;
+        errdefer _ = present_pixel_shader.IUnknown.Release();
 
         const interop_device = procs.open_device(@ptrCast(device)) orelse
             return error.InteropDeviceUnavailable;
@@ -225,6 +251,8 @@ pub const Bridge = struct {
             .procs = procs,
             .device = device,
             .context = context,
+            .vertex_shader = vertex_shader,
+            .present_pixel_shader = present_pixel_shader,
             .interop_device = interop_device,
             .swap_chain = swap_chain,
             .frame_latency_waitable = waitable,
@@ -254,6 +282,8 @@ pub const Bridge = struct {
         _ = self.dcomp_target.IUnknown.Release();
         _ = self.dcomp_device.IUnknown.Release();
         _ = self.swap_chain.IUnknown.Release();
+        _ = self.present_pixel_shader.IUnknown.Release();
+        _ = self.vertex_shader.IUnknown.Release();
         self.context.ClearState();
         self.context.Flush();
         _ = self.context.IUnknown.Release();
@@ -290,10 +320,41 @@ pub const Bridge = struct {
             @ptrCast(&back_buffer),
         ) < 0) return error.PresentFailed;
         defer _ = back_buffer.IUnknown.Release();
-        self.context.CopyResource(
+
+        const rtv_desc: win32.D3D11_RENDER_TARGET_VIEW_DESC = .{
+            .Format = presentation_view_format,
+            .ViewDimension = .TEXTURE2D,
+            .Anonymous = .{ .Texture2D = .{ .MipSlice = 0 } },
+        };
+        var render_target: *win32.ID3D11RenderTargetView = undefined;
+        if (self.device.CreateRenderTargetView(
             &back_buffer.ID3D11Resource,
-            &self.texture.?.ID3D11Resource,
-        );
+            &rtv_desc,
+            &render_target,
+        ) < 0) return error.PresentFailed;
+        defer _ = render_target.IUnknown.Release();
+
+        var targets = [_]?*win32.ID3D11RenderTargetView{render_target};
+        self.context.OMSetRenderTargets(targets.len, &targets, null);
+        var viewport: win32.D3D11_VIEWPORT = .{
+            .TopLeftX = 0,
+            .TopLeftY = 0,
+            .Width = @floatFromInt(self.width),
+            .Height = @floatFromInt(self.height),
+            .MinDepth = 0,
+            .MaxDepth = 0,
+        };
+        self.context.RSSetViewports(1, @ptrCast(&viewport));
+        self.context.IASetPrimitiveTopology(._PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        self.context.VSSetShader(self.vertex_shader, null, 0);
+        self.context.PSSetShader(self.present_pixel_shader, null, 0);
+        var resources = [_]?*win32.ID3D11ShaderResourceView{self.texture_view.?};
+        self.context.PSSetShaderResources(4, resources.len, &resources);
+        self.context.Draw(4, 0);
+        var no_resources = [_]?*win32.ID3D11ShaderResourceView{null};
+        self.context.PSSetShaderResources(4, no_resources.len, &no_resources);
+        self.context.OMSetRenderTargets(0, null, null);
+
         const hr = self.swap_chain.IDXGISwapChain.Present(0, 0);
         if (hr < 0 and hr != DXGI_STATUS_OCCLUDED) return error.PresentFailed;
     }
@@ -333,10 +394,10 @@ pub const Bridge = struct {
             .Height = height,
             .MipLevels = 1,
             .ArraySize = 1,
-            .Format = .B8G8R8A8_UNORM,
+            .Format = interop_texture_format,
             .SampleDesc = .{ .Count = 1, .Quality = 0 },
             .Usage = .DEFAULT,
-            .BindFlags = .{ .RENDER_TARGET = 1 },
+            .BindFlags = .{ .SHADER_RESOURCE = 1, .RENDER_TARGET = 1 },
             .CPUAccessFlags = .{},
             .MiscFlags = .{},
         };
@@ -345,6 +406,14 @@ pub const Bridge = struct {
             return error.SurfaceUnavailable;
         }
         errdefer _ = texture.IUnknown.Release();
+
+        var texture_view: *win32.ID3D11ShaderResourceView = undefined;
+        if (self.device.CreateShaderResourceView(
+            &texture.ID3D11Resource,
+            null,
+            &texture_view,
+        ) < 0) return error.SurfaceViewUnavailable;
+        errdefer _ = texture_view.IUnknown.Release();
 
         var renderbuffer: gl.uint = 0;
         gl.GenRenderbuffers(1, @ptrCast(&renderbuffer));
@@ -377,6 +446,7 @@ pub const Bridge = struct {
         gl.NamedFramebufferDrawBuffer(self.framebuffer, gl.COLOR_ATTACHMENT0);
 
         self.texture = texture;
+        self.texture_view = texture_view;
         self.renderbuffer = renderbuffer;
         self.interop_object = object;
         self.width = width;
@@ -401,6 +471,10 @@ pub const Bridge = struct {
         if (self.renderbuffer != 0) {
             gl.DeleteRenderbuffers(1, @ptrCast(&self.renderbuffer));
             self.renderbuffer = 0;
+        }
+        if (self.texture_view) |texture_view| {
+            _ = texture_view.IUnknown.Release();
+            self.texture_view = null;
         }
         if (self.texture) |texture| {
             _ = texture.IUnknown.Release();
@@ -446,4 +520,15 @@ test "interop device creation remains multithread capable" {
     const flags = interopDeviceFlags();
     try std.testing.expectEqual(@as(u1, 0), flags.SINGLETHREADED);
     try std.testing.expectEqual(@as(u1, 1), flags.BGRA_SUPPORT);
+}
+
+test "interop presentation encodes linear shader output as sRGB" {
+    try std.testing.expectEqual(
+        win32.DXGI_FORMAT.B8G8R8A8_UNORM,
+        interop_texture_format,
+    );
+    try std.testing.expectEqual(
+        win32.DXGI_FORMAT.B8G8R8A8_UNORM_SRGB,
+        presentation_view_format,
+    );
 }

@@ -15,6 +15,7 @@ pub const image_pixel = ShaderTargets{
     .dxil = @embedFile("terminal_image_pixel.dxil"),
     .spirv = @embedFile("terminal_image_pixel.spv"),
 };
+pub const present_pixel = @embedFile("terminal_present_pixel.dxbc");
 
 pub const ShaderTargets = struct {
     /// Shader Model 5 bytecode consumed by D3D11, which rejects Shader Model 6.
@@ -71,6 +72,11 @@ test "every runtime shader entry has valid DirectX and SPIR-V assets" {
         try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x02, 0x23, 0x07 }, targets.spirv[0..4]);
         try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x01, 0x00 }, targets.spirv[4..8]);
     }
+}
+
+test "D3D11 presentation shader has valid bytecode" {
+    try std.testing.expect(present_pixel.len > 4);
+    try std.testing.expectEqualStrings("DXBC", present_pixel[0..4]);
 }
 
 test "OpenGL SPIR-V uses combined sampled images" {
