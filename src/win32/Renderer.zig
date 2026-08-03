@@ -41,11 +41,6 @@ pub const RendererBackend = union(enum) {
 pub const StartupFallback = struct {
     configured: Config.RendererBackend,
     replacement: Config.RendererBackend = .d3d11,
-    reason: Reason,
-
-    pub const Reason = enum {
-        remote_session,
-    };
 
     pub fn selectedBackend(self: StartupFallback, accepted: bool) ?Config.RendererBackend {
         return if (accepted) self.replacement else null;
@@ -54,17 +49,35 @@ pub const StartupFallback = struct {
 
 pub fn recommendStartupFallback(
     backend: Config.RendererBackend,
-    remote_session: bool,
+    startup_failed: bool,
 ) ?StartupFallback {
-    if (backend == .opengl and remote_session) {
-        return .{ .configured = backend, .reason = .remote_session };
-    }
-    return null;
+    if (!startup_failed or backend == .d3d11) return null;
+    return .{ .configured = backend };
 }
+
+pub const StartupFailure = union(enum) {
+    d3d12: d3d12.Renderer.StartupError,
+    opengl: gl46.StartupError,
+
+    pub fn description(self: StartupFailure) []const u8 {
+        return switch (self) {
+            .d3d12 => |err| d3d12.Renderer.startupErrorDescription(err),
+            .opengl => |err| gl46.startupErrorDescription(err),
+        };
+    }
+
+    pub fn codeName(self: StartupFailure) []const u8 {
+        return switch (self) {
+            .d3d12 => |err| @errorName(err),
+            .opengl => |err| @errorName(err),
+        };
+    }
+};
 
 common: RendererCommon,
 font_service: FontService,
-backend: RendererBackend,
+configured_backend: Config.RendererBackend,
+backend: ?RendererBackend,
 
 // Initialize in place: the backend borrows `common`, and the async glyph
 // worker later borrows backend state. The process-global renderer provides
@@ -88,32 +101,92 @@ pub fn init(
         font_ligatures,
         configured_gpu,
     );
+    self.configured_backend = backend;
     self.backend = switch (backend) {
         .d3d11 => .{ .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu) },
-        .d3d12 => .{
-            .d3d12 = d3d12.Renderer.init(&self.common, &self.font_service, configured_gpu),
-        },
+        .d3d12 => null,
         .opengl => .{
             .opengl = gl46.init(&self.common, &self.font_service, configured_gpu),
         },
     };
 }
 
-test "OpenGL startup in RDP offers an explicit D3D11 fallback" {
+test "research backend startup failure offers an explicit D3D11 fallback" {
     const fallback = recommendStartupFallback(.opengl, true).?;
     try std.testing.expectEqual(Config.RendererBackend.opengl, fallback.configured);
-    try std.testing.expectEqual(StartupFallback.Reason.remote_session, fallback.reason);
     try std.testing.expectEqual(
         Config.RendererBackend.d3d11,
         fallback.selectedBackend(true).?,
     );
     try std.testing.expectEqual(@as(?Config.RendererBackend, null), fallback.selectedBackend(false));
+    try std.testing.expectEqual(Config.RendererBackend.d3d11, recommendStartupFallback(.d3d12, true).?.replacement);
 }
 
-test "compatible renderer environments do not offer a fallback" {
+test "successful startup and D3D11 failure do not offer a fallback" {
     try std.testing.expectEqual(@as(?StartupFallback, null), recommendStartupFallback(.opengl, false));
     try std.testing.expectEqual(@as(?StartupFallback, null), recommendStartupFallback(.d3d11, true));
-    try std.testing.expectEqual(@as(?StartupFallback, null), recommendStartupFallback(.d3d12, true));
+}
+
+test "startup failure retains its backend-specific reason" {
+    const failure: StartupFailure = .{ .opengl = error.VersionTooOld };
+    try std.testing.expectEqualStrings("VersionTooOld", failure.codeName());
+    try std.testing.expectEqualStrings(
+        "the driver exposed an OpenGL version older than 4.6",
+        failure.description(),
+    );
+    const d3d12_failure: StartupFailure = .{ .d3d12 = error.DeviceUnavailable };
+    try std.testing.expectEqualStrings("DeviceUnavailable", d3d12_failure.codeName());
+    try std.testing.expectEqualStrings(
+        "no D3D12 device supports feature level 11_0",
+        d3d12_failure.description(),
+    );
+}
+
+pub fn initializeWindow(
+    self: *Renderer,
+    hwnd: win32.HWND,
+    configured_gpu: ?[]const u8,
+) ?StartupFailure {
+    if (self.backend == null) {
+        std.debug.assert(self.configured_backend == .d3d12);
+        var backend = d3d12.Renderer.init(
+            &self.common,
+            &self.font_service,
+            configured_gpu,
+        ) catch |err| return .{ .d3d12 = err };
+        backend.initializeWindow(hwnd) catch |err| {
+            backend.deinit();
+            return .{ .d3d12 = err };
+        };
+        self.backend = .{ .d3d12 = backend };
+        return null;
+    }
+    return switch (self.backend.?) {
+        .opengl => |*backend| blk: {
+            backend.initializeWindow(hwnd) catch |err| break :blk .{ .opengl = err };
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+pub fn fallbackToD3d11(self: *Renderer, configured_gpu: ?[]const u8) void {
+    if (self.backend) |*active| switch (active.*) {
+        .d3d11 => return,
+        inline else => |*backend| backend.deinit(),
+    };
+    self.configured_backend = .d3d11;
+    self.backend = .{ .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu) };
+}
+
+fn activeBackend(self: *Renderer) *RendererBackend {
+    return if (self.backend) |*backend| backend else @panic("renderer backend used before its startup capability gate");
+}
+
+fn deinitBackend(self: *Renderer) void {
+    if (self.backend) |*active| switch (active.*) {
+        inline else => |*backend| backend.deinit(),
+    };
 }
 
 pub fn cellSizeForDpi(self: *Renderer, dpi: u32) win32.SIZE {
@@ -126,7 +199,7 @@ pub fn tabBarHeightForDpi(self: *Renderer, dpi: u32) i32 {
 
 pub fn updateDpi(self: *Renderer, dpi: u32) void {
     if (self.font_service.updateDpi(dpi)) {
-        switch (self.backend) {
+        switch (self.activeBackend().*) {
             inline else => |*backend| backend.onFontStateChanged(),
         }
     }
@@ -134,15 +207,13 @@ pub fn updateDpi(self: *Renderer, dpi: u32) void {
 
 pub fn updateFont(self: *Renderer, font_config: FontConfig) void {
     self.font_service.updateFont(font_config);
-    switch (self.backend) {
+    switch (self.activeBackend().*) {
         inline else => |*backend| backend.onFontStateChanged(),
     }
 }
 
 pub fn deinit(self: *Renderer) void {
-    switch (self.backend) {
-        inline else => |*backend| backend.deinit(),
-    }
+    self.deinitBackend();
     self.font_service.deinit();
     self.* = undefined;
 }
@@ -163,7 +234,7 @@ pub fn render(
     remote_session: bool,
     url_highlight: ?types.UrlHighlight,
 ) void {
-    switch (self.backend) {
+    switch (self.activeBackend().*) {
         inline else => |*backend| backend.render(
             hwnd,
             tab_id,
@@ -187,7 +258,7 @@ pub fn setWorkerHwnd(self: *Renderer, gpa: std.mem.Allocator, hwnd: win32.HWND) 
 }
 
 pub fn applyGlyphResult(self: *Renderer, result: *RasterResult) bool {
-    return switch (self.backend) {
+    return switch (self.activeBackend().*) {
         inline else => |*backend| backend.applyGlyphResult(result),
     };
 }
@@ -198,19 +269,20 @@ pub fn reloadBackgroundImage(
     cfg: *const Config,
     hwnd: win32.HWND,
 ) void {
-    switch (self.backend) {
+    switch (self.activeBackend().*) {
         inline else => |*backend| backend.reloadBackgroundImage(gpa, cfg, hwnd),
     }
 }
 
 pub fn applyDecodedBackgroundImage(self: *Renderer, result: *const BgImageDecoded) void {
-    switch (self.backend) {
+    switch (self.activeBackend().*) {
         inline else => |*backend| backend.applyDecodedBackgroundImage(result),
     }
 }
 
 pub fn releaseKittyImagesForTab(self: *Renderer, tab_id: types.TabId) void {
-    switch (self.backend) {
+    if (self.backend == null) return;
+    switch (self.activeBackend().*) {
         inline else => |*backend| backend.releaseKittyImagesForTab(tab_id),
     }
 }

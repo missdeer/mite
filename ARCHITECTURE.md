@@ -543,12 +543,14 @@ The OpenGL backend creates a WGL 4.6 core context on the window's stable
 class-owned DC and uses checked-in zigglgen bindings. It reuses the shared
 cell/glyph/image builders and the font service's CPU-pixel handoff. Persistent
 mapped frame data is split across three completion-fenced slots; missing
-4.6/SPIR-V and a configured `gpu` override fail explicitly. An RDP session
-selected at startup is detected before renderer resources are created and
-offers a user-confirmed D3D11 fallback for that process; declining exits
-without changing the configured backend. The preflight recommendation is
-backend-independent so future compatibility gates use the same explicit
-fallback policy rather than silently changing renderers.
+4.6/SPIR-V and a configured `gpu` override are reported by the real-window
+startup capability gate. RDP is not rejected preemptively: a session whose
+hardware policy exposes the required OpenGL capabilities continues on OpenGL.
+If the actual gate fails, startup offers a user-confirmed D3D11 fallback for
+that process; declining exits without changing the configured backend. D3D12
+uses the same real-window gate for device, pipeline, descriptor, and
+DirectComposition-surface creation failures, so every non-D3D11 backend has
+the same explicit policy rather than silently changing renderers.
 
 Presentation first attempts an optional `WGL_NV_DX_interop2` bridge. The bridge
 owns a multithread-capable D3D11 device, registers its render target with GL,

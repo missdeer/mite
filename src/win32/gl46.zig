@@ -40,6 +40,50 @@ pub const glyph_handoff: shared.GlyphHandoff = .cpu_pixels;
 const frame_count = 3;
 const map_flags = gl.MAP_WRITE_BIT | gl.MAP_PERSISTENT_BIT | gl.MAP_COHERENT_BIT;
 
+pub const StartupError = error{
+    GpuOverrideUnsupported,
+    GetDcFailed,
+    PixelFormatUnavailable,
+    SetPixelFormatFailed,
+    BootstrapContextFailed,
+    BootstrapMakeCurrentFailed,
+    CreateContextUnavailable,
+    SwapControlUnavailable,
+    CoreContextRejected,
+    CoreMakeCurrentFailed,
+    OpenGlModuleUnavailable,
+    ProcedureTableIncomplete,
+    VersionTooOld,
+    SwapIntervalFailed,
+    ShaderObjectFailed,
+    SpirvSpecializationFailed,
+    ProgramObjectFailed,
+    ProgramLinkFailed,
+};
+
+pub fn startupErrorDescription(err: StartupError) []const u8 {
+    return switch (err) {
+        error.GpuOverrideUnsupported => "WGL cannot honor the configured GPU override",
+        error.GetDcFailed => "the window device context is unavailable",
+        error.PixelFormatUnavailable => "no composited RGBA pixel format is available",
+        error.SetPixelFormatFailed => "the OpenGL pixel format was rejected",
+        error.BootstrapContextFailed => "the legacy WGL bootstrap context could not be created",
+        error.BootstrapMakeCurrentFailed => "the legacy WGL bootstrap context could not be activated",
+        error.CreateContextUnavailable => "WGL_ARB_create_context is unavailable",
+        error.SwapControlUnavailable => "WGL_EXT_swap_control is unavailable",
+        error.CoreContextRejected => "the driver rejected an OpenGL 4.6 core context",
+        error.CoreMakeCurrentFailed => "the OpenGL 4.6 core context could not be activated",
+        error.OpenGlModuleUnavailable => "opengl32.dll is not loaded",
+        error.ProcedureTableIncomplete => "the OpenGL 4.6 procedure table is incomplete",
+        error.VersionTooOld => "the driver exposed an OpenGL version older than 4.6",
+        error.SwapIntervalFailed => "the driver rejected swap interval 1",
+        error.ShaderObjectFailed => "the driver could not create a shader object",
+        error.SpirvSpecializationFailed => "the driver could not specialize the shared SPIR-V shader",
+        error.ProgramObjectFailed => "the driver could not create a shader program",
+        error.ProgramLinkFailed => "the driver could not link the shared SPIR-V program",
+    };
+}
+
 const WglCreateContextAttribs = *const fn (
     win32.HDC,
     ?win32.HGLRC,
@@ -138,6 +182,7 @@ context: ?win32.HGLRC = null,
 procs: gl.ProcTable = undefined,
 interop_state: interop.State = .untried,
 interop_bridge: ?interop.Bridge = null,
+gpu_override_configured: bool = false,
 
 grid_program: gl.uint = 0,
 image_program: gl.uint = 0,
@@ -169,12 +214,11 @@ pub fn init(
     font_service: *FontService,
     configured_gpu: ?[]const u8,
 ) Gl46Renderer {
-    if (configured_gpu) |name| std.debug.panic(
-        "renderer = opengl: gpu override '{s}' cannot be honored by the WGL path; " ++
-            "remove gpu or select a D3D backend",
-        .{name},
-    );
-    return .{ .common = common, .font_service = font_service };
+    return .{
+        .common = common,
+        .font_service = font_service,
+        .gpu_override_configured = configured_gpu != null,
+    };
 }
 
 pub fn deinit(self: *Gl46Renderer) void {
@@ -237,19 +281,19 @@ pub fn onFontStateChanged(self: *Gl46Renderer) void {
     self.grid_force_full = true;
 }
 
-fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) void {
+pub fn initializeWindow(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
+    return self.ensureInitialized(hwnd);
+}
+
+fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
     if (self.initialized) {
         if (self.hwnd != hwnd) fatal("the WGL context was asked to move to another window");
         gl.makeProcTableCurrent(&self.procs);
         return;
     }
-    if (win32.GetSystemMetrics(win32.SM_REMOTESESSION) != 0) std.debug.panic(
-        "renderer = opengl: RDP is outside the OpenGL 4.6 baseline because Windows " ++
-            "normally exposes only the GDI Generic 1.1 implementation",
-        .{},
-    );
+    if (self.gpu_override_configured) return error.GpuOverrideUnsupported;
 
-    const dc = win32.GetDC(hwnd) orelse fatal("GetDC failed");
+    const dc = win32.GetDC(hwnd) orelse return error.GetDcFailed;
     errdefer _ = win32.ReleaseDC(hwnd, dc);
 
     var pfd = std.mem.zeroes(win32.PIXELFORMATDESCRIPTOR);
@@ -266,21 +310,26 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) void {
     pfd.cAlphaBits = 8;
     pfd.iLayerType = .MAIN_PLANE;
     const pixel_format = win32.ChoosePixelFormat(dc, &pfd);
-    if (pixel_format == 0) fatal("ChoosePixelFormat found no composited RGBA format");
-    if (win32.SetPixelFormat(dc, pixel_format, &pfd) == 0) fatal("SetPixelFormat failed");
+    if (pixel_format == 0) return error.PixelFormatUnavailable;
+    if (win32.SetPixelFormat(dc, pixel_format, &pfd) == 0) return error.SetPixelFormatFailed;
 
-    const bootstrap = win32.wglCreateContext(dc) orelse fatal("legacy WGL bootstrap context creation failed");
-    defer _ = win32.wglDeleteContext(bootstrap);
-    if (win32.wglMakeCurrent(dc, bootstrap) == 0) fatal("legacy WGL bootstrap context could not be made current");
-
-    const create_context: WglCreateContextAttribs = procAddress(
-        WglCreateContextAttribs,
-        "wglCreateContextAttribsARB",
-    ) orelse fatal("WGL_ARB_create_context is unavailable");
-    const swap_interval: WglSwapInterval = procAddress(
-        WglSwapInterval,
-        "wglSwapIntervalEXT",
-    ) orelse fatal("WGL_EXT_swap_control is unavailable");
+    const context_procs = blk: {
+        const bootstrap = win32.wglCreateContext(dc) orelse return error.BootstrapContextFailed;
+        defer {
+            _ = win32.wglMakeCurrent(null, null);
+            _ = win32.wglDeleteContext(bootstrap);
+        }
+        if (win32.wglMakeCurrent(dc, bootstrap) == 0) return error.BootstrapMakeCurrentFailed;
+        const create_context: WglCreateContextAttribs = procAddress(
+            WglCreateContextAttribs,
+            "wglCreateContextAttribsARB",
+        ) orelse return error.CreateContextUnavailable;
+        const swap_interval: WglSwapInterval = procAddress(
+            WglSwapInterval,
+            "wglSwapIntervalEXT",
+        ) orelse return error.SwapControlUnavailable;
+        break :blk .{ create_context, swap_interval };
+    };
 
     const context_flags: i32 = if (@import("builtin").mode == .Debug)
         WGL_CONTEXT_DEBUG_BIT_ARB
@@ -297,35 +346,43 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) void {
         WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
         0,
     };
-    const context = create_context(dc, null, &attribs) orelse
-        fatal("the driver rejected an OpenGL 4.6 core context");
-    if (win32.wglMakeCurrent(dc, context) == 0) fatal("OpenGL 4.6 context could not be made current");
+    const context = context_procs[0](dc, null, &attribs) orelse return error.CoreContextRejected;
+    errdefer _ = win32.wglDeleteContext(context);
+    if (win32.wglMakeCurrent(dc, context) == 0) return error.CoreMakeCurrentFailed;
+    errdefer {
+        gl.makeProcTableCurrent(null);
+        _ = win32.wglMakeCurrent(null, null);
+    }
 
     const opengl_module = win32.GetModuleHandleW(win32.L("opengl32.dll")) orelse
-        fatal("opengl32.dll is not loaded");
+        return error.OpenGlModuleUnavailable;
     if (!self.procs.init(ProcLoader{ .module = opengl_module }))
-        fatal("the OpenGL 4.6 core procedure table is incomplete");
+        return error.ProcedureTableIncomplete;
     gl.makeProcTableCurrent(&self.procs);
 
     var major: gl.int = 0;
     var minor: gl.int = 0;
     gl.GetIntegerv(gl.MAJOR_VERSION, @ptrCast(&major));
     gl.GetIntegerv(gl.MINOR_VERSION, @ptrCast(&minor));
-    if (major < 4 or (major == 4 and minor < 6)) std.debug.panic(
-        "renderer = opengl: driver exposed OpenGL {d}.{d}, but 4.6 is required for " ++
-            "core SPIR-V ingestion",
-        .{ major, minor },
-    );
+    if (major < 4 or (major == 4 and minor < 6)) {
+        log.warn("driver exposed OpenGL {d}.{d}, but 4.6 is required", .{ major, minor });
+        return error.VersionTooOld;
+    }
 
     gl.Enable(gl.DEBUG_OUTPUT);
     gl.Enable(gl.DEBUG_OUTPUT_SYNCHRONOUS);
     gl.DebugMessageCallback(debugMessage, null);
-    if (swap_interval(1) == 0) fatal("wglSwapIntervalEXT(1) failed");
+    if (context_procs[1](1) == 0) return error.SwapIntervalFailed;
     gl.ClipControl(gl.UPPER_LEFT, gl.ZERO_TO_ONE);
     gl.Enable(gl.FRAMEBUFFER_SRGB);
     gl.Enable(gl.BLEND);
     gl.BlendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.PixelStorei(gl.UNPACK_ALIGNMENT, 1);
+
+    const grid_program = try createProgram(shader_assets.vertex.spirv, "VertexMain", shader_assets.pixel.spirv, "PixelMain");
+    errdefer gl.DeleteProgram(grid_program);
+    const image_program = try createProgram(shader_assets.vertex.spirv, "VertexMain", shader_assets.image_pixel.spirv, "ImagePixelMain");
+    errdefer gl.DeleteProgram(image_program);
 
     var storage_alignment: gl.int = 1;
     var uniform_alignment: gl.int = 1;
@@ -337,8 +394,8 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) void {
     self.grid_ubo = MappedBuffer.create(self.grid_ubo_stride * frame_count);
     self.ensureImageUboCapacity(1);
 
-    self.grid_program = createProgram(shader_assets.vertex.spirv, "VertexMain", shader_assets.pixel.spirv, "PixelMain");
-    self.image_program = createProgram(shader_assets.vertex.spirv, "VertexMain", shader_assets.image_pixel.spirv, "ImagePixelMain");
+    self.grid_program = grid_program;
+    self.image_program = image_program;
 
     gl.CreateVertexArrays(1, @ptrCast(&self.vao));
     gl.BindVertexArray(self.vao);
@@ -402,14 +459,15 @@ fn createProgram(
     vertex_entry: [*:0]const u8,
     pixel_spirv: []const u8,
     pixel_entry: [*:0]const u8,
-) gl.uint {
-    const vertex = createShader(gl.VERTEX_SHADER, vertex_spirv, vertex_entry);
+) StartupError!gl.uint {
+    const vertex = try createShader(gl.VERTEX_SHADER, vertex_spirv, vertex_entry);
     defer gl.DeleteShader(vertex);
-    const pixel = createShader(gl.FRAGMENT_SHADER, pixel_spirv, pixel_entry);
+    const pixel = try createShader(gl.FRAGMENT_SHADER, pixel_spirv, pixel_entry);
     defer gl.DeleteShader(pixel);
 
     const program = gl.CreateProgram();
-    if (program == 0) fatal("glCreateProgram returned zero");
+    if (program == 0) return error.ProgramObjectFailed;
+    errdefer gl.DeleteProgram(program);
     gl.AttachShader(program, vertex);
     gl.AttachShader(program, pixel);
     gl.LinkProgram(program);
@@ -419,14 +477,16 @@ fn createProgram(
         var log_buf: [2048]u8 = undefined;
         var len: gl.sizei = 0;
         gl.GetProgramInfoLog(program, @intCast(log_buf.len), @ptrCast(&len), @ptrCast(&log_buf));
-        std.debug.panic("renderer = opengl: SPIR-V program link failed: {s}", .{log_buf[0..@intCast(@max(0, len))]});
+        log.err("SPIR-V program link failed: {s}", .{log_buf[0..@intCast(@max(0, len))]});
+        return error.ProgramLinkFailed;
     }
     return program;
 }
 
-fn createShader(kind: gl.@"enum", spirv: []const u8, entry: [*:0]const u8) gl.uint {
+fn createShader(kind: gl.@"enum", spirv: []const u8, entry: [*:0]const u8) StartupError!gl.uint {
     const object = gl.CreateShader(kind);
-    if (object == 0) fatal("glCreateShader returned zero");
+    if (object == 0) return error.ShaderObjectFailed;
+    errdefer gl.DeleteShader(object);
     var shader_name = object;
     gl.ShaderBinary(1, @ptrCast(&shader_name), gl.SHADER_BINARY_FORMAT_SPIR_V, spirv.ptr, @intCast(spirv.len));
     var unused = [_]gl.uint{0};
@@ -437,7 +497,8 @@ fn createShader(kind: gl.@"enum", spirv: []const u8, entry: [*:0]const u8) gl.ui
         var log_buf: [2048]u8 = undefined;
         var len: gl.sizei = 0;
         gl.GetShaderInfoLog(object, @intCast(log_buf.len), @ptrCast(&len), @ptrCast(&log_buf));
-        std.debug.panic("renderer = opengl: SPIR-V specialization failed: {s}", .{log_buf[0..@intCast(@max(0, len))]});
+        log.err("SPIR-V specialization failed: {s}", .{log_buf[0..@intCast(@max(0, len))]});
+        return error.SpirvSpecializationFailed;
     }
     return object;
 }
@@ -631,8 +692,11 @@ pub fn render(
     remote_session: bool,
     url_highlight: ?types.UrlHighlight,
 ) void {
-    if (remote_session) fatal("an RDP session entered while the OpenGL backend was active");
-    self.ensureInitialized(hwnd);
+    _ = remote_session;
+    self.ensureInitialized(hwnd) catch |err| std.debug.panic(
+        "renderer = opengl: initialization failed after the startup capability gate ({s})",
+        .{@errorName(err)},
+    );
     const prepared = self.prepareFrame(hwnd, term, mouse_in_scrollbar) orelse return;
 
     if (self.kitty_images.sync(std.heap.page_allocator, self, tab_id, term)) {
@@ -969,7 +1033,10 @@ pub fn reloadBackgroundImage(
     cfg: *const Config,
     hwnd: win32.HWND,
 ) void {
-    self.ensureInitialized(hwnd);
+    self.ensureInitialized(hwnd) catch |err| std.debug.panic(
+        "renderer = opengl: initialization failed after the startup capability gate ({s})",
+        .{@errorName(err)},
+    );
     bg_image.reload(self, gpa, cfg, hwnd);
 }
 

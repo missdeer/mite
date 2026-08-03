@@ -94,36 +94,6 @@ pub fn main() !void {
     // strings. The UTF-16 storage is leaked: it lives for the lifetime of the
     // global renderer (i.e. the whole process).
     global.config = Config.loadDefault(global.gpa.allocator());
-    if (Renderer.recommendStartupFallback(
-        global.config.renderer,
-        win32.GetSystemMetrics(win32.SM_REMOTESESSION) != 0,
-    )) |fallback| {
-        var message_buf: [512]u8 = undefined;
-        const reason: []const u8 = switch (fallback.reason) {
-            .remote_session => "OpenGL 4.6 is unavailable in a Remote Desktop session because Windows " ++
-                "normally exposes only GDI Generic OpenGL 1.1.",
-        };
-        const message = std.fmt.bufPrintZ(
-            &message_buf,
-            "The configured renderer ({s}) cannot be used in this environment.\n\n" ++
-                "{s}\n\nUse D3D11 for this session instead?\n\n" ++
-                "Choose Yes to continue with D3D11, or No to exit Mostty.",
-            .{ @tagName(fallback.configured), reason },
-        ) catch unreachable;
-        const accepted = win32.MessageBoxA(
-            null,
-            message,
-            "Mostty Renderer Fallback",
-            // zigwin32 represents MB_ICONWARNING as these two aliasing bits.
-            .{ .YESNO = 1, .ICONHAND = 1, .ICONQUESTION = 1, .DEFBUTTON2 = 1 },
-        ) == win32.IDYES;
-        global.config.renderer = fallback.selectedBackend(accepted) orelse
-            return error.RendererFallbackDeclined;
-        std.log.warn(
-            "renderer: user accepted startup fallback from {s} to {s}",
-            .{ @tagName(fallback.configured), @tagName(global.config.renderer) },
-        );
-    }
     const gpa_alloc = global.gpa.allocator();
     const font_families_u16 = util.utf16FontFamilies(gpa_alloc, global.config.font_families);
     const emoji_families_u16 = util.utf16FontFamilies(gpa_alloc, global.config.emoji_font_families);
@@ -207,6 +177,26 @@ pub fn main() !void {
         win32.GetModuleHandleW(null),
         null,
     ) orelse win32.panicWin32("CreateWindow", win32.GetLastError());
+
+    if (global.renderer.initializeWindow(hwnd, global.config.gpu)) |failure| {
+        const fallback = Renderer.recommendStartupFallback(global.config.renderer, true) orelse
+            return error.RendererStartupFailed;
+        if (!confirmRendererFallback(hwnd, fallback, failure)) {
+            _ = win32.DestroyWindow(hwnd);
+            return error.RendererFallbackDeclined;
+        }
+        global.renderer.fallbackToD3d11(global.config.gpu);
+        global.config.renderer = fallback.replacement;
+        std.log.warn(
+            "renderer: user accepted startup fallback from {s} to {s} after {s}",
+            .{ @tagName(fallback.configured), @tagName(fallback.replacement), failure.codeName() },
+        );
+    }
+    if (global.window) |*window| window.applyRenderInterval(
+        global.config.render_interval_local_ms,
+        global.config.render_interval_remote_ms,
+        global.renderer.common.remote_or_software_adapter,
+    );
 
     // Start the glyph raster worker now that the renderer sits at its final
     // address and we have an HWND to PostMessage results back to. Submit
@@ -324,6 +314,33 @@ pub fn main() !void {
         std.debug.assert(wait_result == n_tabs);
         global_mod.flushMessages();
     }
+}
+
+fn confirmRendererFallback(
+    hwnd: win32.HWND,
+    fallback: Renderer.StartupFallback,
+    failure: Renderer.StartupFailure,
+) bool {
+    var message_buf: [768]u8 = undefined;
+    const remote_note: []const u8 = if (win32.GetSystemMetrics(win32.SM_REMOTESESSION) != 0)
+        "The capability check failed in a Remote Desktop session. RDP hardware " ++
+            "acceleration may expose OpenGL 4.6, but this session did not satisfy the requirement.\n\n"
+    else
+        "";
+    const message = std.fmt.bufPrintZ(
+        &message_buf,
+        "The configured renderer ({s}) failed its startup capability check.\n\n" ++
+            "{s}.\n\n{s}Use D3D11 for this session instead?\n\n" ++
+            "Choose Yes to continue with D3D11, or No to exit Mostty.",
+        .{ @tagName(fallback.configured), failure.description(), remote_note },
+    ) catch unreachable;
+    return win32.MessageBoxA(
+        hwnd,
+        message,
+        "Mostty Renderer Fallback",
+        // zigwin32 represents MB_ICONWARNING as these two aliasing bits.
+        .{ .YESNO = 1, .ICONHAND = 1, .ICONQUESTION = 1, .DEFBUTTON2 = 1 },
+    ) == win32.IDYES;
 }
 
 const Config = @import("Config.zig");

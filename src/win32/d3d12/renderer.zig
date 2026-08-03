@@ -49,6 +49,40 @@ pub const BgImageDecoded = bg_image.BgImageDecoded;
 pub const RasterResult = FontService.RasterResult;
 pub const scrollbarWidth = gpu.scrollbarWidth;
 
+pub const StartupError = error{
+    AdapterUnavailable,
+    DeviceUnavailable,
+    CommandQueueUnavailable,
+    CommandAllocatorUnavailable,
+    CommandListUnavailable,
+    FenceUnavailable,
+    FenceEventUnavailable,
+    BindingLayoutRejected,
+    GridPipelineRejected,
+    ImagePipelineRejected,
+    DescriptorHeapUnavailable,
+    RenderTargetHeapUnavailable,
+    PresentationUnavailable,
+};
+
+pub fn startupErrorDescription(err: StartupError) []const u8 {
+    return switch (err) {
+        error.AdapterUnavailable => "the configured GPU adapter is unavailable to D3D12",
+        error.DeviceUnavailable => "no D3D12 device supports feature level 11_0",
+        error.CommandQueueUnavailable => "the D3D12 command queue could not be created",
+        error.CommandAllocatorUnavailable => "a D3D12 command allocator could not be created",
+        error.CommandListUnavailable => "the D3D12 command list could not be created",
+        error.FenceUnavailable => "the D3D12 completion fence could not be created",
+        error.FenceEventUnavailable => "the D3D12 completion event could not be created",
+        error.BindingLayoutRejected => "the D3D12 resource binding layout was rejected",
+        error.GridPipelineRejected => "the D3D12 grid shader pipeline was rejected",
+        error.ImagePipelineRejected => "the D3D12 image shader pipeline was rejected",
+        error.DescriptorHeapUnavailable => "a D3D12 shader descriptor heap is unavailable",
+        error.RenderTargetHeapUnavailable => "the D3D12 render-target descriptor heap is unavailable",
+        error.PresentationUnavailable => "the D3D12 presentation surface could not be attached to desktop composition",
+    };
+}
+
 const debug_stats_enabled = builtin.mode == .Debug;
 const DebugStats = struct {
     rows_uploaded: u64 = 0,
@@ -163,16 +197,9 @@ pub fn init(
     common: *RendererCommon,
     font_service: *FontService,
     configured_gpu: ?[]const u8,
-) D3d12Renderer {
-    // A backend the user asked for by name must not quietly become a
-    // different one: a silent fallback would let a comparison study
-    // attribute the other backend's behaviour to this one. Every failure
-    // below therefore terminates rather than degrades.
+) StartupError!D3d12Renderer {
     const selected_adapter = if (configured_gpu) |name|
-        swap_chain_mod.findHardwareAdapterByName(name) orelse std.debug.panic(
-            "renderer = d3d12: configured GPU '{s}' was not found among hardware adapters",
-            .{name},
-        )
+        swap_chain_mod.findHardwareAdapterByName(name) orelse return error.AdapterUnavailable
     else
         null;
     defer if (selected_adapter) |a| {
@@ -187,12 +214,9 @@ pub fn init(
             win32.IID_ID3D12Device,
             @ptrCast(&device),
         );
-        if (hr < 0) std.debug.panic(
-            "renderer = d3d12: no D3D12 device at feature level 11_0 (hresult=0x{x}); " ++
-                "this environment does not meet the backend's baseline",
-            .{@as(u32, @bitCast(hr))},
-        );
+        if (hr < 0) return error.DeviceUnavailable;
     }
+    errdefer _ = device.IUnknown.Release();
 
     var queue: *win32.ID3D12CommandQueue = undefined;
     {
@@ -203,21 +227,27 @@ pub fn init(
             .NodeMask = 0,
         };
         const hr = device.CreateCommandQueue(&desc, win32.IID_ID3D12CommandQueue, @ptrCast(&queue));
-        if (hr < 0) fatal("CreateCommandQueue", hr);
+        if (hr < 0) return error.CommandQueueUnavailable;
     }
+    errdefer _ = queue.IUnknown.Release();
 
     // One allocator per generation. An allocator may only be reset once the
     // GPU is done with everything recorded from it, so sharing a single one
     // across generations would force a full wait every frame — the very thing
     // the generation ring exists to remove.
     var command_allocators: [upload.Ring.generations]*win32.ID3D12CommandAllocator = undefined;
+    var command_allocator_count: usize = 0;
+    errdefer for (command_allocators[0..command_allocator_count]) |allocator| {
+        _ = allocator.IUnknown.Release();
+    };
     for (&command_allocators) |*slot| {
         const hr = device.CreateCommandAllocator(
             .DIRECT,
             win32.IID_ID3D12CommandAllocator,
             @ptrCast(slot),
         );
-        if (hr < 0) fatal("CreateCommandAllocator", hr);
+        if (hr < 0) return error.CommandAllocatorUnavailable;
+        command_allocator_count += 1;
     }
 
     var command_list: *win32.ID3D12GraphicsCommandList = undefined;
@@ -230,55 +260,50 @@ pub fn init(
             win32.IID_ID3D12GraphicsCommandList,
             @ptrCast(&command_list),
         );
-        if (hr < 0) fatal("CreateCommandList", hr);
+        if (hr < 0) return error.CommandListUnavailable;
         // Created open; close it so the first `beginRecording` starts from a
         // known state like every later frame does.
-        if (command_list.Close() < 0) fatal("CreateCommandList/Close", 0);
+        if (command_list.Close() < 0) {
+            _ = command_list.IUnknown.Release();
+            return error.CommandListUnavailable;
+        }
     }
+    errdefer _ = command_list.IUnknown.Release();
 
     var fence: *win32.ID3D12Fence = undefined;
     {
         const hr = device.CreateFence(0, .{}, win32.IID_ID3D12Fence, @ptrCast(&fence));
-        if (hr < 0) fatal("CreateFence", hr);
+        if (hr < 0) return error.FenceUnavailable;
     }
-    const fence_event = win32.CreateEventW(null, 0, 0, null) orelse
-        fatal("CreateEventW(fence)", 0);
+    errdefer _ = fence.IUnknown.Release();
+    const fence_event = win32.CreateEventW(null, 0, 0, null) orelse return error.FenceEventUnavailable;
+    errdefer _ = win32.CloseHandle(fence_event);
 
-    const root_signature = pipeline.createRootSignature(device) catch |err| std.debug.panic(
-        "renderer = d3d12: resource binding layout rejected ({s})",
-        .{@errorName(err)},
-    );
+    const root_signature = pipeline.createRootSignature(device) catch return error.BindingLayoutRejected;
+    errdefer _ = root_signature.IUnknown.Release();
     const pso_grid = pipeline.createPipeline(
         device,
         root_signature,
         shader_assets.pixel.dxil,
         .opaque_write,
-    ) catch |err| std.debug.panic(
-        "renderer = d3d12: grid pipeline state rejected ({s}); the generated " ++
-            "Shader Model 6 assets are not usable in this environment",
-        .{@errorName(err)},
-    );
+    ) catch return error.GridPipelineRejected;
+    errdefer _ = pso_grid.IUnknown.Release();
     const pso_inline_image = pipeline.createPipeline(
         device,
         root_signature,
         shader_assets.image_pixel.dxil,
         .premultiplied_over,
-    ) catch |err| std.debug.panic(
-        "renderer = d3d12: inline-image pipeline state rejected ({s})",
-        .{@errorName(err)},
-    );
+    ) catch return error.ImagePipelineRejected;
+    errdefer _ = pso_inline_image.IUnknown.Release();
     var descriptor_heaps: [upload.Ring.generations]pipeline.Descriptors = undefined;
+    var descriptor_heap_count: usize = 0;
+    errdefer for (descriptor_heaps[0..descriptor_heap_count]) |*heap| heap.release();
     for (&descriptor_heaps) |*slot| {
-        slot.* = pipeline.Descriptors.init(device, pipeline.initial_table_count) catch |err|
-            std.debug.panic(
-                "renderer = d3d12: descriptor heap unavailable ({s})",
-                .{@errorName(err)},
-            );
+        slot.* = pipeline.Descriptors.init(device, pipeline.initial_table_count) catch
+            return error.DescriptorHeapUnavailable;
+        descriptor_heap_count += 1;
     }
-    const render_targets = pipeline.RenderTargets.init(device) catch |err| std.debug.panic(
-        "renderer = d3d12: render-target descriptor heap unavailable ({s})",
-        .{@errorName(err)},
-    );
+    const render_targets = pipeline.RenderTargets.init(device) catch return error.RenderTargetHeapUnavailable;
 
     // The other backend classifies the adapter for its present policy; do the
     // same so the shared throttle decision sees identical inputs.
@@ -303,6 +328,18 @@ pub fn init(
         .descriptor_heaps = descriptor_heaps,
         .render_targets = render_targets,
     };
+}
+
+pub fn initializeWindow(self: *D3d12Renderer, hwnd: win32.HWND) StartupError!void {
+    if (self.surface != null) return;
+    const size = win32.getClientSize(hwnd);
+    if (size.cx <= 0 or size.cy <= 0) return error.PresentationUnavailable;
+    self.surface = present.Surface.init(
+        self.queue,
+        hwnd,
+        @intCast(size.cx),
+        @intCast(size.cy),
+    ) catch return error.PresentationUnavailable;
 }
 
 fn fatal(what: []const u8, hr: i32) noreturn {
