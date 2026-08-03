@@ -38,6 +38,30 @@ pub const RendererBackend = union(enum) {
     opengl: gl46,
 };
 
+pub const StartupFallback = struct {
+    configured: Config.RendererBackend,
+    replacement: Config.RendererBackend = .d3d11,
+    reason: Reason,
+
+    pub const Reason = enum {
+        remote_session,
+    };
+
+    pub fn selectedBackend(self: StartupFallback, accepted: bool) ?Config.RendererBackend {
+        return if (accepted) self.replacement else null;
+    }
+};
+
+pub fn recommendStartupFallback(
+    backend: Config.RendererBackend,
+    remote_session: bool,
+) ?StartupFallback {
+    if (backend == .opengl and remote_session) {
+        return .{ .configured = backend, .reason = .remote_session };
+    }
+    return null;
+}
+
 common: RendererCommon,
 font_service: FontService,
 backend: RendererBackend,
@@ -73,6 +97,23 @@ pub fn init(
             .opengl = gl46.init(&self.common, &self.font_service, configured_gpu),
         },
     };
+}
+
+test "OpenGL startup in RDP offers an explicit D3D11 fallback" {
+    const fallback = recommendStartupFallback(.opengl, true).?;
+    try std.testing.expectEqual(Config.RendererBackend.opengl, fallback.configured);
+    try std.testing.expectEqual(StartupFallback.Reason.remote_session, fallback.reason);
+    try std.testing.expectEqual(
+        Config.RendererBackend.d3d11,
+        fallback.selectedBackend(true).?,
+    );
+    try std.testing.expectEqual(@as(?Config.RendererBackend, null), fallback.selectedBackend(false));
+}
+
+test "compatible renderer environments do not offer a fallback" {
+    try std.testing.expectEqual(@as(?StartupFallback, null), recommendStartupFallback(.opengl, false));
+    try std.testing.expectEqual(@as(?StartupFallback, null), recommendStartupFallback(.d3d11, true));
+    try std.testing.expectEqual(@as(?StartupFallback, null), recommendStartupFallback(.d3d12, true));
 }
 
 pub fn cellSizeForDpi(self: *Renderer, dpi: u32) win32.SIZE {

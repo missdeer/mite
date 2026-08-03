@@ -94,6 +94,36 @@ pub fn main() !void {
     // strings. The UTF-16 storage is leaked: it lives for the lifetime of the
     // global renderer (i.e. the whole process).
     global.config = Config.loadDefault(global.gpa.allocator());
+    if (Renderer.recommendStartupFallback(
+        global.config.renderer,
+        win32.GetSystemMetrics(win32.SM_REMOTESESSION) != 0,
+    )) |fallback| {
+        var message_buf: [512]u8 = undefined;
+        const reason: []const u8 = switch (fallback.reason) {
+            .remote_session => "OpenGL 4.6 is unavailable in a Remote Desktop session because Windows " ++
+                "normally exposes only GDI Generic OpenGL 1.1.",
+        };
+        const message = std.fmt.bufPrintZ(
+            &message_buf,
+            "The configured renderer ({s}) cannot be used in this environment.\n\n" ++
+                "{s}\n\nUse D3D11 for this session instead?\n\n" ++
+                "Choose Yes to continue with D3D11, or No to exit Mostty.",
+            .{ @tagName(fallback.configured), reason },
+        ) catch unreachable;
+        const accepted = win32.MessageBoxA(
+            null,
+            message,
+            "Mostty Renderer Fallback",
+            // zigwin32 represents MB_ICONWARNING as these two aliasing bits.
+            .{ .YESNO = 1, .ICONHAND = 1, .ICONQUESTION = 1, .DEFBUTTON2 = 1 },
+        ) == win32.IDYES;
+        global.config.renderer = fallback.selectedBackend(accepted) orelse
+            return error.RendererFallbackDeclined;
+        std.log.warn(
+            "renderer: user accepted startup fallback from {s} to {s}",
+            .{ @tagName(fallback.configured), @tagName(global.config.renderer) },
+        );
+    }
     const gpa_alloc = global.gpa.allocator();
     const font_families_u16 = util.utf16FontFamilies(gpa_alloc, global.config.font_families);
     const emoji_families_u16 = util.utf16FontFamilies(gpa_alloc, global.config.emoji_font_families);

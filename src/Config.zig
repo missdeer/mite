@@ -71,10 +71,10 @@ pub const BackgroundImagePosition = enum {
     bottom_right,
 };
 
-// Renderer backend selected by `renderer`. Selecting a backend that cannot
-// meet its baseline capabilities is a hard failure at startup, never a silent
-// fallback to another backend: a silent fallback would let a comparison study
-// attribute D3D11's behaviour to D3D12.
+// Renderer backend selected by `renderer`. A backend that cannot meet its
+// baseline may offer an explicit, user-approved D3D11 startup fallback, but it
+// must never switch silently: a silent fallback would let a comparison study
+// attribute D3D11's behaviour to another backend.
 pub const RendererBackend = enum {
     d3d11,
     d3d12,
