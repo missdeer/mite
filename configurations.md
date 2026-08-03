@@ -435,14 +435,19 @@ renderer = d3d11
 
 - `d3d11` is the default validated backend.
 - `d3d12` is the explicit Direct3D 12 research backend.
-- `opengl` is the explicit OpenGL 4.6 / shared-SPIR-V research backend.
+- `opengl` is the OpenGL 4.6 / shared-SPIR-V research backend with the
+  `WGL_NV_DX_interop2` DirectComposition bridge when available.
+- `pure-opengl` uses the same OpenGL renderer but presents directly through
+  the window's double-buffered WGL framebuffer. It creates an ordinary
+  DWM-redirected window and never initializes the D3D11 interop bridge.
 
-The OpenGL backend requires a local OpenGL 4.6 driver and does not support RDP
-or `gpu` adapter overrides. It automatically attempts the optional
-`WGL_NV_DX_interop2` DirectComposition bridge and retains ordinary WGL
-presentation when that bridge is unavailable or fails. Missing baseline
-OpenGL capabilities still fail startup explicitly rather than falling back to
-D3D11, so research observations cannot be attributed to the wrong backend.
+Both OpenGL choices require an OpenGL 4.6 driver and do not support `gpu`
+adapter overrides. RDP sessions are allowed when their active display driver
+exposes the required capabilities. `pure-opengl` additionally requires a
+double-buffered pixel format with 8-bit alpha, sRGB encoding, and DWM
+composition support so `background-opacity` and `background-blur` retain their
+normal behavior. Missing capabilities are reported by the real-window startup
+gate, which offers an explicit user-confirmed D3D11 fallback.
 
 **Hot-reload:** no; changing the renderer requires restarting Mostty.
 

@@ -1,3 +1,4 @@
+const std = @import("std");
 const win32 = @import("win32").everything;
 
 pub const TabId = u32;
@@ -73,6 +74,22 @@ pub const window_style_ex = win32.WINDOW_EX_STYLE{
     .APPWINDOW = 1,
     .NOREDIRECTIONBITMAP = 1,
 };
+
+pub fn windowStyleEx(dwm_redirected: bool) win32.WINDOW_EX_STYLE {
+    return if (dwm_redirected)
+        .{ .APPWINDOW = 1 }
+    else
+        window_style_ex;
+}
+
+test "normally redirected windows retain app-window identity" {
+    const redirected = windowStyleEx(true);
+    try std.testing.expectEqual(@as(u1, 1), redirected.APPWINDOW);
+    try std.testing.expectEqual(@as(u1, 0), redirected.NOREDIRECTIONBITMAP);
+
+    const direct_composition = windowStyleEx(false);
+    try std.testing.expectEqual(@as(u1, 1), direct_composition.NOREDIRECTIONBITMAP);
+}
 
 pub const tab_bar_bg: u24 = 0x1f1f1f;
 pub const tab_bar_fg: u24 = 0x808080;

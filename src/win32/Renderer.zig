@@ -106,7 +106,10 @@ pub fn init(
         .d3d11 => .{ .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu) },
         .d3d12 => null,
         .opengl => .{
-            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu),
+            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .interop),
+        },
+        .@"pure-opengl" => .{
+            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .pure_wgl),
         },
     };
 }
@@ -125,6 +128,12 @@ test "research backend startup failure offers an explicit D3D11 fallback" {
 test "successful startup and D3D11 failure do not offer a fallback" {
     try std.testing.expectEqual(@as(?StartupFallback, null), recommendStartupFallback(.opengl, false));
     try std.testing.expectEqual(@as(?StartupFallback, null), recommendStartupFallback(.d3d11, true));
+}
+
+test "pure-opengl startup failure retains its configured identity" {
+    const fallback = recommendStartupFallback(.@"pure-opengl", true).?;
+    try std.testing.expectEqual(Config.RendererBackend.@"pure-opengl", fallback.configured);
+    try std.testing.expectEqual(Config.RendererBackend.d3d11, fallback.replacement);
 }
 
 test "startup failure retains its backend-specific reason" {

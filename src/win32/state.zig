@@ -45,6 +45,7 @@ pub const Tab = struct {
 
 pub const Window = struct {
     hwnd: win32.HWND,
+    dwm_redirected: bool = false,
     bounds: ?WindowBounds = null,
     tabs: std.ArrayListUnmanaged(*Tab) = .empty,
     active_index: usize = 0,

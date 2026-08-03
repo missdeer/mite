@@ -220,8 +220,10 @@ fn reloadConfig(hwnd: win32.HWND) void {
     }
 
     if (blur_changed) {
-        util.applyBlurBehind(hwnd, global.config.background_blur);
-        if (global.window) |*window| window.requestRender();
+        if (global.window) |*window| {
+            util.applyBlurBehind(hwnd, global.config.background_blur, window.dwm_redirected);
+            window.requestRender();
+        }
     }
 
     if (ligatures_changed) {

@@ -164,7 +164,7 @@ pub fn main() !void {
     }
 
     const hwnd = win32.CreateWindowExW(
-        types.window_style_ex,
+        types.windowStyleEx(global.config.renderer.usesDwmRedirection()),
         CLASS_NAME,
         win32.L("Mostty"),
         types.window_style,
@@ -181,6 +181,10 @@ pub fn main() !void {
     if (global.renderer.initializeWindow(hwnd, global.config.gpu)) |failure| {
         const fallback = Renderer.recommendStartupFallback(global.config.renderer, true) orelse
             return error.RendererStartupFailed;
+        std.log.err(
+            "renderer: {s} startup failed ({s}): {s}",
+            .{ @tagName(fallback.configured), failure.codeName(), failure.description() },
+        );
         if (!confirmRendererFallback(hwnd, fallback, failure)) {
             _ = win32.DestroyWindow(hwnd);
             return error.RendererFallbackDeclined;
@@ -233,7 +237,7 @@ pub fn main() !void {
         const hr = win32.DwmExtendFrameIntoClientArea(hwnd, &margins);
         if (hr < 0) std.log.warn("DwmExtendFrameIntoClientArea failed, hresult=0x{x}", .{@as(u32, @bitCast(hr))});
     }
-    util.applyBlurBehind(hwnd, global.config.background_blur);
+    util.applyBlurBehind(hwnd, global.config.background_blur, global.window.?.dwm_redirected);
 
     win32.DragAcceptFiles(hwnd, 1);
     // UIPI: when mostty runs elevated, Explorer (a lower-integrity process)

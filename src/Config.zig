@@ -79,6 +79,11 @@ pub const RendererBackend = enum {
     d3d11,
     d3d12,
     opengl,
+    @"pure-opengl",
+
+    pub fn usesDwmRedirection(self: RendererBackend) bool {
+        return self == .@"pure-opengl";
+    }
 };
 
 // Scaling mode for `background-image-fit`. Mirrors Ghostty's values.
@@ -507,7 +512,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
             gpu = if (value.len == 0) null else a.dupe(u8, value) catch oom();
         } else if (std.mem.eql(u8, key, "renderer")) {
             renderer = std.meta.stringToEnum(RendererBackend, value) orelse {
-                std.log.warn("config: {s}:{}: invalid renderer '{s}' (expect d3d11, d3d12, or opengl)", .{ source_name, line_no, value });
+                std.log.warn("config: {s}:{}: invalid renderer '{s}' (expect d3d11, d3d12, opengl, or pure-opengl)", .{ source_name, line_no, value });
                 continue;
             };
         } else if (std.mem.eql(u8, key, "background-opacity")) {
@@ -1526,7 +1531,7 @@ test "renderer defaults to d3d11 so an untouched config keeps the validated path
 test "research renderers require exact explicit names" {
     // Research backends must never be reachable by accident, neither by a
     // typo nor by a value that merely resembles one.
-    inline for (.{ RendererBackend.d3d12, RendererBackend.opengl }) |backend| {
+    inline for (.{ RendererBackend.d3d12, RendererBackend.opengl, RendererBackend.@"pure-opengl" }) |backend| {
         var buf: [32]u8 = undefined;
         const source = std.fmt.bufPrint(&buf, "renderer = {s}\n", .{@tagName(backend)}) catch unreachable;
         var cfg = parse(std.testing.allocator, source, "test");
@@ -1540,11 +1545,21 @@ test "research renderers require exact explicit names" {
         "renderer = OpenGL\n",
         "renderer = gl46\n",
         "renderer = openglx\n",
+        "renderer = Pure-OpenGL\n",
+        "renderer = pure_opengl\n",
+        "renderer = pureopengl\n",
         "renderer =\n",
     }) |src| {
         var cfg = parse(std.testing.allocator, src, "test");
         defer cfg.deinit();
         try std.testing.expectEqual(RendererBackend.d3d11, cfg.renderer);
+    }
+}
+
+test "only pure-opengl requests a normally redirected window" {
+    try std.testing.expect(RendererBackend.@"pure-opengl".usesDwmRedirection());
+    inline for (.{ RendererBackend.d3d11, RendererBackend.d3d12, RendererBackend.opengl }) |backend| {
+        try std.testing.expect(!backend.usesDwmRedirection());
     }
 }
 

@@ -78,11 +78,21 @@ pub fn hitEql(a: ?types.TabHit, b: types.TabHit) bool {
 // fEnable=0 cancels the blur-behind region; translucent pixels then composite
 // as plain black under most modern Windows compositors. This is the legacy
 // Vista-era API, not Mica/Acrylic via DWMWA_SYSTEMBACKDROP_TYPE.
-pub fn applyBlurBehind(hwnd: win32.HWND, enable: bool) void {
+pub fn applyBlurBehind(hwnd: win32.HWND, enable: bool, dwm_redirected: bool) void {
+    const region = if (enable and dwm_redirected)
+        win32.CreateRectRgn(0, 0, -1, -1)
+    else
+        null;
+    defer if (region) |rgn| {
+        _ = win32.DeleteObject(@ptrCast(rgn));
+    };
+    if (enable and dwm_redirected and region == null) {
+        std.log.warn("CreateRectRgn failed; redirected-window blur may not honor per-pixel alpha", .{});
+    }
     const bb = win32.DWM_BLURBEHIND{
-        .dwFlags = 0x1 | 0x4, // DWM_BB_ENABLE | DWM_BB_TRANSITIONONMAXIMIZED
+        .dwFlags = 0x1 | (if (region != null) @as(u32, 0x2) else 0) | 0x4,
         .fEnable = if (enable) 1 else 0,
-        .hRgnBlur = null,
+        .hRgnBlur = region,
         .fTransitionOnMaximized = 1,
     };
     const hr = win32.DwmEnableBlurBehindWindow(hwnd, &bb);

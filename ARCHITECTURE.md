@@ -539,27 +539,39 @@ D3D11 consumes DXBC, D3D12 consumes signed DXIL, and OpenGL 4.6 specializes the
 SPIR-V assets directly. Explicit bindings keep constant buffers, structured
 cells, textures, and the sampler in one collision-free cross-backend contract.
 
-The OpenGL backend creates a WGL 4.6 core context on the window's stable
+The OpenGL renderer creates a WGL 4.6 core context on the window's stable
 class-owned DC and uses checked-in zigglgen bindings. It reuses the shared
 cell/glyph/image builders and the font service's CPU-pixel handoff. Persistent
 mapped frame data is split across three completion-fenced slots; missing
 4.6/SPIR-V and a configured `gpu` override are reported by the real-window
 startup capability gate. RDP is not rejected preemptively: a session whose
-hardware policy exposes the required OpenGL capabilities continues on OpenGL.
+display-driver policy exposes the required OpenGL capabilities continues on
+OpenGL.
 If the actual gate fails, startup offers a user-confirmed D3D11 fallback for
 that process; declining exits without changing the configured backend. D3D12
 uses the same real-window gate for device, pipeline, descriptor, and
 DirectComposition-surface creation failures, so every non-D3D11 backend has
 the same explicit policy rather than silently changing renderers.
 
-Presentation first attempts an optional `WGL_NV_DX_interop2` bridge. The bridge
-owns a multithread-capable D3D11 device, registers its render target with GL,
-copies completed frames into a flip-model composition swap chain, and binds
-that chain to the window's DirectComposition tree. Missing procedures, setup
-failure, or runtime handoff failure detaches the tree and permanently selects
-the ordinary WGL double-buffered path for that process. Terminal and font
-ownership never move into the bridge; glyph and tab-bar pixels retain the M5a
-CPU handoff. Observed vendor results live in
+The `opengl` presentation choice first attempts an optional
+`WGL_NV_DX_interop2` bridge. The bridge owns a multithread-capable D3D11 device,
+registers its render target with GL, copies completed frames into a flip-model
+composition swap chain, and binds that chain to the window's DirectComposition
+tree. Missing procedures, setup failure, or runtime handoff failure detaches
+the tree and permanently selects the ordinary WGL double-buffered path for
+that process.
+
+The `pure-opengl` choice shares all rendering code but uses a normally
+DWM-redirected HWND and presents with `SwapBuffers`. A hidden class-owned
+bootstrap window loads `WGL_ARB_pixel_format` before the real window's
+immutable pixel format is set; selection and read-back validation require
+double buffering, RGBA with at least 8 alpha bits, sRGB, and
+`PFD_SUPPORT_COMPOSITION`. Frames are drawn into an OpenGL-owned sRGB
+renderbuffer, then vertically blitted into the window framebuffer to reconcile
+the row orientation that the interop path normally corrects when D3D reads the
+shared texture. It never creates the D3D11 interoperability bridge. Terminal
+and font ownership are identical across both choices; glyph and tab-bar pixels
+retain the M5a CPU handoff. Observed vendor results live in
 `rad-notes/opengl-interop-matrix.md`.
 
 ### 6.2 Per-frame orchestration

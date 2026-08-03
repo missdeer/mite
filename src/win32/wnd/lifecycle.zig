@@ -11,7 +11,10 @@ const global = global_mod.global;
 
 pub fn onCreate(hwnd: win32.HWND, _: win32.WPARAM, _: win32.LPARAM) ?win32.LRESULT {
     std.debug.assert(global.window == null);
-    global.window = .{ .hwnd = hwnd };
+    global.window = .{
+        .hwnd = hwnd,
+        .dwm_redirected = global.config.renderer.usesDwmRedirection(),
+    };
     const window = &global.window.?;
     // Boot the renderer at whatever cadence the current session deserves, then
     // keep it in sync by subscribing to WTS session-change notifications so

@@ -40,11 +40,24 @@ pub const glyph_handoff: shared.GlyphHandoff = .cpu_pixels;
 const frame_count = 3;
 const map_flags = gl.MAP_WRITE_BIT | gl.MAP_PERSISTENT_BIT | gl.MAP_COHERENT_BIT;
 
+pub const Presentation = enum {
+    interop,
+    pure_wgl,
+
+    fn usesInterop(self: Presentation) bool {
+        return self == .interop;
+    }
+};
+
 pub const StartupError = error{
     GpuOverrideUnsupported,
     GetDcFailed,
     PixelFormatUnavailable,
+    PixelFormatExtensionUnavailable,
+    PixelFormatContractUnavailable,
     SetPixelFormatFailed,
+    BootstrapWindowClassFailed,
+    BootstrapWindowFailed,
     BootstrapContextFailed,
     BootstrapMakeCurrentFailed,
     CreateContextUnavailable,
@@ -66,7 +79,11 @@ pub fn startupErrorDescription(err: StartupError) []const u8 {
         error.GpuOverrideUnsupported => "WGL cannot honor the configured GPU override",
         error.GetDcFailed => "the window device context is unavailable",
         error.PixelFormatUnavailable => "no composited RGBA pixel format is available",
+        error.PixelFormatExtensionUnavailable => "WGL_ARB_pixel_format is unavailable",
+        error.PixelFormatContractUnavailable => "no double-buffered alpha+sRGB composited pixel format is available",
         error.SetPixelFormatFailed => "the OpenGL pixel format was rejected",
+        error.BootstrapWindowClassFailed => "the WGL bootstrap window class could not be registered",
+        error.BootstrapWindowFailed => "the WGL bootstrap window could not be created",
         error.BootstrapContextFailed => "the legacy WGL bootstrap context could not be created",
         error.BootstrapMakeCurrentFailed => "the legacy WGL bootstrap context could not be activated",
         error.CreateContextUnavailable => "WGL_ARB_create_context is unavailable",
@@ -90,6 +107,33 @@ const WglCreateContextAttribs = *const fn (
     [*:0]const i32,
 ) callconv(.winapi) ?win32.HGLRC;
 const WglSwapInterval = *const fn (i32) callconv(.winapi) win32.BOOL;
+const WglChoosePixelFormat = *const fn (
+    win32.HDC,
+    [*:0]const i32,
+    ?[*]const f32,
+    u32,
+    [*]i32,
+    *u32,
+) callconv(.winapi) win32.BOOL;
+const WglGetPixelFormatAttribiv = *const fn (
+    win32.HDC,
+    i32,
+    i32,
+    u32,
+    [*]const i32,
+    [*]i32,
+) callconv(.winapi) win32.BOOL;
+
+const ContextProcs = struct {
+    create_context: WglCreateContextAttribs,
+    swap_interval: WglSwapInterval,
+};
+
+const PureWglProcs = struct {
+    context: ContextProcs,
+    choose_pixel_format: WglChoosePixelFormat,
+    get_pixel_format_attrib: WglGetPixelFormatAttribiv,
+};
 
 const WGL_CONTEXT_MAJOR_VERSION_ARB = 0x2091;
 const WGL_CONTEXT_MINOR_VERSION_ARB = 0x2092;
@@ -97,6 +141,24 @@ const WGL_CONTEXT_FLAGS_ARB = 0x2094;
 const WGL_CONTEXT_PROFILE_MASK_ARB = 0x9126;
 const WGL_CONTEXT_CORE_PROFILE_BIT_ARB = 0x00000001;
 const WGL_CONTEXT_DEBUG_BIT_ARB = 0x00000001;
+const WGL_DRAW_TO_WINDOW_ARB = 0x2001;
+const WGL_SUPPORT_OPENGL_ARB = 0x2010;
+const WGL_DOUBLE_BUFFER_ARB = 0x2011;
+const WGL_PIXEL_TYPE_ARB = 0x2013;
+const WGL_COLOR_BITS_ARB = 0x2014;
+const WGL_ALPHA_BITS_ARB = 0x201B;
+const WGL_TYPE_RGBA_ARB = 0x202B;
+const WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB = 0x20A9;
+
+const DescribePixelFormatRaw = @extern(
+    *const fn (
+        dc: win32.HDC,
+        pixel_format: i32,
+        bytes: u32,
+        pfd: *win32.PIXELFORMATDESCRIPTOR,
+    ) callconv(.winapi) i32,
+    .{ .name = "DescribePixelFormat" },
+);
 
 const DebugStats = struct {
     rows_uploaded: u64 = 0,
@@ -123,6 +185,67 @@ pub const BackgroundImage = struct {
 
     pub fn release(self: *BackgroundImage) void {
         if (self.texture != 0) gl.DeleteTextures(1, @ptrCast(&self.texture));
+        self.* = .{};
+    }
+};
+
+const PureWglSurface = struct {
+    framebuffer: gl.uint = 0,
+    renderbuffer: gl.uint = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+
+    fn begin(self: *PureWglSurface, width: u32, height: u32) void {
+        if (self.framebuffer == 0) {
+            gl.CreateFramebuffers(1, @ptrCast(&self.framebuffer));
+            gl.CreateRenderbuffers(1, @ptrCast(&self.renderbuffer));
+            if (self.framebuffer == 0 or self.renderbuffer == 0)
+                fatal("pure WGL presentation surface creation failed");
+        }
+        if (self.width != width or self.height != height) {
+            gl.NamedRenderbufferStorage(
+                self.renderbuffer,
+                gl.SRGB8_ALPHA8,
+                @intCast(width),
+                @intCast(height),
+            );
+            gl.NamedFramebufferRenderbuffer(
+                self.framebuffer,
+                gl.COLOR_ATTACHMENT0,
+                gl.RENDERBUFFER,
+                self.renderbuffer,
+            );
+            gl.NamedFramebufferDrawBuffer(self.framebuffer, gl.COLOR_ATTACHMENT0);
+            gl.NamedFramebufferReadBuffer(self.framebuffer, gl.COLOR_ATTACHMENT0);
+            if (gl.CheckNamedFramebufferStatus(self.framebuffer, gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE)
+                fatal("pure WGL presentation framebuffer is incomplete");
+            self.width = width;
+            self.height = height;
+        }
+        gl.BindFramebuffer(gl.FRAMEBUFFER, self.framebuffer);
+    }
+
+    fn blitToWindow(self: PureWglSurface) void {
+        gl.BindFramebuffer(gl.FRAMEBUFFER, 0);
+        gl.BlitNamedFramebuffer(
+            self.framebuffer,
+            0,
+            0,
+            0,
+            @intCast(self.width),
+            @intCast(self.height),
+            0,
+            @intCast(self.height),
+            @intCast(self.width),
+            0,
+            gl.COLOR_BUFFER_BIT,
+            gl.NEAREST,
+        );
+    }
+
+    fn release(self: *PureWglSurface) void {
+        if (self.renderbuffer != 0) gl.DeleteRenderbuffers(1, @ptrCast(&self.renderbuffer));
+        if (self.framebuffer != 0) gl.DeleteFramebuffers(1, @ptrCast(&self.framebuffer));
         self.* = .{};
     }
 };
@@ -182,7 +305,9 @@ context: ?win32.HGLRC = null,
 procs: gl.ProcTable = undefined,
 interop_state: interop.State = .untried,
 interop_bridge: ?interop.Bridge = null,
+pure_wgl_surface: PureWglSurface = .{},
 gpu_override_configured: bool = false,
+presentation: Presentation,
 
 grid_program: gl.uint = 0,
 image_program: gl.uint = 0,
@@ -213,11 +338,13 @@ pub fn init(
     common: *RendererCommon,
     font_service: *FontService,
     configured_gpu: ?[]const u8,
+    presentation: Presentation,
 ) Gl46Renderer {
     return .{
         .common = common,
         .font_service = font_service,
         .gpu_override_configured = configured_gpu != null,
+        .presentation = presentation,
     };
 }
 
@@ -229,6 +356,7 @@ pub fn deinit(self: *Gl46Renderer) void {
         gl.makeProcTableCurrent(&self.procs);
         gl.Finish();
         if (self.interop_bridge) |*bridge| bridge.deinit();
+        self.pure_wgl_surface.release();
         self.kitty_images.deinit(std.heap.page_allocator);
         self.background_image.release();
         self.releaseGlyphState();
@@ -285,17 +413,7 @@ pub fn initializeWindow(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void
     return self.ensureInitialized(hwnd);
 }
 
-fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
-    if (self.initialized) {
-        if (self.hwnd != hwnd) fatal("the WGL context was asked to move to another window");
-        gl.makeProcTableCurrent(&self.procs);
-        return;
-    }
-    if (self.gpu_override_configured) return error.GpuOverrideUnsupported;
-
-    const dc = win32.GetDC(hwnd) orelse return error.GetDcFailed;
-    errdefer _ = win32.ReleaseDC(hwnd, dc);
-
+fn pixelFormatDescriptor() win32.PIXELFORMATDESCRIPTOR {
     var pfd = std.mem.zeroes(win32.PIXELFORMATDESCRIPTOR);
     pfd.nSize = @sizeOf(win32.PIXELFORMATDESCRIPTOR);
     pfd.nVersion = 1;
@@ -309,26 +427,215 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
     pfd.cColorBits = 32;
     pfd.cAlphaBits = 8;
     pfd.iLayerType = .MAIN_PLANE;
+    return pfd;
+}
+
+fn setLegacyPixelFormat(dc: win32.HDC) StartupError!void {
+    const pfd = pixelFormatDescriptor();
     const pixel_format = win32.ChoosePixelFormat(dc, &pfd);
     if (pixel_format == 0) return error.PixelFormatUnavailable;
     if (win32.SetPixelFormat(dc, pixel_format, &pfd) == 0) return error.SetPixelFormatFailed;
+}
 
-    const context_procs = blk: {
-        const bootstrap = win32.wglCreateContext(dc) orelse return error.BootstrapContextFailed;
-        defer {
-            _ = win32.wglMakeCurrent(null, null);
-            _ = win32.wglDeleteContext(bootstrap);
-        }
-        if (win32.wglMakeCurrent(dc, bootstrap) == 0) return error.BootstrapMakeCurrentFailed;
-        const create_context: WglCreateContextAttribs = procAddress(
+fn loadContextProcs() StartupError!ContextProcs {
+    return .{
+        .create_context = procAddress(
             WglCreateContextAttribs,
             "wglCreateContextAttribsARB",
-        ) orelse return error.CreateContextUnavailable;
-        const swap_interval: WglSwapInterval = procAddress(
+        ) orelse return error.CreateContextUnavailable,
+        .swap_interval = procAddress(
             WglSwapInterval,
             "wglSwapIntervalEXT",
-        ) orelse return error.SwapControlUnavailable;
-        break :blk .{ create_context, swap_interval };
+        ) orelse return error.SwapControlUnavailable,
+    };
+}
+
+fn loadContextProcsFromTarget(dc: win32.HDC) StartupError!ContextProcs {
+    const bootstrap = win32.wglCreateContext(dc) orelse return error.BootstrapContextFailed;
+    defer {
+        _ = win32.wglMakeCurrent(null, null);
+        _ = win32.wglDeleteContext(bootstrap);
+    }
+    if (win32.wglMakeCurrent(dc, bootstrap) == 0) return error.BootstrapMakeCurrentFailed;
+    return loadContextProcs();
+}
+
+fn bootstrapWndProc(
+    hwnd: win32.HWND,
+    message: u32,
+    wparam: win32.WPARAM,
+    lparam: win32.LPARAM,
+) callconv(.winapi) win32.LRESULT {
+    return win32.DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+fn loadPureWglProcs() StartupError!PureWglProcs {
+    const class_name = win32.L("MosttyWglBootstrap");
+    const instance = win32.GetModuleHandleW(null);
+    const wc = win32.WNDCLASSEXW{
+        .cbSize = @sizeOf(win32.WNDCLASSEXW),
+        .style = .{ .OWNDC = 1 },
+        .lpfnWndProc = bootstrapWndProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = instance,
+        .hIcon = null,
+        .hCursor = null,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = class_name,
+        .hIconSm = null,
+    };
+    if (win32.RegisterClassExW(&wc) == 0 and
+        win32.GetLastError() != .ERROR_CLASS_ALREADY_EXISTS)
+    {
+        return error.BootstrapWindowClassFailed;
+    }
+
+    const hwnd = win32.CreateWindowExW(
+        .{},
+        class_name,
+        win32.L(""),
+        win32.WS_OVERLAPPED,
+        0,
+        0,
+        1,
+        1,
+        null,
+        null,
+        instance,
+        null,
+    ) orelse return error.BootstrapWindowFailed;
+    defer _ = win32.DestroyWindow(hwnd);
+
+    const dc = win32.GetDC(hwnd) orelse return error.GetDcFailed;
+    defer _ = win32.ReleaseDC(hwnd, dc);
+    try setLegacyPixelFormat(dc);
+
+    const bootstrap = win32.wglCreateContext(dc) orelse return error.BootstrapContextFailed;
+    defer {
+        _ = win32.wglMakeCurrent(null, null);
+        _ = win32.wglDeleteContext(bootstrap);
+    }
+    if (win32.wglMakeCurrent(dc, bootstrap) == 0) return error.BootstrapMakeCurrentFailed;
+
+    return .{
+        .context = try loadContextProcs(),
+        .choose_pixel_format = procAddress(
+            WglChoosePixelFormat,
+            "wglChoosePixelFormatARB",
+        ) orelse return error.PixelFormatExtensionUnavailable,
+        .get_pixel_format_attrib = procAddress(
+            WglGetPixelFormatAttribiv,
+            "wglGetPixelFormatAttribivARB",
+        ) orelse return error.PixelFormatExtensionUnavailable,
+    };
+}
+
+const pure_pixel_format_query = [_]i32{
+    WGL_DRAW_TO_WINDOW_ARB,
+    WGL_SUPPORT_OPENGL_ARB,
+    WGL_DOUBLE_BUFFER_ARB,
+    WGL_PIXEL_TYPE_ARB,
+    WGL_COLOR_BITS_ARB,
+    WGL_ALPHA_BITS_ARB,
+    WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB,
+};
+
+fn purePixelFormatMeetsContract(
+    attributes: [pure_pixel_format_query.len]i32,
+    pfd: win32.PIXELFORMATDESCRIPTOR,
+) bool {
+    return attributes[0] != 0 and
+        attributes[1] != 0 and
+        attributes[2] != 0 and
+        attributes[3] == WGL_TYPE_RGBA_ARB and
+        attributes[4] >= 24 and
+        attributes[5] >= 8 and
+        attributes[6] != 0 and
+        pfd.dwFlags.SUPPORT_COMPOSITION != 0;
+}
+
+fn setPurePixelFormat(dc: win32.HDC, procs: PureWglProcs) StartupError!void {
+    const desired = [_:0]i32{
+        WGL_DRAW_TO_WINDOW_ARB,
+        1,
+        WGL_SUPPORT_OPENGL_ARB,
+        1,
+        WGL_DOUBLE_BUFFER_ARB,
+        1,
+        WGL_PIXEL_TYPE_ARB,
+        WGL_TYPE_RGBA_ARB,
+        WGL_COLOR_BITS_ARB,
+        24,
+        WGL_ALPHA_BITS_ARB,
+        8,
+        WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB,
+        1,
+        0,
+    };
+    var formats: [64]i32 = @splat(0);
+    var format_count: u32 = 0;
+    if (procs.choose_pixel_format(
+        dc,
+        &desired,
+        null,
+        formats.len,
+        &formats,
+        &format_count,
+    ) == 0) return error.PixelFormatContractUnavailable;
+
+    for (formats[0..@min(format_count, formats.len)]) |pixel_format| {
+        var attributes: [pure_pixel_format_query.len]i32 = @splat(0);
+        if (procs.get_pixel_format_attrib(
+            dc,
+            pixel_format,
+            0,
+            pure_pixel_format_query.len,
+            &pure_pixel_format_query,
+            &attributes,
+        ) == 0) continue;
+
+        var pfd = std.mem.zeroes(win32.PIXELFORMATDESCRIPTOR);
+        if (DescribePixelFormatRaw(
+            dc,
+            pixel_format,
+            @sizeOf(win32.PIXELFORMATDESCRIPTOR),
+            &pfd,
+        ) == 0) continue;
+        if (!purePixelFormatMeetsContract(attributes, pfd)) continue;
+        if (win32.SetPixelFormat(dc, pixel_format, &pfd) == 0)
+            return error.SetPixelFormatFailed;
+        log.info(
+            "pure WGL pixel format {d}: color_bits={d}, alpha_bits={d}, sRGB={d}, composition={d}",
+            .{ pixel_format, attributes[4], attributes[5], attributes[6], pfd.dwFlags.SUPPORT_COMPOSITION },
+        );
+        return;
+    }
+    return error.PixelFormatContractUnavailable;
+}
+
+fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
+    if (self.initialized) {
+        if (self.hwnd != hwnd) fatal("the WGL context was asked to move to another window");
+        gl.makeProcTableCurrent(&self.procs);
+        return;
+    }
+    if (self.gpu_override_configured) return error.GpuOverrideUnsupported;
+
+    const dc = win32.GetDC(hwnd) orelse return error.GetDcFailed;
+    errdefer _ = win32.ReleaseDC(hwnd, dc);
+
+    const context_procs = switch (self.presentation) {
+        .interop => blk: {
+            try setLegacyPixelFormat(dc);
+            break :blk try loadContextProcsFromTarget(dc);
+        },
+        .pure_wgl => blk: {
+            const procs = try loadPureWglProcs();
+            try setPurePixelFormat(dc, procs);
+            break :blk procs.context;
+        },
     };
 
     const context_flags: i32 = if (@import("builtin").mode == .Debug)
@@ -346,7 +653,7 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
         WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
         0,
     };
-    const context = context_procs[0](dc, null, &attribs) orelse return error.CoreContextRejected;
+    const context = context_procs.create_context(dc, null, &attribs) orelse return error.CoreContextRejected;
     errdefer _ = win32.wglDeleteContext(context);
     if (win32.wglMakeCurrent(dc, context) == 0) return error.CoreMakeCurrentFailed;
     errdefer {
@@ -368,11 +675,10 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
         log.warn("driver exposed OpenGL {d}.{d}, but 4.6 is required", .{ major, minor });
         return error.VersionTooOld;
     }
-
     gl.Enable(gl.DEBUG_OUTPUT);
     gl.Enable(gl.DEBUG_OUTPUT_SYNCHRONOUS);
     gl.DebugMessageCallback(debugMessage, null);
-    if (context_procs[1](1) == 0) return error.SwapIntervalFailed;
+    if (context_procs.swap_interval(1) == 0) return error.SwapIntervalFailed;
     gl.ClipControl(gl.UPPER_LEFT, gl.ZERO_TO_ONE);
     gl.Enable(gl.FRAMEBUFFER_SRGB);
     gl.Enable(gl.BLEND);
@@ -410,10 +716,17 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
     self.dc = dc;
     self.context = context;
     self.initialized = true;
-    log.info(
-        "OpenGL {d}.{d} baseline active: shared SPIR-V, swap interval 1, {d} completion slots; composition bridge pending",
-        .{ major, minor, frame_count },
-    );
+    if (self.presentation.usesInterop()) {
+        log.info(
+            "OpenGL {d}.{d} baseline active: shared SPIR-V, swap interval 1, {d} completion slots; composition bridge pending",
+            .{ major, minor, frame_count },
+        );
+    } else {
+        log.info(
+            "OpenGL {d}.{d} pure WGL presentation active: alpha+sRGB composited framebuffer, swap interval 1, {d} completion slots",
+            .{ major, minor, frame_count },
+        );
+    }
 }
 
 fn debugMessage(
@@ -540,6 +853,8 @@ fn waitForSlot(self: *Gl46Renderer, slot: usize) void {
 }
 
 fn finishFrame(self: *Gl46Renderer, path: interop.Path) void {
+    if (path == .baseline and self.presentation == .pure_wgl)
+        self.pure_wgl_surface.blitToWindow();
     self.fences[self.frame_slot] = gl.FenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0) orelse
         fatal("glFenceSync failed");
     switch (path) {
@@ -734,6 +1049,10 @@ fn beginPresentation(
     width: u32,
     height: u32,
 ) interop.Path {
+    if (!self.presentation.usesInterop()) {
+        self.pure_wgl_surface.begin(width, height);
+        return .baseline;
+    }
     if (self.interop_state == .untried) {
         self.interop_bridge = interop.Bridge.init(hwnd, width, height) catch |err| {
             self.interop_state = .unavailable;
@@ -757,6 +1076,32 @@ fn beginPresentation(
         gl.BindFramebuffer(gl.FRAMEBUFFER, 0);
     }
     return self.interop_state.path();
+}
+
+test "pure WGL presentation never selects the interoperability bridge" {
+    try std.testing.expect(!Presentation.pure_wgl.usesInterop());
+    try std.testing.expect(Presentation.interop.usesInterop());
+}
+
+test "pure WGL pixel format contract requires alpha sRGB and DWM composition" {
+    var pfd = pixelFormatDescriptor();
+    const valid = [_]i32{ 1, 1, 1, WGL_TYPE_RGBA_ARB, 24, 8, 1 };
+    try std.testing.expect(purePixelFormatMeetsContract(valid, pfd));
+
+    var missing_srgb = valid;
+    missing_srgb[6] = 0;
+    try std.testing.expect(!purePixelFormatMeetsContract(missing_srgb, pfd));
+
+    var missing_alpha = valid;
+    missing_alpha[5] = 0;
+    try std.testing.expect(!purePixelFormatMeetsContract(missing_alpha, pfd));
+
+    var insufficient_rgb = valid;
+    insufficient_rgb[4] = 16;
+    try std.testing.expect(!purePixelFormatMeetsContract(insufficient_rgb, pfd));
+
+    pfd.dwFlags.SUPPORT_COMPOSITION = 0;
+    try std.testing.expect(!purePixelFormatMeetsContract(valid, pfd));
 }
 
 fn failInterop(self: *Gl46Renderer, err: anyerror) void {
