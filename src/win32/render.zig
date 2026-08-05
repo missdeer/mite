@@ -57,11 +57,11 @@ pub fn renderWindow(window: *Window) void {
         url_hl,
     )) |failure| {
         std.log.err(
-            "renderer: native-vulkan runtime failure while {s} ({s})",
-            .{ failure.operationDescription(), failure.codeName() },
+            "renderer: {s} runtime failure while {s} ({s})",
+            .{ failure.backendName(), failure.operationDescription(), failure.codeName() },
         );
-        if (global.renderer.recoverNativeVulkan(window.hwnd, global.config.gpu)) {
-            std.log.warn("renderer: rebuilt native-vulkan after a runtime failure", .{});
+        if (global.renderer.recoverVulkan(window.hwnd, global.config.gpu)) {
+            std.log.warn("renderer: rebuilt {s} after a runtime failure", .{failure.backendName()});
             _ = win32.InvalidateRect(window.hwnd, null, 0);
             return;
         }
@@ -71,7 +71,7 @@ pub fn renderWindow(window: *Window) void {
         }
         global.renderer.fallbackToD3d11(global.config.gpu);
         global.config.renderer = .d3d11;
-        std.log.warn("renderer: user accepted runtime fallback from native-vulkan to d3d11", .{});
+        std.log.warn("renderer: user accepted runtime fallback from {s} to d3d11", .{failure.backendName()});
         _ = win32.InvalidateRect(window.hwnd, null, 0);
     }
 }

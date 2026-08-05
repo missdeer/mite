@@ -55,11 +55,14 @@ src/
     FontService.zig       process-lifetime DirectWrite/D2D + font D3D11 owner
     d3d11.zig              top-level renderer struct; init / render / resize / deinit
     d3d12/renderer.zig     selectable D3D12 research renderer
+    dcomp.zig              shared DXGI composition swapchain + DComp visual
+    dcomp_blit.zig         shared D3D11 full-screen composition presenter
     gl46.zig               selectable OpenGL 4.6 renderer + WGL fallback
     gl46/interop.zig       optional WGL/D3D11 DirectComposition bridge
     gl46/loader.zig        checked-in zigglgen OpenGL 4.6 core bindings
-    vulkan.zig             selectable native Win32 Vulkan renderer
-    vulkan/core.zig        Vulkan device, resources, frames, and Win32 WSI
+    vulkan.zig             shared Vulkan renderer + presentation dispatch
+    vulkan/core.zig        Vulkan device, resources, frames, WSI, external API
+    vulkan/bridge.zig      Vulkan/D3D11 memory + timeline interop
     vulkan/loader.zig      checked runtime Vulkan procedure tables
     render.zig             renderWindow orchestration (state → renderer.render)
     GlyphIndexCache.zig    circular-LRU mapping (codepoint,half,style) → atlas slot
@@ -484,8 +487,9 @@ The process-global `Renderer` (`Renderer.zig`) is the only boundary used by
 window, input, layout, and render orchestration code. It owns a process-lifetime
 `FontService`, a backend-independent `RendererCommon` (cell size, tab-bar
 height, ligature setting, and adapter classification), plus a tagged backend
-union. D3D11 remains the default validated variant; D3D12, OpenGL 4.6, and
-native Vulkan are explicit research variants that still satisfy the whole facade contract. The
+union. D3D11 remains the default validated variant; D3D12, OpenGL 4.6, Vulkan
+with DirectComposition, and native Vulkan are explicit research variants that
+still satisfy the whole facade contract. The
 font service publishes font/DPI metrics into the common state, while each
 backend borrows both and keeps no authoritative font state.
 
@@ -568,8 +572,27 @@ presentation failure gets one full Vulkan-core rebuild attempt for session
 reconnect recovery; a failed rebuild or immediate repeated failure offers only
 explicit D3D11 fallback or exit.
 
+The `vulkan` choice uses that same device, frame-resource, descriptor, shader,
+grid, image, and tab-bar core but does not create a Win32 Vulkan surface or
+swapchain. Three legacy D3D11 shared textures on the Vulkan adapter are
+imported as external Vulkan images. A D3D11 shared fence is permanently
+imported as a Vulkan timeline semaphore: Vulkan waits for the preceding D3D11
+release, renders and signals ready; D3D11 waits ready, blits the completed
+texture, then signals release. Queue-family ownership barriers bracket each
+Vulkan render. Resize drains both APIs before replacing the shared images.
+There is no CPU frame copy and bridge failure never selects native WSI.
+
+DirectComposition lifecycle is split by responsibility. `dcomp.Surface` owns
+the three-buffer composition swapchain, frame-latency handle, DComp device,
+target, and visual. D3D12 passes its command queue directly to that surface.
+`dcomp_blit.Presenter` adds a D3D11 device and shared full-screen shaders; both
+OpenGL and Vulkan use it to feed a completed cross-API image into the surface.
+WGL registration remains in `gl46/interop.zig`, while Vulkan external memory,
+timeline synchronization, and adapter-LUID matching remain in
+`vulkan/bridge.zig`.
+
 The `opengl` presentation choice first attempts an optional
-`WGL_NV_DX_interop2` bridge. The bridge owns a multithread-capable D3D11 device,
+`WGL_NV_DX_interop2` bridge. The bridge uses a multithread-capable D3D11 device,
 registers its render target with GL, copies completed frames into a flip-model
 composition swap chain, and binds that chain to the window's DirectComposition
 tree. Missing procedures, setup failure, or runtime handoff failure detaches

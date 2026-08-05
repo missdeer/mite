@@ -440,6 +440,14 @@ renderer = d3d11
 - `pure-opengl` uses the same OpenGL renderer but presents directly through
   the window's double-buffered WGL framebuffer. It creates an ordinary
   DWM-redirected window and never initializes the D3D11 interop bridge.
+- `vulkan` uses the Vulkan renderer with a DirectComposition bridge. Vulkan
+  renders into shared D3D11 textures on the same adapter, external timeline
+  synchronization transfers ownership to a D3D11 full-screen blit, and the
+  shared composition swap chain presents the result. It never falls through
+  to native Vulkan WSI.
+- `native-vulkan` uses the same Vulkan rendering core with a native Win32
+  Vulkan surface and swapchain. It never initializes the DirectComposition
+  bridge.
 
 Both OpenGL choices require an OpenGL 4.6 driver and do not support `gpu`
 adapter overrides. RDP sessions are allowed when their active display driver
@@ -448,6 +456,14 @@ double-buffered pixel format with 8-bit alpha, sRGB encoding, and DWM
 composition support so `background-opacity` and `background-blur` retain their
 normal behavior. Missing capabilities are reported by the real-window startup
 gate, which offers an explicit user-confirmed D3D11 fallback.
+
+Both Vulkan choices require Vulkan 1.3 dynamic rendering, synchronization2,
+and timeline semaphores. `vulkan` additionally requires D3D11 texture external
+memory, D3D12-fence external semaphore import, and a matching DXGI adapter;
+`native-vulkan` requires a Win32 surface whose composite-alpha modes preserve
+Mostty's window effects. Startup or recovery failure offers only an explicit
+D3D11 fallback or exit and never switches between the two Vulkan presentation
+paths.
 
 **Hot-reload:** no; changing the renderer requires restarting Mostty.
 

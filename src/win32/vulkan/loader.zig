@@ -54,36 +54,42 @@ pub const Instance = struct {
     destroy_instance: Fn(vk.PFN_vkDestroyInstance),
     enumerate_physical_devices: Fn(vk.PFN_vkEnumeratePhysicalDevices),
     get_physical_device_properties: Fn(vk.PFN_vkGetPhysicalDeviceProperties),
+    get_physical_device_properties2: Fn(vk.PFN_vkGetPhysicalDeviceProperties2),
     get_physical_device_features2: Fn(vk.PFN_vkGetPhysicalDeviceFeatures2),
+    get_physical_device_image_format_properties2: Fn(vk.PFN_vkGetPhysicalDeviceImageFormatProperties2),
+    get_physical_device_external_semaphore_properties: Fn(vk.PFN_vkGetPhysicalDeviceExternalSemaphoreProperties),
     get_physical_device_queue_family_properties: Fn(vk.PFN_vkGetPhysicalDeviceQueueFamilyProperties),
     get_physical_device_memory_properties: Fn(vk.PFN_vkGetPhysicalDeviceMemoryProperties),
     enumerate_device_extension_properties: Fn(vk.PFN_vkEnumerateDeviceExtensionProperties),
     create_device: Fn(vk.PFN_vkCreateDevice),
     get_device_proc_addr: Fn(vk.PFN_vkGetDeviceProcAddr),
-    create_win32_surface: Fn(vk.PFN_vkCreateWin32SurfaceKHR),
-    destroy_surface: Fn(vk.PFN_vkDestroySurfaceKHR),
-    get_surface_support: Fn(vk.PFN_vkGetPhysicalDeviceSurfaceSupportKHR),
-    get_surface_capabilities: Fn(vk.PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR),
-    get_surface_formats: Fn(vk.PFN_vkGetPhysicalDeviceSurfaceFormatsKHR),
-    get_surface_present_modes: Fn(vk.PFN_vkGetPhysicalDeviceSurfacePresentModesKHR),
+    create_win32_surface: ?Fn(vk.PFN_vkCreateWin32SurfaceKHR),
+    destroy_surface: ?Fn(vk.PFN_vkDestroySurfaceKHR),
+    get_surface_support: ?Fn(vk.PFN_vkGetPhysicalDeviceSurfaceSupportKHR),
+    get_surface_capabilities: ?Fn(vk.PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR),
+    get_surface_formats: ?Fn(vk.PFN_vkGetPhysicalDeviceSurfaceFormatsKHR),
+    get_surface_present_modes: ?Fn(vk.PFN_vkGetPhysicalDeviceSurfacePresentModesKHR),
 
     fn init(get: Fn(vk.PFN_vkGetInstanceProcAddr), instance: vk.VkInstance) LoadError!Instance {
         return .{
             .destroy_instance = try instanceProc(vk.PFN_vkDestroyInstance, get, instance, "vkDestroyInstance"),
             .enumerate_physical_devices = try instanceProc(vk.PFN_vkEnumeratePhysicalDevices, get, instance, "vkEnumeratePhysicalDevices"),
             .get_physical_device_properties = try instanceProc(vk.PFN_vkGetPhysicalDeviceProperties, get, instance, "vkGetPhysicalDeviceProperties"),
+            .get_physical_device_properties2 = try instanceProc(vk.PFN_vkGetPhysicalDeviceProperties2, get, instance, "vkGetPhysicalDeviceProperties2"),
             .get_physical_device_features2 = try instanceProc(vk.PFN_vkGetPhysicalDeviceFeatures2, get, instance, "vkGetPhysicalDeviceFeatures2"),
+            .get_physical_device_image_format_properties2 = try instanceProc(vk.PFN_vkGetPhysicalDeviceImageFormatProperties2, get, instance, "vkGetPhysicalDeviceImageFormatProperties2"),
+            .get_physical_device_external_semaphore_properties = try instanceProc(vk.PFN_vkGetPhysicalDeviceExternalSemaphoreProperties, get, instance, "vkGetPhysicalDeviceExternalSemaphoreProperties"),
             .get_physical_device_queue_family_properties = try instanceProc(vk.PFN_vkGetPhysicalDeviceQueueFamilyProperties, get, instance, "vkGetPhysicalDeviceQueueFamilyProperties"),
             .get_physical_device_memory_properties = try instanceProc(vk.PFN_vkGetPhysicalDeviceMemoryProperties, get, instance, "vkGetPhysicalDeviceMemoryProperties"),
             .enumerate_device_extension_properties = try instanceProc(vk.PFN_vkEnumerateDeviceExtensionProperties, get, instance, "vkEnumerateDeviceExtensionProperties"),
             .create_device = try instanceProc(vk.PFN_vkCreateDevice, get, instance, "vkCreateDevice"),
             .get_device_proc_addr = try instanceProc(vk.PFN_vkGetDeviceProcAddr, get, instance, "vkGetDeviceProcAddr"),
-            .create_win32_surface = try instanceProc(vk.PFN_vkCreateWin32SurfaceKHR, get, instance, "vkCreateWin32SurfaceKHR"),
-            .destroy_surface = try instanceProc(vk.PFN_vkDestroySurfaceKHR, get, instance, "vkDestroySurfaceKHR"),
-            .get_surface_support = try instanceProc(vk.PFN_vkGetPhysicalDeviceSurfaceSupportKHR, get, instance, "vkGetPhysicalDeviceSurfaceSupportKHR"),
-            .get_surface_capabilities = try instanceProc(vk.PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR, get, instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"),
-            .get_surface_formats = try instanceProc(vk.PFN_vkGetPhysicalDeviceSurfaceFormatsKHR, get, instance, "vkGetPhysicalDeviceSurfaceFormatsKHR"),
-            .get_surface_present_modes = try instanceProc(vk.PFN_vkGetPhysicalDeviceSurfacePresentModesKHR, get, instance, "vkGetPhysicalDeviceSurfacePresentModesKHR"),
+            .create_win32_surface = instanceProc(vk.PFN_vkCreateWin32SurfaceKHR, get, instance, "vkCreateWin32SurfaceKHR") catch null,
+            .destroy_surface = instanceProc(vk.PFN_vkDestroySurfaceKHR, get, instance, "vkDestroySurfaceKHR") catch null,
+            .get_surface_support = instanceProc(vk.PFN_vkGetPhysicalDeviceSurfaceSupportKHR, get, instance, "vkGetPhysicalDeviceSurfaceSupportKHR") catch null,
+            .get_surface_capabilities = instanceProc(vk.PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR, get, instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") catch null,
+            .get_surface_formats = instanceProc(vk.PFN_vkGetPhysicalDeviceSurfaceFormatsKHR, get, instance, "vkGetPhysicalDeviceSurfaceFormatsKHR") catch null,
+            .get_surface_present_modes = instanceProc(vk.PFN_vkGetPhysicalDeviceSurfacePresentModesKHR, get, instance, "vkGetPhysicalDeviceSurfacePresentModesKHR") catch null,
         };
     }
 
@@ -107,11 +113,11 @@ pub const Device = struct {
     device_wait_idle: Fn(vk.PFN_vkDeviceWaitIdle),
     queue_wait_idle: Fn(vk.PFN_vkQueueWaitIdle),
     queue_submit2: Fn(vk.PFN_vkQueueSubmit2),
-    queue_present: Fn(vk.PFN_vkQueuePresentKHR),
-    create_swapchain: Fn(vk.PFN_vkCreateSwapchainKHR),
-    destroy_swapchain: Fn(vk.PFN_vkDestroySwapchainKHR),
-    get_swapchain_images: Fn(vk.PFN_vkGetSwapchainImagesKHR),
-    acquire_next_image: Fn(vk.PFN_vkAcquireNextImageKHR),
+    queue_present: ?Fn(vk.PFN_vkQueuePresentKHR),
+    create_swapchain: ?Fn(vk.PFN_vkCreateSwapchainKHR),
+    destroy_swapchain: ?Fn(vk.PFN_vkDestroySwapchainKHR),
+    get_swapchain_images: ?Fn(vk.PFN_vkGetSwapchainImagesKHR),
+    acquire_next_image: ?Fn(vk.PFN_vkAcquireNextImageKHR),
     create_semaphore: Fn(vk.PFN_vkCreateSemaphore),
     destroy_semaphore: Fn(vk.PFN_vkDestroySemaphore),
     wait_semaphores: Fn(vk.PFN_vkWaitSemaphores),
@@ -160,6 +166,8 @@ pub const Device = struct {
     cmd_bind_descriptor_sets: Fn(vk.PFN_vkCmdBindDescriptorSets),
     cmd_draw: Fn(vk.PFN_vkCmdDraw),
     wait_for_present: ?Fn(vk.PFN_vkWaitForPresentKHR),
+    get_memory_win32_handle_properties: ?Fn(vk.PFN_vkGetMemoryWin32HandlePropertiesKHR),
+    import_semaphore_win32_handle: ?Fn(vk.PFN_vkImportSemaphoreWin32HandleKHR),
 
     fn init(get: Fn(vk.PFN_vkGetDeviceProcAddr), device: vk.VkDevice) LoadError!Device {
         return .{
@@ -168,11 +176,11 @@ pub const Device = struct {
             .device_wait_idle = try deviceProc(vk.PFN_vkDeviceWaitIdle, get, device, "vkDeviceWaitIdle"),
             .queue_wait_idle = try deviceProc(vk.PFN_vkQueueWaitIdle, get, device, "vkQueueWaitIdle"),
             .queue_submit2 = try deviceProc(vk.PFN_vkQueueSubmit2, get, device, "vkQueueSubmit2"),
-            .queue_present = try deviceProc(vk.PFN_vkQueuePresentKHR, get, device, "vkQueuePresentKHR"),
-            .create_swapchain = try deviceProc(vk.PFN_vkCreateSwapchainKHR, get, device, "vkCreateSwapchainKHR"),
-            .destroy_swapchain = try deviceProc(vk.PFN_vkDestroySwapchainKHR, get, device, "vkDestroySwapchainKHR"),
-            .get_swapchain_images = try deviceProc(vk.PFN_vkGetSwapchainImagesKHR, get, device, "vkGetSwapchainImagesKHR"),
-            .acquire_next_image = try deviceProc(vk.PFN_vkAcquireNextImageKHR, get, device, "vkAcquireNextImageKHR"),
+            .queue_present = deviceProc(vk.PFN_vkQueuePresentKHR, get, device, "vkQueuePresentKHR") catch null,
+            .create_swapchain = deviceProc(vk.PFN_vkCreateSwapchainKHR, get, device, "vkCreateSwapchainKHR") catch null,
+            .destroy_swapchain = deviceProc(vk.PFN_vkDestroySwapchainKHR, get, device, "vkDestroySwapchainKHR") catch null,
+            .get_swapchain_images = deviceProc(vk.PFN_vkGetSwapchainImagesKHR, get, device, "vkGetSwapchainImagesKHR") catch null,
+            .acquire_next_image = deviceProc(vk.PFN_vkAcquireNextImageKHR, get, device, "vkAcquireNextImageKHR") catch null,
             .create_semaphore = try deviceProc(vk.PFN_vkCreateSemaphore, get, device, "vkCreateSemaphore"),
             .destroy_semaphore = try deviceProc(vk.PFN_vkDestroySemaphore, get, device, "vkDestroySemaphore"),
             .wait_semaphores = try deviceProc(vk.PFN_vkWaitSemaphores, get, device, "vkWaitSemaphores"),
@@ -221,6 +229,8 @@ pub const Device = struct {
             .cmd_bind_descriptor_sets = try deviceProc(vk.PFN_vkCmdBindDescriptorSets, get, device, "vkCmdBindDescriptorSets"),
             .cmd_draw = try deviceProc(vk.PFN_vkCmdDraw, get, device, "vkCmdDraw"),
             .wait_for_present = deviceProc(vk.PFN_vkWaitForPresentKHR, get, device, "vkWaitForPresentKHR") catch null,
+            .get_memory_win32_handle_properties = deviceProc(vk.PFN_vkGetMemoryWin32HandlePropertiesKHR, get, device, "vkGetMemoryWin32HandlePropertiesKHR") catch null,
+            .import_semaphore_win32_handle = deviceProc(vk.PFN_vkImportSemaphoreWin32HandleKHR, get, device, "vkImportSemaphoreWin32HandleKHR") catch null,
         };
     }
 };
@@ -239,4 +249,6 @@ test "Vulkan SDK headers expose the Win32 and synchronization contracts" {
     try std.testing.expect(@hasDecl(vk, "VkSubmitInfo2"));
     try std.testing.expect(@hasDecl(vk, "VkRenderingInfo"));
     try std.testing.expect(@hasDecl(vk, "PFN_vkWaitForPresentKHR"));
+    try std.testing.expect(@hasDecl(vk, "VkImportMemoryWin32HandleInfoKHR"));
+    try std.testing.expect(@hasDecl(vk, "VkImportSemaphoreWin32HandleInfoKHR"));
 }

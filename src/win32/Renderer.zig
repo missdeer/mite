@@ -37,6 +37,7 @@ pub const RendererBackend = union(enum) {
     /// OpenGL research path: complete baseline rendering through WGL and
     /// shared SPIR-V, with optional DirectComposition interoperability.
     opengl: gl46,
+    vulkan: vulkan,
     @"native-vulkan": vulkan,
 };
 
@@ -60,12 +61,14 @@ pub fn recommendStartupFallback(
 pub const StartupFailure = union(enum) {
     d3d12: d3d12.Renderer.StartupError,
     opengl: gl46.StartupError,
+    vulkan: vulkan.StartupError,
     @"native-vulkan": vulkan.StartupError,
 
     pub fn description(self: StartupFailure) []const u8 {
         return switch (self) {
             .d3d12 => |err| d3d12.Renderer.startupErrorDescription(err),
             .opengl => |err| gl46.startupErrorDescription(err),
+            .vulkan => |err| vulkan.startupErrorDescription(err),
             .@"native-vulkan" => |err| vulkan.startupErrorDescription(err),
         };
     }
@@ -74,24 +77,32 @@ pub const StartupFailure = union(enum) {
         return switch (self) {
             .d3d12 => |err| @errorName(err),
             .opengl => |err| @errorName(err),
+            .vulkan => |err| @errorName(err),
             .@"native-vulkan" => |err| @errorName(err),
         };
     }
 };
 
 pub const RuntimeFailure = union(enum) {
+    vulkan: vulkan.RuntimeFailure,
     @"native-vulkan": vulkan.RuntimeFailure,
 
     pub fn operationDescription(self: RuntimeFailure) []const u8 {
         return switch (self) {
+            .vulkan => |failure| failure.operation.description(),
             .@"native-vulkan" => |failure| failure.operation.description(),
         };
     }
 
     pub fn codeName(self: RuntimeFailure) []const u8 {
         return switch (self) {
+            .vulkan => |failure| @errorName(failure.cause),
             .@"native-vulkan" => |failure| @errorName(failure.cause),
         };
+    }
+
+    pub fn backendName(self: RuntimeFailure) []const u8 {
+        return @tagName(self);
     }
 };
 
@@ -99,7 +110,7 @@ common: RendererCommon,
 font_service: FontService,
 configured_backend: Config.RendererBackend,
 backend: ?RendererBackend,
-native_vulkan_recovery_attempted: bool,
+vulkan_recovery_attempted: bool,
 
 // Initialize in place: the backend borrows `common`, and the async glyph
 // worker later borrows backend state. The process-global renderer provides
@@ -124,7 +135,7 @@ pub fn init(
         configured_gpu,
     );
     self.configured_backend = backend;
-    self.native_vulkan_recovery_attempted = false;
+    self.vulkan_recovery_attempted = false;
     self.backend = switch (backend) {
         .d3d11 => .{ .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu) },
         .d3d12 => null,
@@ -134,6 +145,7 @@ pub fn init(
         .@"pure-opengl" => .{
             .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .pure_wgl),
         },
+        .vulkan => null,
         .@"native-vulkan" => null,
     };
 }
@@ -165,6 +177,13 @@ test "native Vulkan startup failure only offers explicit D3D11" {
     try std.testing.expectEqual(Config.RendererBackend.@"native-vulkan", fallback.configured);
     try std.testing.expectEqual(Config.RendererBackend.d3d11, fallback.selectedBackend(true).?);
     try std.testing.expectEqual(@as(?Config.RendererBackend, null), fallback.selectedBackend(false));
+}
+
+test "Vulkan bridge startup failure never selects native Vulkan" {
+    const fallback = recommendStartupFallback(.vulkan, true).?;
+    try std.testing.expectEqual(Config.RendererBackend.vulkan, fallback.configured);
+    try std.testing.expectEqual(Config.RendererBackend.d3d11, fallback.selectedBackend(true).?);
+    try std.testing.expect(fallback.selectedBackend(true).? != .@"native-vulkan");
 }
 
 test "native Vulkan runtime failure retains operation and cause" {
@@ -211,12 +230,20 @@ pub fn initializeWindow(
                 self.backend = .{ .d3d12 = backend };
             },
             .@"native-vulkan" => {
-                var backend = vulkan.init(&self.common, &self.font_service, configured_gpu);
+                var backend = vulkan.init(&self.common, &self.font_service, configured_gpu, .native_wsi);
                 backend.initializeWindow(hwnd) catch |err| {
                     backend.deinit();
                     return .{ .@"native-vulkan" = err };
                 };
                 self.backend = .{ .@"native-vulkan" = backend };
+            },
+            .vulkan => {
+                var backend = vulkan.init(&self.common, &self.font_service, configured_gpu, .dcomp_bridge);
+                backend.initializeWindow(hwnd) catch |err| {
+                    backend.deinit();
+                    return .{ .vulkan = err };
+                };
+                self.backend = .{ .vulkan = backend };
             },
             else => unreachable,
         }
@@ -237,23 +264,24 @@ pub fn fallbackToD3d11(self: *Renderer, configured_gpu: ?[]const u8) void {
         inline else => |*backend| backend.deinit(),
     };
     self.configured_backend = .d3d11;
-    self.native_vulkan_recovery_attempted = false;
+    self.vulkan_recovery_attempted = false;
     self.backend = .{ .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu) };
 }
 
-pub fn recoverNativeVulkan(self: *Renderer, hwnd: win32.HWND, configured_gpu: ?[]const u8) bool {
-    if (self.native_vulkan_recovery_attempted) return false;
+pub fn recoverVulkan(self: *Renderer, hwnd: win32.HWND, configured_gpu: ?[]const u8) bool {
+    if (self.vulkan_recovery_attempted) return false;
     const active = if (self.backend) |*backend| backend else return false;
     switch (active.*) {
+        .vulkan => |*backend| backend.deinit(),
         .@"native-vulkan" => |*backend| backend.deinit(),
         else => return false,
     }
     self.backend = null;
-    self.native_vulkan_recovery_attempted = true;
+    self.vulkan_recovery_attempted = true;
     if (self.initializeWindow(hwnd, configured_gpu)) |failure| {
         std.log.err(
-            "renderer: native-vulkan runtime recovery failed ({s}): {s}",
-            .{ failure.codeName(), failure.description() },
+            "renderer: {s} runtime recovery failed ({s}): {s}",
+            .{ @tagName(self.configured_backend), failure.codeName(), failure.description() },
         );
         return false;
     }
@@ -316,6 +344,25 @@ pub fn render(
     url_highlight: ?types.UrlHighlight,
 ) ?RuntimeFailure {
     return switch (self.activeBackend().*) {
+        .vulkan => |*backend| blk: {
+            if (backend.render(
+                hwnd,
+                tab_id,
+                term,
+                tabbar,
+                resizing,
+                mouse_in_scrollbar,
+                selection_fade,
+                cursor_text,
+                selection_bg,
+                selection_fg,
+                background_opacity,
+                remote_session,
+                url_highlight,
+            )) |failure| break :blk .{ .vulkan = failure };
+            self.vulkan_recovery_attempted = false;
+            break :blk null;
+        },
         .@"native-vulkan" => |*backend| blk: {
             if (backend.render(
                 hwnd,
@@ -332,7 +379,7 @@ pub fn render(
                 remote_session,
                 url_highlight,
             )) |failure| break :blk .{ .@"native-vulkan" = failure };
-            self.native_vulkan_recovery_attempted = false;
+            self.vulkan_recovery_attempted = false;
             break :blk null;
         },
         inline else => |*backend| blk: {
@@ -360,10 +407,10 @@ pub fn confirmRuntimeFallback(hwnd: win32.HWND, failure: RuntimeFailure) bool {
     var message_buf: [768]u8 = undefined;
     const message = std.fmt.bufPrintZ(
         &message_buf,
-        "The configured renderer (native-vulkan) encountered an unrecoverable runtime failure while {s}.\n\n" ++
+        "The configured renderer ({s}) encountered an unrecoverable runtime failure while {s}.\n\n" ++
             "{s}.\n\nUse D3D11 for this session instead?\n\n" ++
             "Choose Yes to continue with D3D11, or No to exit Mostty.",
-        .{ failure.operationDescription(), failure.codeName() },
+        .{ failure.backendName(), failure.operationDescription(), failure.codeName() },
     ) catch unreachable;
     return win32.MessageBoxA(
         hwnd,

@@ -20,6 +20,7 @@ const gpu = @import("d3d11/gpu.zig");
 const grid = @import("d3d11/grid.zig");
 const kitty_image_mod = @import("d3d11/kitty_images.zig");
 const tabbar_paint = @import("d3d11/tabbar_paint.zig");
+const bridge_mod = @import("vulkan/bridge.zig");
 const core_mod = @import("vulkan/core.zig");
 const shader_assets = @import("shader_assets.zig");
 
@@ -105,7 +106,9 @@ const DebugStats = struct {
 common: *RendererCommon,
 font_service: *FontService,
 configured_gpu: ?[]const u8,
+presentation: core_mod.Presentation,
 core: ?core_mod.Core = null,
+bridge: ?bridge_mod.Bridge = null,
 
 shadow_cells: []shader.Cell = &.{},
 glyph_cache_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
@@ -133,11 +136,17 @@ cells_count: u32 = 0,
 tabbar_image: core_mod.Image = .{},
 tabbar_size: win32.SIZE = .{ .cx = 0, .cy = 0 },
 
-pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu: ?[]const u8) VulkanRenderer {
+pub fn init(
+    common: *RendererCommon,
+    font_service: *FontService,
+    configured_gpu: ?[]const u8,
+    presentation: core_mod.Presentation,
+) VulkanRenderer {
     return .{
         .common = common,
         .font_service = font_service,
         .configured_gpu = configured_gpu,
+        .presentation = presentation,
     };
 }
 
@@ -146,10 +155,20 @@ pub fn initializeWindow(self: *VulkanRenderer, hwnd: win32.HWND) StartupError!vo
     self.core = try core_mod.Core.init(
         hwnd,
         self.configured_gpu,
+        self.presentation,
         shader_assets.vertex.vulkan_spirv,
         shader_assets.pixel.vulkan_spirv,
         shader_assets.image_pixel.vulkan_spirv,
     );
+    if (self.presentation == .dcomp_bridge) {
+        const size = win32.getClientSize(hwnd);
+        self.bridge = try bridge_mod.Bridge.init(
+            &self.core.?,
+            hwnd,
+            @intCast(@max(1, size.cx)),
+            @intCast(@max(1, size.cy)),
+        );
+    }
     const properties = self.core.?.physical_properties;
     self.common.remote_or_software_adapter = properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_CPU or
         properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
@@ -163,6 +182,7 @@ pub fn deinit(self: *VulkanRenderer) void {
         self.tabbar_image.release(core);
         self.atlas.release(core);
         self.releaseGlyphState();
+        if (self.bridge) |*bridge| bridge.deinit(core);
         core.deinit();
     } else {
         self.kitty_images.deinit(std.heap.page_allocator);
@@ -468,6 +488,13 @@ fn prepareTabbar(self: *VulkanRenderer, prepared: PreparedFrame, tabbar: types.T
 }
 
 fn recordAndPresent(self: *VulkanRenderer, hwnd: win32.HWND, prepared: PreparedFrame) !PresentOutcome {
+    return switch (self.presentation) {
+        .dcomp_bridge => self.recordAndPresentBridge(prepared),
+        .native_wsi => self.recordAndPresentNative(hwnd, prepared),
+    };
+}
+
+fn recordAndPresentNative(self: *VulkanRenderer, hwnd: win32.HWND, prepared: PreparedFrame) !PresentOutcome {
     var core = &self.core.?;
     if (core.swapchain_extent.width != prepared.client_w or core.swapchain_extent.height != prepared.client_h) {
         try core.recreateSwapchain(hwnd);
@@ -485,109 +512,23 @@ fn recordAndPresent(self: *VulkanRenderer, hwnd: win32.HWND, prepared: PreparedF
 
     const frame = core.currentFrame();
     var image_index: u32 = 0;
-    var acquire_result = core.dp.acquire_next_image(core.device, core.swapchain, std.math.maxInt(u64), frame.image_acquired, null, &image_index);
+    var acquire_result = core.dp.acquire_next_image.?(core.device, core.swapchain, std.math.maxInt(u64), frame.image_acquired, null, &image_index);
     if (acquire_result == vk.VK_ERROR_OUT_OF_DATE_KHR) {
         try core.recreateSwapchain(hwnd);
-        acquire_result = core.dp.acquire_next_image(core.device, core.swapchain, std.math.maxInt(u64), frame.image_acquired, null, &image_index);
+        acquire_result = core.dp.acquire_next_image.?(core.device, core.swapchain, std.math.maxInt(u64), frame.image_acquired, null, &image_index);
     }
     if (acquire_result != vk.VK_SUCCESS and acquire_result != vk.VK_SUBOPTIMAL_KHR)
         return error.ImageAcquireFailed;
 
-    const begin = vk.VkCommandBufferBeginInfo{
-        .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = null,
-        .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        .pInheritanceInfo = null,
-    };
-    if (core.dp.begin_command_buffer(frame.command_buffer, &begin) != vk.VK_SUCCESS)
-        return error.CommandRecordingFailed;
-
-    core.imageBarrier(
+    try self.recordTarget(
         frame.command_buffer,
         core.swapchain_images[image_index],
-        if (core.swapchain_initialized[image_index]) vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR else vk.VK_IMAGE_LAYOUT_UNDEFINED,
-        vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        if (core.swapchain_initialized[image_index]) vk.VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT else vk.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-        vk.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        0,
-        vk.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        core.swapchain_views[image_index],
+        core.swapchain_extent,
+        core.swapchain_initialized[image_index],
+        false,
+        prepared,
     );
-
-    const clear = vk.VkClearValue{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } };
-    const color_attachment = vk.VkRenderingAttachmentInfo{
-        .sType = vk.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .pNext = null,
-        .imageView = core.swapchain_views[image_index],
-        .imageLayout = vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .resolveMode = vk.VK_RESOLVE_MODE_NONE,
-        .resolveImageView = null,
-        .resolveImageLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
-        .loadOp = vk.VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = vk.VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = clear,
-    };
-    const rendering = vk.VkRenderingInfo{
-        .sType = vk.VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .pNext = null,
-        .flags = 0,
-        .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = core.swapchain_extent },
-        .layerCount = 1,
-        .viewMask = 0,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &color_attachment,
-        .pDepthAttachment = null,
-        .pStencilAttachment = null,
-    };
-    core.dp.cmd_begin_rendering(frame.command_buffer, &rendering);
-
-    try self.drawGrid(frame.command_buffer, prepared);
-    for (self.kitty_images.placements.items) |placement| {
-        if (placement.z < 0) continue;
-        const entry = self.kitty_images.images.get(.{
-            .tab_id = self.kitty_images.last_tab_id,
-            .image_id = placement.image_id,
-        }) orelse continue;
-        const config: kitty_image_mod.ImageConfig = .{
-            .dest = .{
-                @floatFromInt(@as(i64, placement.x) * prepared.cs.x + placement.cell_offset_x),
-                @floatFromInt(@as(i64, placement.y) * prepared.cs.y + placement.cell_offset_y),
-                @floatFromInt(placement.width),
-                @floatFromInt(placement.height),
-            },
-            .source = .{
-                @floatFromInt(placement.source_x),
-                @floatFromInt(placement.source_y),
-                @floatFromInt(placement.source_width),
-                @floatFromInt(placement.source_height),
-            },
-            .image_size = .{ @floatFromInt(entry.width), @floatFromInt(entry.height) },
-            .tab_bar_height = @floatFromInt(prepared.tab_bar_h),
-        };
-        try self.drawImage(frame.command_buffer, &config, entry.image.image.view, prepared.client_w, prepared.client_h);
-    }
-    if (prepared.tab_bar_h != 0) {
-        const config: kitty_image_mod.ImageConfig = .{
-            .dest = .{ 0, 0, @floatFromInt(prepared.client_w), @floatFromInt(prepared.tab_bar_h) },
-            .source = .{ 0, 0, @floatFromInt(prepared.client_w), @floatFromInt(prepared.tab_bar_h) },
-            .image_size = .{ @floatFromInt(prepared.client_w), @floatFromInt(prepared.tab_bar_h) },
-            .tab_bar_height = 0,
-        };
-        try self.drawImage(frame.command_buffer, &config, self.tabbar_image.view, prepared.client_w, prepared.client_h);
-    }
-
-    core.dp.cmd_end_rendering(frame.command_buffer);
-    core.imageBarrier(
-        frame.command_buffer,
-        core.swapchain_images[image_index],
-        vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        vk.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        vk.VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
-        vk.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        0,
-    );
-    if (core.dp.end_command_buffer(frame.command_buffer) != vk.VK_SUCCESS)
-        return error.CommandRecordingFailed;
 
     core.timeline_value += 1;
     const wait = vk.VkSemaphoreSubmitInfo{
@@ -640,7 +581,7 @@ fn recordAndPresent(self: *VulkanRenderer, hwnd: win32.HWND, prepared: PreparedF
         .pImageIndices = &image_index,
         .pResults = null,
     };
-    const result = core.dp.queue_present(core.queue, &present);
+    const result = core.dp.queue_present.?(core.queue, &present);
     if (result == vk.VK_ERROR_OUT_OF_DATE_KHR or result == vk.VK_SUBOPTIMAL_KHR) {
         try core.recreateSwapchain(hwnd);
         return .swapchain_recreated;
@@ -651,6 +592,179 @@ fn recordAndPresent(self: *VulkanRenderer, hwnd: win32.HWND, prepared: PreparedF
         core.swapchain_initialized[image_index] = true;
     }
     return .presented;
+}
+
+fn recordAndPresentBridge(self: *VulkanRenderer, prepared: PreparedFrame) !PresentOutcome {
+    var core = &self.core.?;
+    var bridge = &self.bridge.?;
+    const resized = try bridge.ensureSize(core, prepared.client_w, prepared.client_h);
+    if (resized) self.grid_force_full = true;
+
+    const frame = core.currentFrame();
+    const shared_frame = bridge.frame(core.frame_cursor);
+    try self.recordTarget(
+        frame.command_buffer,
+        shared_frame.image.handle,
+        shared_frame.image.view,
+        .{ .width = prepared.client_w, .height = prepared.client_h },
+        shared_frame.initialized,
+        true,
+        prepared,
+    );
+
+    const exchange = bridge.beginExchange();
+    core.timeline_value += 1;
+    const external_wait = vk.VkSemaphoreSubmitInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = null,
+        .semaphore = bridge.semaphore,
+        .value = exchange.wait_value,
+        .stageMask = vk.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .deviceIndex = 0,
+    };
+    const signals = [_]vk.VkSemaphoreSubmitInfo{
+        .{ .sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .pNext = null, .semaphore = bridge.semaphore, .value = exchange.ready_value, .stageMask = vk.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .deviceIndex = 0 },
+        .{ .sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .pNext = null, .semaphore = core.timeline, .value = core.timeline_value, .stageMask = vk.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .deviceIndex = 0 },
+    };
+    const command = vk.VkCommandBufferSubmitInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .pNext = null,
+        .commandBuffer = frame.command_buffer,
+        .deviceMask = 0,
+    };
+    const submit = vk.VkSubmitInfo2{
+        .sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .pNext = null,
+        .flags = 0,
+        .waitSemaphoreInfoCount = if (exchange.wait_value == 0) 0 else 1,
+        .pWaitSemaphoreInfos = if (exchange.wait_value == 0) null else &external_wait,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &command,
+        .signalSemaphoreInfoCount = signals.len,
+        .pSignalSemaphoreInfos = &signals,
+    };
+    if (core.dp.queue_submit2(core.queue, 1, &submit, null) != vk.VK_SUCCESS)
+        return error.QueueSubmitFailed;
+    frame.completion_value = core.timeline_value;
+    shared_frame.initialized = true;
+    try bridge.present(shared_frame.view.?, exchange);
+    return if (resized) .swapchain_recreated else .presented;
+}
+
+fn recordTarget(
+    self: *VulkanRenderer,
+    command: vk.VkCommandBuffer,
+    image: vk.VkImage,
+    view: vk.VkImageView,
+    extent: vk.VkExtent2D,
+    initialized: bool,
+    external: bool,
+    prepared: PreparedFrame,
+) !void {
+    var core = &self.core.?;
+    const begin = vk.VkCommandBufferBeginInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = null,
+        .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = null,
+    };
+    if (core.dp.begin_command_buffer(command, &begin) != vk.VK_SUCCESS)
+        return error.CommandRecordingFailed;
+
+    if (external) {
+        core.acquireExternalImage(command, image, initialized);
+    } else {
+        core.imageBarrier(
+            command,
+            image,
+            if (initialized) vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR else vk.VK_IMAGE_LAYOUT_UNDEFINED,
+            vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            if (initialized) vk.VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT else vk.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            vk.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0,
+            vk.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        );
+    }
+
+    const clear = vk.VkClearValue{ .color = .{ .float32 = .{ 0, 0, 0, 0 } } };
+    const color_attachment = vk.VkRenderingAttachmentInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .pNext = null,
+        .imageView = view,
+        .imageLayout = vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .resolveMode = vk.VK_RESOLVE_MODE_NONE,
+        .resolveImageView = null,
+        .resolveImageLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
+        .loadOp = vk.VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = vk.VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = clear,
+    };
+    const rendering = vk.VkRenderingInfo{
+        .sType = vk.VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .pNext = null,
+        .flags = 0,
+        .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
+        .layerCount = 1,
+        .viewMask = 0,
+        .colorAttachmentCount = 1,
+        .pColorAttachments = &color_attachment,
+        .pDepthAttachment = null,
+        .pStencilAttachment = null,
+    };
+    core.dp.cmd_begin_rendering(command, &rendering);
+
+    try self.drawGrid(command, prepared);
+    for (self.kitty_images.placements.items) |placement| {
+        if (placement.z < 0) continue;
+        const entry = self.kitty_images.images.get(.{
+            .tab_id = self.kitty_images.last_tab_id,
+            .image_id = placement.image_id,
+        }) orelse continue;
+        const config: kitty_image_mod.ImageConfig = .{
+            .dest = .{
+                @floatFromInt(@as(i64, placement.x) * prepared.cs.x + placement.cell_offset_x),
+                @floatFromInt(@as(i64, placement.y) * prepared.cs.y + placement.cell_offset_y),
+                @floatFromInt(placement.width),
+                @floatFromInt(placement.height),
+            },
+            .source = .{
+                @floatFromInt(placement.source_x),
+                @floatFromInt(placement.source_y),
+                @floatFromInt(placement.source_width),
+                @floatFromInt(placement.source_height),
+            },
+            .image_size = .{ @floatFromInt(entry.width), @floatFromInt(entry.height) },
+            .tab_bar_height = @floatFromInt(prepared.tab_bar_h),
+        };
+        try self.drawImage(command, &config, entry.image.image.view, prepared.client_w, prepared.client_h);
+    }
+    if (prepared.tab_bar_h != 0) {
+        const config: kitty_image_mod.ImageConfig = .{
+            .dest = .{ 0, 0, @floatFromInt(prepared.client_w), @floatFromInt(prepared.tab_bar_h) },
+            .source = .{ 0, 0, @floatFromInt(prepared.client_w), @floatFromInt(prepared.tab_bar_h) },
+            .image_size = .{ @floatFromInt(prepared.client_w), @floatFromInt(prepared.tab_bar_h) },
+            .tab_bar_height = 0,
+        };
+        try self.drawImage(command, &config, self.tabbar_image.view, prepared.client_w, prepared.client_h);
+    }
+
+    core.dp.cmd_end_rendering(command);
+    if (external) {
+        core.releaseExternalImage(command, image);
+    } else {
+        core.imageBarrier(
+            command,
+            image,
+            vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            vk.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            vk.VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+            vk.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            0,
+        );
+    }
+    if (core.dp.end_command_buffer(command) != vk.VK_SUCCESS)
+        return error.CommandRecordingFailed;
 }
 
 fn drawGrid(self: *VulkanRenderer, command: vk.VkCommandBuffer, prepared: PreparedFrame) !void {
@@ -802,7 +916,7 @@ pub fn releaseKittyImagesForTab(self: *VulkanRenderer, tab_id: types.TabId) void
 }
 
 fn fatal(what: []const u8, err: anyerror) noreturn {
-    std.debug.panic("renderer = native-vulkan: {s} failed ({s})", .{ what, @errorName(err) });
+    std.debug.panic("Vulkan renderer: {s} failed ({s})", .{ what, @errorName(err) });
 }
 
 test "native Vulkan uses the shared shader and CPU glyph contracts" {

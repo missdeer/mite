@@ -11,6 +11,11 @@ pub const max_swapchain_images = 8;
 pub const uniform_bytes = 1024 * 1024;
 pub const max_descriptor_sets = 2048;
 
+pub const Presentation = enum {
+    dcomp_bridge,
+    native_wsi,
+};
+
 pub const StartupError = error{
     VulkanLoaderUnavailable,
     LoaderProcedureUnavailable,
@@ -21,6 +26,12 @@ pub const StartupError = error{
     GraphicsPresentQueueUnavailable,
     RequiredDeviceExtensionUnavailable,
     RequiredFeatureUnavailable,
+    ExternalMemoryUnavailable,
+    ExternalSemaphoreUnavailable,
+    AdapterIdentityUnavailable,
+    D3dDeviceUnavailable,
+    CompositionUnavailable,
+    BridgeSurfaceUnavailable,
     DeviceUnavailable,
     DeviceProcedureUnavailable,
     SwapchainCapabilitiesUnavailable,
@@ -46,6 +57,12 @@ pub fn startupErrorDescription(err: StartupError) []const u8 {
         error.GraphicsPresentQueueUnavailable => "no queue family supports both graphics and Win32 presentation",
         error.RequiredDeviceExtensionUnavailable => "the selected device does not support Vulkan swapchains",
         error.RequiredFeatureUnavailable => "the selected device lacks timeline semaphore, synchronization2, or dynamic rendering support",
+        error.ExternalMemoryUnavailable => "the selected device cannot import Direct3D 11 textures into Vulkan",
+        error.ExternalSemaphoreUnavailable => "the selected device cannot share timeline synchronization with Direct3D",
+        error.AdapterIdentityUnavailable => "the Vulkan device does not expose a Windows adapter identity",
+        error.D3dDeviceUnavailable => "Direct3D 11 is unavailable on the selected Vulkan adapter",
+        error.CompositionUnavailable => "DirectComposition could not attach the Vulkan bridge to the window",
+        error.BridgeSurfaceUnavailable => "the Vulkan DirectComposition bridge surface is unavailable",
         error.DeviceUnavailable => "the Vulkan logical device could not be created",
         error.DeviceProcedureUnavailable => "the Vulkan device is missing a required procedure",
         error.SwapchainCapabilitiesUnavailable => "the Win32 surface capabilities could not be queried",
@@ -176,6 +193,7 @@ pub const Frame = struct {
 };
 
 pub const Core = struct {
+    presentation: Presentation,
     global: loader.Global,
     instance: vk.VkInstance,
     ip: loader.Instance,
@@ -214,6 +232,7 @@ pub const Core = struct {
     pub fn init(
         hwnd: win32.HWND,
         configured_gpu: ?[]const u8,
+        presentation: Presentation,
         vertex_spirv: []align(4) const u8,
         pixel_spirv: []align(4) const u8,
         image_pixel_spirv: []align(4) const u8,
@@ -234,7 +253,12 @@ pub const Core = struct {
             .engineVersion = 0,
             .apiVersion = apiVersion(1, 3, 0),
         };
-        const instance_extensions = [_][*:0]const u8{ "VK_KHR_surface", "VK_KHR_win32_surface" };
+        var instance_extensions: [2][*:0]const u8 = undefined;
+        const instance_extension_count: u32 = if (presentation == .native_wsi) blk: {
+            instance_extensions[0] = "VK_KHR_surface";
+            instance_extensions[1] = "VK_KHR_win32_surface";
+            break :blk 2;
+        } else 0;
         const instance_info = vk.VkInstanceCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             .pNext = null,
@@ -242,8 +266,8 @@ pub const Core = struct {
             .pApplicationInfo = &app_info,
             .enabledLayerCount = 0,
             .ppEnabledLayerNames = null,
-            .enabledExtensionCount = instance_extensions.len,
-            .ppEnabledExtensionNames = &instance_extensions,
+            .enabledExtensionCount = instance_extension_count,
+            .ppEnabledExtensionNames = if (instance_extension_count != 0) &instance_extensions else null,
         };
         var instance: vk.VkInstance = null;
         if (global.create_instance(&instance_info, null, &instance) != vk.VK_SUCCESS)
@@ -252,20 +276,24 @@ pub const Core = struct {
         var instance_owned = true;
         errdefer if (instance_owned) ip.destroy_instance(instance, null);
 
-        const surface_info = vk.VkWin32SurfaceCreateInfoKHR{
-            .sType = vk.VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-            .pNext = null,
-            .flags = 0,
-            .hinstance = cHandleFromInt(vk.HINSTANCE, @intFromPtr(win32.GetModuleHandleW(null))),
-            .hwnd = cHandleFromInt(vk.HWND, @intFromPtr(hwnd)),
-        };
         var surface: vk.VkSurfaceKHR = null;
-        if (ip.create_win32_surface(instance, &surface_info, null, &surface) != vk.VK_SUCCESS)
-            return error.SurfaceUnavailable;
-        var surface_owned = true;
-        errdefer if (surface_owned) ip.destroy_surface(instance, surface, null);
+        var surface_owned = false;
+        if (presentation == .native_wsi) {
+            const surface_info = vk.VkWin32SurfaceCreateInfoKHR{
+                .sType = vk.VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                .pNext = null,
+                .flags = 0,
+                .hinstance = cHandleFromInt(vk.HINSTANCE, @intFromPtr(win32.GetModuleHandleW(null))),
+                .hwnd = cHandleFromInt(vk.HWND, @intFromPtr(hwnd)),
+            };
+            const create_surface = ip.create_win32_surface orelse return error.LoaderProcedureUnavailable;
+            if (create_surface(instance, &surface_info, null, &surface) != vk.VK_SUCCESS)
+                return error.SurfaceUnavailable;
+            surface_owned = true;
+        }
+        errdefer if (surface_owned) ip.destroy_surface.?(instance, surface, null);
 
-        const selection = try selectPhysicalDevice(&ip, instance, surface, configured_gpu);
+        const selection = try selectPhysicalDevice(&ip, instance, presentation, surface, configured_gpu);
         const physical_device = selection.device;
         const queue_family = selection.queue_family;
         var present_wait_enabled = selection.present_wait;
@@ -337,16 +365,23 @@ pub const Core = struct {
             .pQueuePriorities = &priority,
         };
         var extension_names: [3][*:0]const u8 = undefined;
-        extension_names[0] = "VK_KHR_swapchain";
-        var extension_count: u32 = 1;
-        if (present_wait_enabled) {
-            extension_names[1] = "VK_KHR_present_id";
-            extension_names[2] = "VK_KHR_present_wait";
-            extension_count = 3;
+        var extension_count: u32 = 0;
+        if (presentation == .native_wsi) {
+            extension_names[0] = "VK_KHR_swapchain";
+            extension_count = 1;
+            if (present_wait_enabled) {
+                extension_names[1] = "VK_KHR_present_id";
+                extension_names[2] = "VK_KHR_present_wait";
+                extension_count = 3;
+            }
+        } else {
+            extension_names[0] = "VK_KHR_external_memory_win32";
+            extension_names[1] = "VK_KHR_external_semaphore_win32";
+            extension_count = 2;
         }
         const device_info = vk.VkDeviceCreateInfo{
             .sType = vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-            .pNext = if (present_wait_enabled) &present_id_features else &features12,
+            .pNext = if (presentation == .native_wsi and present_wait_enabled) &present_id_features else &features12,
             .flags = 0,
             .queueCreateInfoCount = 1,
             .pQueueCreateInfos = &queue_info,
@@ -371,6 +406,7 @@ pub const Core = struct {
         ip.get_physical_device_memory_properties(physical_device, &memory_properties);
 
         var core: Core = undefined;
+        core.presentation = presentation;
         core.global = global;
         core.instance = instance;
         core.ip = ip;
@@ -391,7 +427,7 @@ pub const Core = struct {
         core.grid_pipeline = null;
         core.image_pipeline = null;
         core.swapchain = null;
-        core.swapchain_format = vk.VK_FORMAT_UNDEFINED;
+        core.swapchain_format = if (presentation == .dcomp_bridge) vk.VK_FORMAT_B8G8R8A8_UNORM else vk.VK_FORMAT_UNDEFINED;
         core.swapchain_extent = .{ .width = 0, .height = 0 };
         core.swapchain_images = @splat(null);
         core.swapchain_views = @splat(null);
@@ -417,7 +453,7 @@ pub const Core = struct {
 
         try core.createSynchronization();
         try core.createDescriptorContract();
-        try core.createSwapchain(hwnd, null);
+        if (presentation == .native_wsi) try core.createSwapchain(hwnd, null);
         try core.createPipelines(vertex_spirv, pixel_spirv, image_pixel_spirv);
         for (&core.frames) |*frame| {
             frame.* = try Frame.init(&core);
@@ -429,10 +465,14 @@ pub const Core = struct {
             return error.ResourceUnavailable;
 
         const name = std.mem.sliceTo(&physical_properties.deviceName, 0);
-        log.info(
-            "native Vulkan device active: {s}; present tier={s}; alpha composition enabled",
-            .{ name, @tagName(core.present_tier) },
-        );
+        if (presentation == .native_wsi) {
+            log.info(
+                "native Vulkan device active: {s}; present tier={s}; alpha composition enabled",
+                .{ name, @tagName(core.present_tier) },
+            );
+        } else {
+            log.info("Vulkan DirectComposition bridge device active: {s}", .{name});
+        }
         return core;
     }
 
@@ -446,7 +486,7 @@ pub const Core = struct {
         if (self.sampler != null) self.dp.destroy_sampler(self.device, self.sampler, null);
         if (self.timeline != null) self.dp.destroy_semaphore(self.device, self.timeline, null);
         if (self.device != null) self.dp.destroy_device(self.device, null);
-        if (self.surface != null) self.ip.destroy_surface(self.instance, self.surface, null);
+        if (self.surface != null) self.ip.destroy_surface.?(self.instance, self.surface, null);
         if (self.instance != null) self.ip.destroy_instance(self.instance, null);
         self.global.deinit();
     }
@@ -472,6 +512,145 @@ pub const Core = struct {
         };
         if (self.dp.create_semaphore(self.device, &info, null, &self.timeline) != vk.VK_SUCCESS)
             return error.SynchronizationUnavailable;
+    }
+
+    pub fn deviceLuid(self: *const Core) StartupError!win32.LUID {
+        var id = std.mem.zeroes(vk.VkPhysicalDeviceIDProperties);
+        id.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+        var properties = std.mem.zeroes(vk.VkPhysicalDeviceProperties2);
+        properties.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        properties.pNext = &id;
+        self.ip.get_physical_device_properties2(self.physical_device, &properties);
+        if (id.deviceLUIDValid == vk.VK_FALSE) return error.AdapterIdentityUnavailable;
+        const raw: u64 = @bitCast(id.deviceLUID);
+        return .{
+            .LowPart = @truncate(raw),
+            .HighPart = @bitCast(@as(u32, @truncate(raw >> 32))),
+        };
+    }
+
+    pub fn importExternalTimeline(self: *Core, handle: win32.HANDLE) StartupError!vk.VkSemaphore {
+        var type_info = std.mem.zeroes(vk.VkSemaphoreTypeCreateInfo);
+        type_info.sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+        type_info.semaphoreType = vk.VK_SEMAPHORE_TYPE_TIMELINE;
+        var info = std.mem.zeroes(vk.VkSemaphoreCreateInfo);
+        info.sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        info.pNext = &type_info;
+        var semaphore: vk.VkSemaphore = null;
+        if (self.dp.create_semaphore(self.device, &info, null, &semaphore) != vk.VK_SUCCESS)
+            return error.ExternalSemaphoreUnavailable;
+        errdefer self.dp.destroy_semaphore(self.device, semaphore, null);
+        const import_handle = self.dp.import_semaphore_win32_handle orelse
+            return error.ExternalSemaphoreUnavailable;
+        var import_info = std.mem.zeroes(vk.VkImportSemaphoreWin32HandleInfoKHR);
+        import_info.sType = vk.VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR;
+        import_info.semaphore = semaphore;
+        import_info.handleType = vk.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+        import_info.handle = @ptrCast(handle);
+        if (import_handle(self.device, &import_info) != vk.VK_SUCCESS)
+            return error.ExternalSemaphoreUnavailable;
+        return semaphore;
+    }
+
+    pub fn importD3d11Texture(
+        self: *Core,
+        handle: win32.HANDLE,
+        width: u32,
+        height: u32,
+    ) StartupError!Image {
+        const get_properties = self.dp.get_memory_win32_handle_properties orelse
+            return error.ExternalMemoryUnavailable;
+        var external_info = std.mem.zeroes(vk.VkExternalMemoryImageCreateInfo);
+        external_info.sType = vk.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        external_info.handleTypes = vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+        const image_info = vk.VkImageCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = &external_info,
+            .flags = 0,
+            .imageType = vk.VK_IMAGE_TYPE_2D,
+            .format = vk.VK_FORMAT_B8G8R8A8_UNORM,
+            .extent = .{ .width = width, .height = height, .depth = 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk.VK_SAMPLE_COUNT_1_BIT,
+            .tiling = vk.VK_IMAGE_TILING_OPTIMAL,
+            .usage = vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+            .sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = null,
+            .initialLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        var image: Image = .{ .format = vk.VK_FORMAT_B8G8R8A8_UNORM, .width = width, .height = height };
+        errdefer image.release(self);
+        if (self.dp.create_image(self.device, &image_info, null, &image.handle) != vk.VK_SUCCESS)
+            return error.ExternalMemoryUnavailable;
+
+        var requirements: vk.VkMemoryRequirements = undefined;
+        self.dp.get_image_memory_requirements(self.device, image.handle, &requirements);
+        var handle_properties = std.mem.zeroes(vk.VkMemoryWin32HandlePropertiesKHR);
+        handle_properties.sType = vk.VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR;
+        const vk_handle: vk.HANDLE = @ptrCast(handle);
+        if (get_properties(
+            self.device,
+            vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+            vk_handle,
+            &handle_properties,
+        ) != vk.VK_SUCCESS) return error.ExternalMemoryUnavailable;
+        const memory_type = self.findMemoryType(
+            requirements.memoryTypeBits & handle_properties.memoryTypeBits,
+            0,
+        ) orelse return error.MemoryTypeUnavailable;
+
+        var dedicated = std.mem.zeroes(vk.VkMemoryDedicatedAllocateInfo);
+        dedicated.sType = vk.VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+        dedicated.image = image.handle;
+        var import_info = std.mem.zeroes(vk.VkImportMemoryWin32HandleInfoKHR);
+        import_info.sType = vk.VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
+        import_info.pNext = &dedicated;
+        import_info.handleType = vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+        import_info.handle = vk_handle;
+        const allocation = vk.VkMemoryAllocateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = &import_info,
+            .allocationSize = requirements.size,
+            .memoryTypeIndex = memory_type,
+        };
+        if (self.dp.allocate_memory(self.device, &allocation, null, &image.memory) != vk.VK_SUCCESS or
+            self.dp.bind_image_memory(self.device, image.handle, image.memory, 0) != vk.VK_SUCCESS)
+            return error.ExternalMemoryUnavailable;
+
+        const view_info = vk.VkImageViewCreateInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = null,
+            .flags = 0,
+            .image = image.handle,
+            .viewType = vk.VK_IMAGE_VIEW_TYPE_2D,
+            .format = image.format,
+            .components = .{
+                .r = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+                .g = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+                .b = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+                .a = vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+            },
+            .subresourceRange = colorRange(),
+        };
+        if (self.dp.create_image_view(self.device, &view_info, null, &image.view) != vk.VK_SUCCESS)
+            return error.ExternalMemoryUnavailable;
+        return image;
+    }
+
+    pub fn waitTimeline(self: *Core, semaphore: vk.VkSemaphore, value: u64) StartupError!void {
+        if (value == 0) return;
+        const info = vk.VkSemaphoreWaitInfo{
+            .sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .pNext = null,
+            .flags = 0,
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore,
+            .pValues = &value,
+        };
+        if (self.dp.wait_semaphores(self.device, &info, 10_000_000_000) != vk.VK_SUCCESS)
+            return error.ExternalSemaphoreUnavailable;
     }
 
     fn createDescriptorContract(self: *Core) StartupError!void {
@@ -682,7 +861,7 @@ pub const Core = struct {
     pub fn recreateSwapchain(self: *Core, hwnd: win32.HWND) StartupError!void {
         _ = self.dp.device_wait_idle(self.device);
         const old = self.swapchain;
-        defer if (old != null) self.dp.destroy_swapchain(self.device, old, null);
+        defer if (old != null) self.dp.destroy_swapchain.?(self.device, old, null);
         self.destroySwapchainViews();
         self.swapchain = null;
         try self.createSwapchain(hwnd, old);
@@ -690,7 +869,7 @@ pub const Core = struct {
 
     fn createSwapchain(self: *Core, hwnd: win32.HWND, old: vk.VkSwapchainKHR) StartupError!void {
         var capabilities: vk.VkSurfaceCapabilitiesKHR = undefined;
-        if (self.ip.get_surface_capabilities(self.physical_device, self.surface, &capabilities) != vk.VK_SUCCESS)
+        if (self.ip.get_surface_capabilities.?(self.physical_device, self.surface, &capabilities) != vk.VK_SUCCESS)
             return error.SwapchainCapabilitiesUnavailable;
         const size = win32.getClientSize(hwnd);
         if (size.cx <= 0 or size.cy <= 0) return error.SwapchainUnavailable;
@@ -704,11 +883,11 @@ pub const Core = struct {
             std.math.clamp(@as(u32, @intCast(size.cy)), capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
 
         var format_count: u32 = 0;
-        if (self.ip.get_surface_formats(self.physical_device, self.surface, &format_count, null) != vk.VK_SUCCESS or format_count == 0)
+        if (self.ip.get_surface_formats.?(self.physical_device, self.surface, &format_count, null) != vk.VK_SUCCESS or format_count == 0)
             return error.SwapchainFormatUnavailable;
         var formats: [32]vk.VkSurfaceFormatKHR = undefined;
         format_count = @min(format_count, formats.len);
-        if (self.ip.get_surface_formats(self.physical_device, self.surface, &format_count, &formats) != vk.VK_SUCCESS)
+        if (self.ip.get_surface_formats.?(self.physical_device, self.surface, &format_count, &formats) != vk.VK_SUCCESS)
             return error.SwapchainFormatUnavailable;
         var chosen: ?vk.VkSurfaceFormatKHR = null;
         for (formats[0..format_count]) |format| {
@@ -722,11 +901,11 @@ pub const Core = struct {
         const surface_format = chosen orelse return error.SwapchainFormatUnavailable;
 
         var mode_count: u32 = 0;
-        if (self.ip.get_surface_present_modes(self.physical_device, self.surface, &mode_count, null) != vk.VK_SUCCESS)
+        if (self.ip.get_surface_present_modes.?(self.physical_device, self.surface, &mode_count, null) != vk.VK_SUCCESS)
             return error.SwapchainCapabilitiesUnavailable;
         var modes: [16]vk.VkPresentModeKHR = undefined;
         mode_count = @min(mode_count, modes.len);
-        if (self.ip.get_surface_present_modes(self.physical_device, self.surface, &mode_count, &modes) != vk.VK_SUCCESS)
+        if (self.ip.get_surface_present_modes.?(self.physical_device, self.surface, &mode_count, &modes) != vk.VK_SUCCESS)
             return error.SwapchainCapabilitiesUnavailable;
         var has_mailbox = false;
         for (modes[0..mode_count]) |mode| if (mode == vk.VK_PRESENT_MODE_MAILBOX_KHR) {
@@ -765,16 +944,16 @@ pub const Core = struct {
             .oldSwapchain = old,
         };
         var swapchain: vk.VkSwapchainKHR = null;
-        if (self.dp.create_swapchain(self.device, &info, null, &swapchain) != vk.VK_SUCCESS)
+        if (self.dp.create_swapchain.?(self.device, &info, null, &swapchain) != vk.VK_SUCCESS)
             return error.SwapchainUnavailable;
-        errdefer self.dp.destroy_swapchain(self.device, swapchain, null);
+        errdefer self.dp.destroy_swapchain.?(self.device, swapchain, null);
         var images: [max_swapchain_images]vk.VkImage = @splat(null);
         var views: [max_swapchain_images]vk.VkImageView = @splat(null);
         errdefer for (views) |view| {
             if (view != null) self.dp.destroy_image_view(self.device, view, null);
         };
         var actual_count: u32 = max_swapchain_images;
-        if (self.dp.get_swapchain_images(self.device, swapchain, &actual_count, &images) != vk.VK_SUCCESS or actual_count == 0)
+        if (self.dp.get_swapchain_images.?(self.device, swapchain, &actual_count, &images) != vk.VK_SUCCESS or actual_count == 0)
             return error.SwapchainUnavailable;
         for (images[0..actual_count], views[0..actual_count]) |image, *view| {
             const view_info = vk.VkImageViewCreateInfo{
@@ -817,7 +996,7 @@ pub const Core = struct {
 
     fn destroySwapchain(self: *Core) void {
         self.destroySwapchainViews();
-        if (self.swapchain != null) self.dp.destroy_swapchain(self.device, self.swapchain, null);
+        if (self.swapchain != null) self.dp.destroy_swapchain.?(self.device, self.swapchain, null);
         self.swapchain = null;
     }
 
@@ -1098,6 +1277,63 @@ pub const Core = struct {
         source_access: vk.VkAccessFlags2,
         destination_access: vk.VkAccessFlags2,
     ) void {
+        self.imageBarrierQueues(
+            command,
+            image,
+            old_layout,
+            new_layout,
+            source_stage,
+            destination_stage,
+            source_access,
+            destination_access,
+            vk.VK_QUEUE_FAMILY_IGNORED,
+            vk.VK_QUEUE_FAMILY_IGNORED,
+        );
+    }
+
+    pub fn acquireExternalImage(self: *Core, command: vk.VkCommandBuffer, image: vk.VkImage, initialized: bool) void {
+        self.imageBarrierQueues(
+            command,
+            image,
+            if (initialized) vk.VK_IMAGE_LAYOUT_GENERAL else vk.VK_IMAGE_LAYOUT_UNDEFINED,
+            vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            vk.VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            vk.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0,
+            vk.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            if (initialized) vk.VK_QUEUE_FAMILY_EXTERNAL else vk.VK_QUEUE_FAMILY_IGNORED,
+            if (initialized) self.queue_family else vk.VK_QUEUE_FAMILY_IGNORED,
+        );
+    }
+
+    pub fn releaseExternalImage(self: *Core, command: vk.VkCommandBuffer, image: vk.VkImage) void {
+        self.imageBarrierQueues(
+            command,
+            image,
+            vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            vk.VK_IMAGE_LAYOUT_GENERAL,
+            vk.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            vk.VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+            vk.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            0,
+            self.queue_family,
+            vk.VK_QUEUE_FAMILY_EXTERNAL,
+        );
+    }
+
+    fn imageBarrierQueues(
+        self: *Core,
+        command: vk.VkCommandBuffer,
+        image: vk.VkImage,
+        old_layout: vk.VkImageLayout,
+        new_layout: vk.VkImageLayout,
+        source_stage: vk.VkPipelineStageFlags2,
+        destination_stage: vk.VkPipelineStageFlags2,
+        source_access: vk.VkAccessFlags2,
+        destination_access: vk.VkAccessFlags2,
+        source_queue: u32,
+        destination_queue: u32,
+    ) void {
         const barrier = vk.VkImageMemoryBarrier2{
             .sType = vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
             .pNext = null,
@@ -1107,8 +1343,8 @@ pub const Core = struct {
             .dstAccessMask = destination_access,
             .oldLayout = old_layout,
             .newLayout = new_layout,
-            .srcQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = vk.VK_QUEUE_FAMILY_IGNORED,
+            .srcQueueFamilyIndex = source_queue,
+            .dstQueueFamilyIndex = destination_queue,
             .image = image,
             .subresourceRange = colorRange(),
         };
@@ -1145,6 +1381,7 @@ const Selection = struct {
 fn selectPhysicalDevice(
     ip: *const loader.Instance,
     instance: vk.VkInstance,
+    presentation: Presentation,
     surface: vk.VkSurfaceKHR,
     configured_gpu: ?[]const u8,
 ) StartupError!Selection {
@@ -1167,10 +1404,30 @@ fn selectPhysicalDevice(
             if (std.mem.indexOf(u8, name, wanted) == null) continue;
             override_seen = true;
         }
-        if (!hasExtension(ip, device, "VK_KHR_swapchain")) continue;
-        const queue_family = findGraphicsPresentQueue(ip, device, surface) orelse continue;
-        if (configured_gpu == null and !supportsRequiredFeatures(ip, device)) continue;
-        const present_wait = hasExtension(ip, device, "VK_KHR_present_id") and
+        if (!supportsRequiredFeatures(ip, device)) continue;
+        const queue_family = switch (presentation) {
+            .native_wsi => blk: {
+                if (!hasExtension(ip, device, "VK_KHR_swapchain")) continue;
+                break :blk findGraphicsPresentQueue(ip, device, surface) orelse continue;
+            },
+            .dcomp_bridge => blk: {
+                if (!hasExtension(ip, device, "VK_KHR_external_memory_win32")) {
+                    log.warn("Vulkan DComp candidate '{s}' lacks VK_KHR_external_memory_win32", .{name});
+                    continue;
+                }
+                if (!hasExtension(ip, device, "VK_KHR_external_semaphore_win32")) {
+                    log.warn("Vulkan DComp candidate '{s}' lacks VK_KHR_external_semaphore_win32", .{name});
+                    continue;
+                }
+                if (!supportsExternalInterop(ip, device)) {
+                    log.warn("Vulkan DComp candidate '{s}' lacks required D3D11 texture or fence interop", .{name});
+                    continue;
+                }
+                break :blk findGraphicsQueue(ip, device) orelse continue;
+            },
+        };
+        const present_wait = presentation == .native_wsi and
+            hasExtension(ip, device, "VK_KHR_present_id") and
             hasExtension(ip, device, "VK_KHR_present_wait");
         const score: i32 = switch (properties.deviceType) {
             vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => 3,
@@ -1215,18 +1472,73 @@ fn findGraphicsPresentQueue(ip: *const loader.Instance, device: vk.VkPhysicalDev
     for (properties[0..count], 0..) |property, index| {
         if (property.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT == 0) continue;
         var supported: vk.VkBool32 = vk.VK_FALSE;
-        if (ip.get_surface_support(device, @intCast(index), surface, &supported) == vk.VK_SUCCESS and supported == vk.VK_TRUE)
+        if (ip.get_surface_support.?(device, @intCast(index), surface, &supported) == vk.VK_SUCCESS and supported == vk.VK_TRUE)
             return @intCast(index);
     }
     return null;
 }
 
+fn findGraphicsQueue(ip: *const loader.Instance, device: vk.VkPhysicalDevice) ?u32 {
+    var count: u32 = 0;
+    ip.get_physical_device_queue_family_properties(device, &count, null);
+    var properties: [32]vk.VkQueueFamilyProperties = undefined;
+    count = @min(count, properties.len);
+    ip.get_physical_device_queue_family_properties(device, &count, &properties);
+    for (properties[0..count], 0..) |property, index| {
+        if (property.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT != 0) return @intCast(index);
+    }
+    return null;
+}
+
+fn supportsExternalInterop(ip: *const loader.Instance, device: vk.VkPhysicalDevice) bool {
+    var external_image_info = std.mem.zeroes(vk.VkPhysicalDeviceExternalImageFormatInfo);
+    external_image_info.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+    external_image_info.handleType = vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+    var image_info = std.mem.zeroes(vk.VkPhysicalDeviceImageFormatInfo2);
+    image_info.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+    image_info.pNext = &external_image_info;
+    image_info.format = vk.VK_FORMAT_B8G8R8A8_UNORM;
+    image_info.type = vk.VK_IMAGE_TYPE_2D;
+    image_info.tiling = vk.VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    var external_image = std.mem.zeroes(vk.VkExternalImageFormatProperties);
+    external_image.sType = vk.VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
+    var image_properties = std.mem.zeroes(vk.VkImageFormatProperties2);
+    image_properties.sType = vk.VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+    image_properties.pNext = &external_image;
+    const image_result = ip.get_physical_device_image_format_properties2(device, &image_info, &image_properties);
+    if (image_result != vk.VK_SUCCESS or
+        external_image.externalMemoryProperties.externalMemoryFeatures & vk.VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT == 0)
+    {
+        log.warn(
+            "Vulkan DComp external image rejected: result={} features=0x{x}",
+            .{ image_result, external_image.externalMemoryProperties.externalMemoryFeatures },
+        );
+        return false;
+    }
+
+    var semaphore_info = std.mem.zeroes(vk.VkPhysicalDeviceExternalSemaphoreInfo);
+    semaphore_info.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO;
+    semaphore_info.handleType = vk.VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+    var semaphore_properties = std.mem.zeroes(vk.VkExternalSemaphoreProperties);
+    semaphore_properties.sType = vk.VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES;
+    ip.get_physical_device_external_semaphore_properties(device, &semaphore_info, &semaphore_properties);
+    const importable = semaphore_properties.externalSemaphoreFeatures & vk.VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT != 0;
+    if (!importable) {
+        log.warn(
+            "Vulkan DComp external semaphore is not importable: features=0x{x}",
+            .{semaphore_properties.externalSemaphoreFeatures},
+        );
+    }
+    return importable;
+}
+
 fn hasExtension(ip: *const loader.Instance, device: vk.VkPhysicalDevice, wanted: []const u8) bool {
     var count: u32 = 0;
     if (ip.enumerate_device_extension_properties(device, null, &count, null) != vk.VK_SUCCESS) return false;
-    var extensions: [256]vk.VkExtensionProperties = undefined;
-    count = @min(count, extensions.len);
-    if (ip.enumerate_device_extension_properties(device, null, &count, &extensions) != vk.VK_SUCCESS) return false;
+    const extensions = std.heap.page_allocator.alloc(vk.VkExtensionProperties, count) catch return false;
+    defer std.heap.page_allocator.free(extensions);
+    if (ip.enumerate_device_extension_properties(device, null, &count, extensions.ptr) != vk.VK_SUCCESS) return false;
     for (extensions[0..count]) |extension| {
         if (std.mem.eql(u8, std.mem.sliceTo(&extension.extensionName, 0), wanted)) return true;
     }

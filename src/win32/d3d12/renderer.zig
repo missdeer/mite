@@ -335,10 +335,12 @@ pub fn initializeWindow(self: *D3d12Renderer, hwnd: win32.HWND) StartupError!voi
     const size = win32.getClientSize(hwnd);
     if (size.cx <= 0 or size.cy <= 0) return error.PresentationUnavailable;
     self.surface = present.Surface.init(
-        self.queue,
+        &self.queue.IUnknown,
+        null,
         hwnd,
         @intCast(size.cx),
         @intCast(size.cy),
+        pipeline.render_target_format,
     ) catch return error.PresentationUnavailable;
 }
 
@@ -909,7 +911,14 @@ fn prepareFrame(
     if (client_w == 0 or client_h == 0) return null;
 
     if (self.surface == null) {
-        self.surface = present.Surface.init(self.queue, hwnd, client_w, client_h) catch |err|
+        self.surface = present.Surface.init(
+            &self.queue.IUnknown,
+            null,
+            hwnd,
+            client_w,
+            client_h,
+            pipeline.render_target_format,
+        ) catch |err|
             std.debug.panic(
                 "renderer = d3d12: presentation surface could not be attached to desktop " ++
                     "composition ({s}); the backend cannot complete a first frame",
@@ -1195,7 +1204,7 @@ fn drawAndPresent(
         self.grid_force_full = false;
     }
 
-    const back_buffer = surface.currentBackBuffer() orelse {
+    const back_buffer = surface.getBuffer(win32.ID3D12Resource) orelse {
         // Submit what was recorded so the list does not carry into the next
         // frame, then stop: without a back buffer this backend cannot present
         // at all, and quietly dropping frames forever is precisely the
