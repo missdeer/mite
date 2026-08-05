@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
     const vt = b.dependency("ghostty", dep_opts).module("ghostty-vt");
     const z2d = b.dependency("z2d", dep_opts).module("z2d");
     const shader_assets = buildShaders(b);
+    const vulkan_include = findVulkanInclude(b);
 
     const main = b.path("src/mosttywindows.zig");
     const exe = b.addExecutable(.{
@@ -48,7 +49,7 @@ pub fn build(b: *std.Build) void {
         }),
         .win32_manifest = b.path("src/win32/mostty.manifest"),
     });
-    addImports(b, exe.root_module, vt, z2d, shader_assets);
+    addImports(b, exe.root_module, vt, z2d, shader_assets, vulkan_include);
     exe.root_module.linkSystemLibrary("opengl32", .{});
     exe.root_module.linkSystemLibrary("gdi32", .{});
     addShaderValidationDependencies(&exe.step, shader_assets);
@@ -83,7 +84,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    addImports(b, tests.root_module, vt, z2d, shader_assets);
+    addImports(b, tests.root_module, vt, z2d, shader_assets, vulkan_include);
     tests.root_module.linkSystemLibrary("opengl32", .{});
     tests.root_module.linkSystemLibrary("gdi32", .{});
     addShaderValidationDependencies(&tests.step, shader_assets);
@@ -97,22 +98,27 @@ fn addImports(
     vt: *std.Build.Module,
     z2d: *std.Build.Module,
     shader_assets: ShaderAssets,
+    vulkan_include: []const u8,
 ) void {
     mod.addImport("vt", vt);
     mod.addImport("z2d", z2d);
     mod.addAnonymousImport("terminal_vertex.dxbc", .{ .root_source_file = shader_assets.vertex.dxbc });
     mod.addAnonymousImport("terminal_vertex.dxil", .{ .root_source_file = shader_assets.vertex.dxil });
     mod.addAnonymousImport("terminal_vertex.spv", .{ .root_source_file = shader_assets.vertex.spirv });
+    mod.addAnonymousImport("terminal_vertex.vulkan.spv", .{ .root_source_file = shader_assets.vertex.vulkan_spirv });
     mod.addAnonymousImport("terminal_pixel.dxbc", .{ .root_source_file = shader_assets.pixel.dxbc });
     mod.addAnonymousImport("terminal_pixel.dxil", .{ .root_source_file = shader_assets.pixel.dxil });
     mod.addAnonymousImport("terminal_pixel.spv", .{ .root_source_file = shader_assets.pixel.spirv });
+    mod.addAnonymousImport("terminal_pixel.vulkan.spv", .{ .root_source_file = shader_assets.pixel.vulkan_spirv });
     mod.addAnonymousImport("terminal_image_pixel.dxbc", .{ .root_source_file = shader_assets.image_pixel.dxbc });
     mod.addAnonymousImport("terminal_image_pixel.dxil", .{ .root_source_file = shader_assets.image_pixel.dxil });
     mod.addAnonymousImport("terminal_image_pixel.spv", .{ .root_source_file = shader_assets.image_pixel.spirv });
+    mod.addAnonymousImport("terminal_image_pixel.vulkan.spv", .{ .root_source_file = shader_assets.image_pixel.vulkan_spirv });
     mod.addAnonymousImport("terminal_present_pixel.dxbc", .{ .root_source_file = shader_assets.present_pixel });
     if (b.lazyDependency("win32", .{})) |win32_dep| {
         mod.addImport("win32", win32_dep.module("win32"));
         mod.addIncludePath(b.path("src/win32"));
+        mod.addIncludePath(.{ .cwd_relative = vulkan_include });
     }
 }
 
@@ -120,6 +126,7 @@ const ShaderTargets = struct {
     dxbc: std.Build.LazyPath,
     dxil: std.Build.LazyPath,
     spirv: std.Build.LazyPath,
+    vulkan_spirv: std.Build.LazyPath,
     validation: *std.Build.Step,
 };
 
@@ -288,7 +295,13 @@ fn compileShaderTargets(
     opengl_validation_command.addFileArg(spirv);
     opengl_validation_command.step.dependOn(&vulkan_validation_command.step);
 
-    return .{ .dxbc = dxbc, .dxil = dxil, .spirv = spirv, .validation = &opengl_validation_command.step };
+    return .{
+        .dxbc = dxbc,
+        .dxil = dxil,
+        .spirv = spirv,
+        .vulkan_spirv = spirv_raw,
+        .validation = &opengl_validation_command.step,
+    };
 }
 
 fn addShaderValidationDependencies(step: *std.Build.Step, assets: ShaderAssets) void {
@@ -365,6 +378,48 @@ fn toolExists(path: []const u8) bool {
         std.fs.cwd().access(path, .{}) catch return false;
     }
     return true;
+}
+
+fn findVulkanInclude(b: *std.Build) []const u8 {
+    const install_hint = "install the LunarG Vulkan SDK or pass -Dvulkan-include-path=<path>";
+    if (b.option([]const u8, "vulkan-include-path", "Path containing vulkan/vulkan.h")) |path| {
+        return requireVulkanInclude(b, path, install_hint);
+    }
+    if (b.graph.env_map.get("VULKAN_SDK")) |root| {
+        const path = b.pathJoin(&.{ root, "Include" });
+        if (vulkanIncludeExists(b, path)) return path;
+    }
+
+    const search_root = "C:/VulkanSDK";
+    var root = std.fs.openDirAbsolute(search_root, .{ .iterate = true }) catch {
+        std.debug.panic("Vulkan headers not found: {s}", .{install_hint});
+    };
+    defer root.close();
+
+    var newest_version: ?[]const u8 = null;
+    var newest_path: ?[]const u8 = null;
+    var iterator = root.iterate();
+    while (iterator.next() catch @panic("failed to enumerate Vulkan SDK versions")) |entry| {
+        if (entry.kind != .directory) continue;
+        const candidate = b.pathJoin(&.{ search_root, entry.name, "Include" });
+        if (!vulkanIncludeExists(b, candidate)) continue;
+        if (newest_version == null or versionLessThan(newest_version.?, entry.name)) {
+            newest_version = b.dupe(entry.name);
+            newest_path = candidate;
+        }
+    }
+    return newest_path orelse std.debug.panic("Vulkan headers not found: {s}", .{install_hint});
+}
+
+fn requireVulkanInclude(b: *std.Build, path: []const u8, install_hint: []const u8) []const u8 {
+    if (!vulkanIncludeExists(b, path)) {
+        std.debug.panic("Vulkan headers not found under '{s}': {s}", .{ path, install_hint });
+    }
+    return b.dupe(path);
+}
+
+fn vulkanIncludeExists(b: *std.Build, path: []const u8) bool {
+    return toolExists(b.pathJoin(&.{ path, "vulkan", "vulkan.h" }));
 }
 
 fn versionLessThan(lhs: []const u8, rhs: []const u8) bool {

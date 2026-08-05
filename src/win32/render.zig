@@ -1,6 +1,8 @@
 const win32 = @import("win32").everything;
+const std = @import("std");
 
 const global_mod = @import("global.zig");
+const Renderer = @import("Renderer.zig");
 const mouse = @import("wnd/mouse.zig");
 const state = @import("state.zig");
 const tab_bar = @import("tab_bar.zig");
@@ -39,7 +41,7 @@ pub fn renderWindow(window: *Window) void {
             .end_col = h.hit.end_col,
         };
     };
-    global.renderer.render(
+    if (global.renderer.render(
         window.hwnd,
         window.active().id,
         window.active().term,
@@ -53,7 +55,25 @@ pub fn renderWindow(window: *Window) void {
         global.config.background_opacity,
         window.remote_session,
         url_hl,
-    );
+    )) |failure| {
+        std.log.err(
+            "renderer: native-vulkan runtime failure while {s} ({s})",
+            .{ failure.operationDescription(), failure.codeName() },
+        );
+        if (global.renderer.recoverNativeVulkan(window.hwnd, global.config.gpu)) {
+            std.log.warn("renderer: rebuilt native-vulkan after a runtime failure", .{});
+            _ = win32.InvalidateRect(window.hwnd, null, 0);
+            return;
+        }
+        if (!Renderer.confirmRuntimeFallback(window.hwnd, failure)) {
+            _ = win32.DestroyWindow(window.hwnd);
+            return;
+        }
+        global.renderer.fallbackToD3d11(global.config.gpu);
+        global.config.renderer = .d3d11;
+        std.log.warn("renderer: user accepted runtime fallback from native-vulkan to d3d11", .{});
+        _ = win32.InvalidateRect(window.hwnd, null, 0);
+    }
 }
 
 // Pixel position of the top-left of the active tab's cursor cell, including

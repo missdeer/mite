@@ -1,19 +1,26 @@
 const std = @import("std");
 
+const vertex_vulkan_spirv align(4) = @embedFile("terminal_vertex.vulkan.spv").*;
+const pixel_vulkan_spirv align(4) = @embedFile("terminal_pixel.vulkan.spv").*;
+const image_pixel_vulkan_spirv align(4) = @embedFile("terminal_image_pixel.vulkan.spv").*;
+
 pub const vertex = ShaderTargets{
     .dxbc = @embedFile("terminal_vertex.dxbc"),
     .dxil = @embedFile("terminal_vertex.dxil"),
     .spirv = @embedFile("terminal_vertex.spv"),
+    .vulkan_spirv = &vertex_vulkan_spirv,
 };
 pub const pixel = ShaderTargets{
     .dxbc = @embedFile("terminal_pixel.dxbc"),
     .dxil = @embedFile("terminal_pixel.dxil"),
     .spirv = @embedFile("terminal_pixel.spv"),
+    .vulkan_spirv = &pixel_vulkan_spirv,
 };
 pub const image_pixel = ShaderTargets{
     .dxbc = @embedFile("terminal_image_pixel.dxbc"),
     .dxil = @embedFile("terminal_image_pixel.dxil"),
     .spirv = @embedFile("terminal_image_pixel.spv"),
+    .vulkan_spirv = &image_pixel_vulkan_spirv,
 };
 pub const present_pixel = @embedFile("terminal_present_pixel.dxbc");
 
@@ -23,6 +30,7 @@ pub const ShaderTargets = struct {
     /// Signed Shader Model 6 bytecode consumed by D3D12, which rejects Shader Model 5.
     dxil: []const u8,
     spirv: []const u8,
+    vulkan_spirv: []align(4) const u8,
 };
 
 /// Both FXC and DXC emit the same DXBC container; only the parts inside differ.
@@ -71,6 +79,8 @@ test "every runtime shader entry has valid DirectX and SPIR-V assets" {
         try std.testing.expect(targets.spirv.len > 4);
         try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x02, 0x23, 0x07 }, targets.spirv[0..4]);
         try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x01, 0x00 }, targets.spirv[4..8]);
+        try std.testing.expect(targets.vulkan_spirv.len > 4);
+        try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x02, 0x23, 0x07 }, targets.vulkan_spirv[0..4]);
     }
 }
 

@@ -58,6 +58,9 @@ src/
     gl46.zig               selectable OpenGL 4.6 renderer + WGL fallback
     gl46/interop.zig       optional WGL/D3D11 DirectComposition bridge
     gl46/loader.zig        checked-in zigglgen OpenGL 4.6 core bindings
+    vulkan.zig             selectable native Win32 Vulkan renderer
+    vulkan/core.zig        Vulkan device, resources, frames, and Win32 WSI
+    vulkan/loader.zig      checked runtime Vulkan procedure tables
     render.zig             renderWindow orchestration (state → renderer.render)
     GlyphIndexCache.zig    circular-LRU mapping (codepoint,half,style) → atlas slot
     sprite.zig             ghostty-sprite dispatcher + z2d canvas
@@ -481,8 +484,8 @@ The process-global `Renderer` (`Renderer.zig`) is the only boundary used by
 window, input, layout, and render orchestration code. It owns a process-lifetime
 `FontService`, a backend-independent `RendererCommon` (cell size, tab-bar
 height, ligature setting, and adapter classification), plus a tagged backend
-union. D3D11 remains the default validated variant; D3D12 and OpenGL 4.6 are
-explicit research variants that still satisfy the whole facade contract. The
+union. D3D11 remains the default validated variant; D3D12, OpenGL 4.6, and
+native Vulkan are explicit research variants that still satisfy the whole facade contract. The
 font service publishes font/DPI metrics into the common state, while each
 backend borrows both and keeps no authoritative font state.
 
@@ -523,10 +526,10 @@ font service state, then reset the active backend glyph cache and force a full r
 backend.
 
 The shader build graph treats `terminal.hlsl` as the single source of truth.
-For each runtime entry point it produces three assets: an SM5/DXBC asset with
+For each runtime entry point it produces four assets: an SM5/DXBC asset with
 the Windows SDK `fxc` for D3D11, a signed SM6/DXIL asset with the Windows SDK
-`dxc` for D3D12, and a SPIR-V 1.0 asset with a SPIR-V-enabled `dxc`. DXC output
-is normalized through SPIRV-Cross and glslang into OpenGL's combined
+`dxc` for D3D12, raw Vulkan SPIR-V from the Vulkan SDK `dxc`, and an OpenGL
+SPIR-V asset normalized through SPIRV-Cross and glslang into OpenGL's combined
 sampled-image form. The
 two DirectX targets are not interchangeable — D3D11 rejects SM6 and D3D12
 rejects SM5 — and they share a container format, so `shader_assets.zig` checks
@@ -535,8 +538,8 @@ unsigned bytecode outside developer mode, so the build requires `dxil.dll`
 beside the DXIL compiler and a test asserts the container digest is non-zero.
 DXC output passes Vulkan 1.0 validation before normalization; each final asset
 passes OpenGL 4.5 validation. Any failed stage stops the build.
-D3D11 consumes DXBC, D3D12 consumes signed DXIL, and OpenGL 4.6 specializes the
-SPIR-V assets directly. Explicit bindings keep constant buffers, structured
+D3D11 consumes DXBC, D3D12 consumes signed DXIL, Vulkan consumes the raw
+SPIR-V, and OpenGL 4.6 specializes the normalized SPIR-V assets directly. Explicit bindings keep constant buffers, structured
 cells, textures, and the sampler in one collision-free cross-backend contract.
 
 The OpenGL renderer creates a WGL 4.6 core context on the window's stable
@@ -552,6 +555,18 @@ that process; declining exits without changing the configured backend. D3D12
 uses the same real-window gate for device, pipeline, descriptor, and
 DirectComposition-surface creation failures, so every non-D3D11 backend has
 the same explicit policy rather than silently changing renderers.
+
+The `native-vulkan` choice loads `vulkan-1.dll` at runtime, requires Vulkan
+1.3 dynamic rendering, synchronization2, timeline semaphores, and a Win32
+surface whose composite-alpha modes preserve the configured window effects.
+It uses three frame slots, separate acquire/render-finished semaphores, a
+timeline for frame-resource reuse, and native Win32 WSI presentation. Present
+selection prefers present-wait mailbox, then timeline-gated mailbox, then
+FIFO; the active tier is logged. Resize, out-of-date, and suboptimal results
+rebuild the swapchain without changing renderer identity. A runtime device or
+presentation failure gets one full Vulkan-core rebuild attempt for session
+reconnect recovery; a failed rebuild or immediate repeated failure offers only
+explicit D3D11 fallback or exit.
 
 The `opengl` presentation choice first attempts an optional
 `WGL_NV_DX_interop2` bridge. The bridge owns a multithread-capable D3D11 device,
