@@ -36,6 +36,8 @@ pub const StartupError = error{
     DeviceProcedureUnavailable,
     SwapchainCapabilitiesUnavailable,
     SwapchainFormatUnavailable,
+    PresentTierOverrideInvalid,
+    PresentTierUnavailable,
     WindowEffectsUnsupported,
     SwapchainUnavailable,
     SynchronizationUnavailable,
@@ -67,6 +69,8 @@ pub fn startupErrorDescription(err: StartupError) []const u8 {
         error.DeviceProcedureUnavailable => "the Vulkan device is missing a required procedure",
         error.SwapchainCapabilitiesUnavailable => "the Win32 surface capabilities could not be queried",
         error.SwapchainFormatUnavailable => "the Win32 surface has no usable sRGB format",
+        error.PresentTierOverrideInvalid => "the diagnostic Vulkan present tier override is invalid",
+        error.PresentTierUnavailable => "the requested Vulkan present tier is unavailable on this surface",
         error.WindowEffectsUnsupported => "native Vulkan presentation cannot preserve alpha composition on this surface",
         error.SwapchainUnavailable => "the native Vulkan swapchain could not be created",
         error.SynchronizationUnavailable => "the Vulkan synchronization objects could not be created",
@@ -206,6 +210,7 @@ pub const Core = struct {
     dp: loader.Device,
     queue: vk.VkQueue,
     present_wait_enabled: bool,
+    present_tier_override: ?PresentTier,
     timeline: vk.VkSemaphore,
     timeline_value: u64 = 0,
     sampler: vk.VkSampler,
@@ -237,6 +242,7 @@ pub const Core = struct {
         pixel_spirv: []align(4) const u8,
         image_pixel_spirv: []align(4) const u8,
     ) StartupError!Core {
+        const present_tier_override = try diagnosticPresentTierOverride();
         var global = loader.Global.init() catch |err| return switch (err) {
             error.LibraryUnavailable => error.VulkanLoaderUnavailable,
             error.ProcedureUnavailable => error.LoaderProcedureUnavailable,
@@ -296,7 +302,8 @@ pub const Core = struct {
         const selection = try selectPhysicalDevice(&ip, instance, presentation, surface, configured_gpu);
         const physical_device = selection.device;
         const queue_family = selection.queue_family;
-        var present_wait_enabled = selection.present_wait;
+        var present_wait_enabled = selection.present_wait and
+            (present_tier_override == null or present_tier_override.? == .present_wait_mailbox);
 
         var features13 = vk.VkPhysicalDeviceVulkan13Features{
             .sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -419,6 +426,7 @@ pub const Core = struct {
         core.dp = dp;
         core.queue = queue;
         core.present_wait_enabled = present_wait_enabled;
+        core.present_tier_override = present_tier_override;
         core.timeline = null;
         core.timeline_value = 0;
         core.sampler = null;
@@ -911,14 +919,20 @@ pub const Core = struct {
         for (modes[0..mode_count]) |mode| if (mode == vk.VK_PRESENT_MODE_MAILBOX_KHR) {
             has_mailbox = true;
         };
-        const present_mode: vk.VkPresentModeKHR = if (has_mailbox) vk.VK_PRESENT_MODE_MAILBOX_KHR else vk.VK_PRESENT_MODE_FIFO_KHR;
-        self.present_tier = if (has_mailbox and self.present_wait_enabled and self.dp.wait_for_present != null)
-            .present_wait_mailbox
-        else if (has_mailbox)
-            .timeline_mailbox
+        self.present_tier = try selectPresentTier(
+            has_mailbox,
+            self.present_wait_enabled and self.dp.wait_for_present != null,
+            self.present_tier_override,
+        );
+        const present_mode: vk.VkPresentModeKHR = if (self.present_tier == .fifo)
+            vk.VK_PRESENT_MODE_FIFO_KHR
         else
-            .fifo;
+            vk.VK_PRESENT_MODE_MAILBOX_KHR;
 
+        log.info(
+            "native Vulkan surface on '{s}': composite alpha flags=0x{x}",
+            .{ std.mem.sliceTo(&self.physical_properties.deviceName, 0), capabilities.supportedCompositeAlpha },
+        );
         const composite_alpha = chooseCompositeAlpha(capabilities.supportedCompositeAlpha) orelse
             return error.WindowEffectsUnsupported;
         var image_count: u32 = @max(3, capabilities.minImageCount);
@@ -1582,10 +1596,51 @@ fn alignForward(value: usize, alignment: usize) usize {
     return std.mem.alignForward(usize, value, std.math.ceilPowerOfTwoAssert(usize, alignment));
 }
 
+fn diagnosticPresentTierOverride() StartupError!?PresentTier {
+    if (!std.process.hasEnvVarConstant("MOSTTY_DIAG")) return null;
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, "MOSTTY_VULKAN_PRESENT_TIER") catch return null;
+    defer std.heap.page_allocator.free(value);
+    return parsePresentTierOverride(value) orelse error.PresentTierOverrideInvalid;
+}
+
+fn parsePresentTierOverride(value: []const u8) ?PresentTier {
+    return std.meta.stringToEnum(PresentTier, value);
+}
+
+fn selectPresentTier(
+    has_mailbox: bool,
+    has_present_wait: bool,
+    requested: ?PresentTier,
+) StartupError!PresentTier {
+    if (requested) |tier| return switch (tier) {
+        .present_wait_mailbox => if (has_mailbox and has_present_wait) tier else error.PresentTierUnavailable,
+        .timeline_mailbox => if (has_mailbox) tier else error.PresentTierUnavailable,
+        .fifo => tier,
+    };
+    if (has_mailbox and has_present_wait) return .present_wait_mailbox;
+    if (has_mailbox) return .timeline_mailbox;
+    return .fifo;
+}
+
 test "present tier preference is ordered from explicit wait to FIFO" {
     try std.testing.expectEqual(@as(usize, 3), @typeInfo(PresentTier).@"enum".fields.len);
-    try std.testing.expectEqualStrings("present_wait_mailbox", @tagName(PresentTier.present_wait_mailbox));
-    try std.testing.expectEqualStrings("fifo", @tagName(PresentTier.fifo));
+    try std.testing.expectEqual(PresentTier.present_wait_mailbox, try selectPresentTier(true, true, null));
+    try std.testing.expectEqual(PresentTier.timeline_mailbox, try selectPresentTier(true, false, null));
+    try std.testing.expectEqual(PresentTier.fifo, try selectPresentTier(false, false, null));
+}
+
+test "diagnostic present tier override forces available lower tiers and rejects unavailable tiers" {
+    try std.testing.expectEqual(PresentTier.timeline_mailbox, try selectPresentTier(true, true, .timeline_mailbox));
+    try std.testing.expectEqual(PresentTier.fifo, try selectPresentTier(true, true, .fifo));
+    try std.testing.expectError(error.PresentTierUnavailable, selectPresentTier(false, true, .timeline_mailbox));
+    try std.testing.expectError(error.PresentTierUnavailable, selectPresentTier(true, false, .present_wait_mailbox));
+}
+
+test "diagnostic present tier names are exact" {
+    try std.testing.expectEqual(PresentTier.present_wait_mailbox, parsePresentTierOverride("present_wait_mailbox").?);
+    try std.testing.expectEqual(PresentTier.timeline_mailbox, parsePresentTierOverride("timeline_mailbox").?);
+    try std.testing.expectEqual(PresentTier.fifo, parsePresentTierOverride("fifo").?);
+    try std.testing.expectEqual(@as(?PresentTier, null), parsePresentTierOverride("mailbox"));
 }
 
 test "opaque Win32 Vulkan handles preserve unaligned handle values" {
