@@ -7,6 +7,8 @@ Each rule ends with a ❌/✅ pair — match the pattern, not the slogan.
 ## Rule 0 — Modern CLI only (enforced by PreToolUse hook)
 Mappings: `find`→`fd`, `grep`→`rg`, `cat`→`bat` (or Read), `ls`→`eza`, `diff`→`delta`, JSON parsing → `jq` (never `python -c "import json"`).
 The hook `.claude/hooks/legacy-cli-pretool.sh` will **deny** any Bash call whose first segment-token is a legacy tool and tell you the replacement — reissue with the modern equivalent, don't retry the same command. `git grep` / `git diff` are fine.
+On Windows, `fd` is backed by the Everything search index, so a filename search returns instantly even across a whole drive. Search roots are per-drive (`C:\`, `D:\`, …), not a unified `/` — pass the drive root you want, e.g. `fd -t f 'mingw32-make' 'D:\'`. Prefer reaching for `fd` first whenever you need to locate a file.
+Use the built-in file-editing tools; never edit files with external tools like `perl` / `awk` / `sed`. Every file edit — including bulk renames and repeated substitutions across a file — goes through Edit / Write / NotebookEdit, so the change is reviewable as a diff.
 - ❌ `find . -name "*.go" | xargs grep TODO`
 - ✅ `fd -e go -x rg TODO`
 
