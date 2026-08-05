@@ -15,7 +15,7 @@ Pinned versions: Zig `0.15.2`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI 
 ```
 src/
   mosttywindows.zig        process entry, WinMain shim, main message loop
-  Cmdline.zig              --ttf / --font-size parser (currently unused by main())
+  Cmdline.zig              startup options, including the per-process renderer override
   Config.zig               1.4 kLOC — config file parser, theme resolution, arena owner
   vendor/ghostty-sprite/   vendored Ghostty sprite face (block/box/braille/...)
   win32/

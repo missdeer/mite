@@ -41,6 +41,18 @@ fn winMain(
 
 pub fn main() !void {
     diag.init();
+    var args = try std.process.argsWithAllocator(global.gpa.allocator());
+    defer args.deinit();
+    var cmdline = try Cmdline.parse(&args);
+    switch (cmdline.renderer) {
+        .invalid => |value| {
+            if (!confirmInvalidRendererFallback(value)) return error.RendererFallbackDeclined;
+            cmdline.renderer = .{ .backend = .d3d11 };
+            std.log.warn("renderer: user accepted command-line fallback from invalid value '{s}' to d3d11", .{value});
+        },
+        else => {},
+    }
+
     const com_initialized = png_decode.initUiComApartment();
     defer if (com_initialized) win32.CoUninitialize();
     png_decode.install();
@@ -94,6 +106,7 @@ pub fn main() !void {
     // strings. The UTF-16 storage is leaked: it lives for the lifetime of the
     // global renderer (i.e. the whole process).
     global.config = Config.loadDefault(global.gpa.allocator());
+    global.config.renderer = cmdline.rendererOr(global.config.renderer);
     const gpa_alloc = global.gpa.allocator();
     const font_families_u16 = util.utf16FontFamilies(gpa_alloc, global.config.font_families);
     const emoji_families_u16 = util.utf16FontFamilies(gpa_alloc, global.config.emoji_font_families);
@@ -347,7 +360,27 @@ fn confirmRendererFallback(
     ) == win32.IDYES;
 }
 
+fn confirmInvalidRendererFallback(value: []const u8) bool {
+    var message_buf: [768]u8 = undefined;
+    const display_value = value[0..@min(value.len, 128)];
+    const message = std.fmt.bufPrintZ(
+        &message_buf,
+        "The command-line renderer value ({s}) is not recognized.\n\n" ++
+            "Expected d3d11, d3d12, opengl, pure-opengl, vulkan, or native-vulkan.\n\n" ++
+            "Use D3D11 for this session instead?\n\n" ++
+            "Choose Yes to continue with D3D11, or No to exit Mostty.",
+        .{display_value},
+    ) catch unreachable;
+    return win32.MessageBoxA(
+        null,
+        message,
+        "Mostty Renderer Fallback",
+        .{ .YESNO = 1, .ICONHAND = 1, .ICONQUESTION = 1, .DEFBUTTON2 = 1 },
+    ) == win32.IDYES;
+}
+
 const Config = @import("Config.zig");
+const Cmdline = @import("Cmdline.zig");
 const Renderer = @import("win32/Renderer.zig");
 const config_watch = @import("win32/config_watch.zig");
 const diag = @import("win32/diag.zig");
