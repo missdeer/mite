@@ -108,7 +108,7 @@ pub fn pasteClipboard(hwnd: win32.HWND, tab: *Tab) void {
     }));
     defer util.globalUnlock(hmem);
     var buf: [4096]u8 = undefined;
-    var pty_writer = pty.write.writerStreaming(&buf);
+    var pty_writer = pty.write.writerStreaming(std.Io.Threaded.global_single_threaded.io(), &buf);
     pasteUtf16(tab, mem, &pty_writer.interface) catch |err| switch (err) {
         error.WriteFailed => std.log.err("paste: write to pty failed with {t}", .{pty_writer.err.?}),
         error.Reported => {},
@@ -157,7 +157,7 @@ pub fn onDropFiles(window: *Window, hdrop: win32.HDROP) void {
     @memcpy(final[0..combined.items.len], combined.items);
 
     var write_buf: [4096]u8 = undefined;
-    var pty_writer = pty.write.writerStreaming(&write_buf);
+    var pty_writer = pty.write.writerStreaming(std.Io.Threaded.global_single_threaded.io(), &write_buf);
     pasteUtf16(tab, final.ptr, &pty_writer.interface) catch |err| switch (err) {
         error.WriteFailed => std.log.err("drop: write to pty failed with {t}", .{pty_writer.err.?}),
         error.Reported => {},

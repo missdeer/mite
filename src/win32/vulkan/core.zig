@@ -1597,8 +1597,9 @@ fn alignForward(value: usize, alignment: usize) usize {
 }
 
 fn diagnosticPresentTierOverride() StartupError!?PresentTier {
-    if (!std.process.hasEnvVarConstant("MOSTTY_DIAG")) return null;
-    const value = std.process.getEnvVarOwned(std.heap.page_allocator, "MOSTTY_VULKAN_PRESENT_TIER") catch return null;
+    const environ: std.process.Environ = .{ .block = .global };
+    if (!environ.containsConstant("MOSTTY_DIAG")) return null;
+    const value = environ.getAlloc(std.heap.page_allocator, "MOSTTY_VULKAN_PRESENT_TIER") catch return null;
     defer std.heap.page_allocator.free(value);
     return parsePresentTierOverride(value) orelse error.PresentTierOverrideInvalid;
 }

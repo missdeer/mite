@@ -34,6 +34,9 @@ fn crashMessageBox(msg: []const u8, ret_addr: usize) void {
 
 fn writeCrash(writer: *std.Io.Writer, msg: []const u8, ret_addr: usize) error{WriteFailed}!void {
     try writer.print("{s}\n\n", .{msg});
-    try std.debug.dumpCurrentStackTraceToWriter(ret_addr, writer);
+    try std.debug.writeCurrentStackTrace(
+        .{ .first_address = ret_addr },
+        .{ .writer = writer, .mode = .no_color },
+    );
     try writer.writeByte(0);
 }

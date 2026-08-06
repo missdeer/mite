@@ -86,7 +86,10 @@ pub fn onWindowPosChanged(hwnd: win32.HWND, _: win32.WPARAM, lparam: win32.LPARA
         for (window.tabs.items) |tab| {
             if (tab.closing) continue;
             if (tab.term.cols != cell_count.col or tab.term.rows != cell_count.row) {
-                tab.term.resize(tab.term_arena.allocator(), cell_count.col, cell_count.row) catch |e|
+                tab.term.resize(tab.term_arena.allocator(), .{
+                    .cols = cell_count.col,
+                    .rows = cell_count.row,
+                }) catch |e|
                     std.debug.panic("Terminal.resize: {}", .{e});
                 var resize_err: Error = undefined;
                 tab.child_process.resize(&resize_err, cell_count) catch |e| switch (e) {

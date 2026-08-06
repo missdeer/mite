@@ -11,7 +11,6 @@ const state = @import("state.zig");
 const tooltip = @import("tooltip.zig");
 const types = @import("types.zig");
 const util = @import("util.zig");
-const vt_stream_mod = @import("vt_stream.zig");
 const window_geom = @import("window_geom.zig");
 
 const ChildProcess = cp_mod.ChildProcess;
@@ -22,8 +21,7 @@ const Window = state.Window;
 const global = global_mod.global;
 
 fn tabFromEffectHandler(handler: *vt.TerminalStream.Handler) *Tab {
-    const mostty_handler: *vt_stream_mod.Handler = @fieldParentPtr("inner", handler);
-    const stream: *vt_stream_mod.Stream = @fieldParentPtr("handler", mostty_handler);
+    const stream: *vt.TerminalStream = @fieldParentPtr("handler", handler);
     return @fieldParentPtr("vt_stream", stream);
 }
 
@@ -111,14 +109,14 @@ fn onSize(handler: *vt.TerminalStream.Handler) EffectReturnType("size") {
 pub const DEFAULT_SCROLLBACK_BYTES: usize = 10_000_000;
 
 // Sole source of the `vt.Terminal.Options` mostty uses at tab creation. The
-// tests below assert this helper wires `max_scrollback` correctly, which is
+// tests below assert this helper wires `max_scrollback_bytes` correctly, which is
 // how we regression-guard against the field ever being dropped from the init
 // options struct.
 fn terminalInitOptions(cols: u16, rows: u16) vt.Terminal.Options {
     return .{
         .cols = cols,
         .rows = rows,
-        .max_scrollback = DEFAULT_SCROLLBACK_BYTES,
+        .max_scrollback_bytes = DEFAULT_SCROLLBACK_BYTES,
         .default_modes = .{ .grapheme_cluster = true },
     };
 }
@@ -214,24 +212,27 @@ pub fn newTabWithLauncher(window: *Window, launcher: ?*const Config.Launcher) vo
 
     tab.term = std.heap.page_allocator.create(vt.Terminal) catch util.oom(error.OutOfMemory);
     tab.term.* = vt.Terminal.init(
+        std.Io.Threaded.global_single_threaded.io(),
         tab.term_arena.allocator(),
         terminalInitOptions(cell_count.col, cell_count.row),
     ) catch |e| std.debug.panic("Terminal.init: {}", .{e});
     syncTerminalPixelSize(tab.term);
     global.config.theme.applyToNewTerminal(tab.term);
 
-    tab.vt_stream = .initAlloc(
-        global.gpa.allocator(),
-        vt_stream_mod.Handler.init(tab.term, effects: {
-            var e: vt.TerminalStream.Handler.Effects = .readonly;
-            e.title_changed = onTitleChanged;
-            e.write_pty = onWritePty;
-            e.device_attributes = onDeviceAttributes;
-            e.xtversion = onXtVersion;
-            e.size = onSize;
-            break :effects e;
-        }),
-    );
+    var handler = tab.term.vtHandler();
+    handler.effects = effects: {
+        var e: vt.TerminalStream.Handler.Effects = .readonly;
+        e.title_changed = onTitleChanged;
+        e.write_pty = onWritePty;
+        e.device_attributes = onDeviceAttributes;
+        e.xtversion = onXtVersion;
+        e.size = onSize;
+        break :effects e;
+    };
+    tab.vt_stream = .init(.{
+        .allocator = global.gpa.allocator(),
+        .handler = handler,
+    });
 
     window.tabs.append(global.gpa.allocator(), tab) catch util.oom(error.OutOfMemory);
     window.active_index = window.tabs.items.len - 1;
@@ -367,7 +368,7 @@ test "terminalInitOptions wires DEFAULT_SCROLLBACK_BYTES" {
     // DEFAULT_SCROLLBACK_BYTES to a value too small for real scrollback)
     // is caught by the positive behavior test below.
     const opts = terminalInitOptions(80, 24);
-    try std.testing.expectEqual(DEFAULT_SCROLLBACK_BYTES, opts.max_scrollback);
+    try std.testing.expectEqual(DEFAULT_SCROLLBACK_BYTES, opts.max_scrollback_bytes);
 }
 
 test "long output with DEFAULT_SCROLLBACK_BYTES preserves earliest line" {
@@ -378,17 +379,14 @@ test "long output with DEFAULT_SCROLLBACK_BYTES preserves earliest line" {
     // observation would collapse to "everything fits regardless of
     // max_scrollback" at smaller col counts.
     const alloc = std.testing.allocator;
-    var term = try vt.Terminal.init(alloc, .{
+    var term = try vt.Terminal.init(std.testing.io, alloc, .{
         .cols = 215,
         .rows = 2,
-        .max_scrollback = DEFAULT_SCROLLBACK_BYTES,
+        .max_scrollback_bytes = DEFAULT_SCROLLBACK_BYTES,
     });
     defer term.deinit(alloc);
 
-    var stream = vt_stream_mod.Stream.initAlloc(
-        alloc,
-        vt_stream_mod.Handler.init(&term, .readonly),
-    );
+    var stream = term.vtStream();
     defer stream.deinit();
 
     var buf: [32]u8 = undefined;
@@ -412,17 +410,14 @@ test "long output with 10 KB scrollback evicts earliest line" {
     // This asserts the positive behavior test above can actually fail if
     // its max_scrollback gets accidentally zeroed / minimized.
     const alloc = std.testing.allocator;
-    var term = try vt.Terminal.init(alloc, .{
+    var term = try vt.Terminal.init(std.testing.io, alloc, .{
         .cols = 215,
         .rows = 2,
-        .max_scrollback = 10_000,
+        .max_scrollback_bytes = 10_000,
     });
     defer term.deinit(alloc);
 
-    var stream = vt_stream_mod.Stream.initAlloc(
-        alloc,
-        vt_stream_mod.Handler.init(&term, .readonly),
-    );
+    var stream = term.vtStream();
     defer stream.deinit();
 
     var buf: [32]u8 = undefined;
@@ -436,4 +431,103 @@ test "long output with 10 KB scrollback evicts earliest line" {
     const dump = try term.plainString(alloc);
     defer alloc.free(dump);
     try std.testing.expect(std.mem.indexOf(u8, dump, "line 0000") == null);
+}
+
+test "upstream stream prints over a wide head without crashing" {
+    const alloc = std.testing.allocator;
+    var term = try vt.Terminal.init(std.testing.io, alloc, .{ .cols = 5, .rows = 2 });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    try term.print(0x4E2D);
+    term.setCursorPos(1, 1);
+    stream.nextSlice("x");
+
+    const str = try term.plainString(alloc);
+    defer alloc.free(str);
+    try std.testing.expectEqualStrings("x", str);
+}
+
+test "upstream stream prints over a wide spacer tail without crashing" {
+    const alloc = std.testing.allocator;
+    var term = try vt.Terminal.init(std.testing.io, alloc, .{ .cols = 5, .rows = 2 });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    try term.print(0x4E2D);
+    term.setCursorPos(1, 2);
+    stream.nextSlice("x");
+
+    const str = try term.plainString(alloc);
+    defer alloc.free(str);
+    try std.testing.expectEqualStrings(" x", str);
+}
+
+test "upstream stream handles Kitty graphics APC and emits ACK" {
+    const alloc = std.testing.allocator;
+    var term = try vt.Terminal.init(std.testing.io, alloc, .{ .cols = 10, .rows = 10 });
+    defer term.deinit(alloc);
+    term.width_px = 100;
+    term.height_px = 100;
+
+    const S = struct {
+        var written: ?[]const u8 = null;
+        fn writePty(_: *vt.TerminalStream.Handler, data: [:0]const u8) void {
+            if (written) |old| std.testing.allocator.free(old);
+            written = std.testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+    };
+    S.written = null;
+    defer if (S.written) |old| alloc.free(old);
+
+    var handler = term.vtHandler();
+    handler.effects.write_pty = S.writePty;
+    var stream = vt.TerminalStream.init(.{ .allocator = alloc, .handler = handler });
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2,c=10,r=1;////////\x1b\\");
+
+    try std.testing.expectEqualStrings("\x1b_Gi=1;OK\x1b\\", S.written.?);
+    const image = term.screens.active.kitty_images.imageById(1).?;
+    try std.testing.expectEqual(.rgb, image.format);
+}
+
+test "upstream stream creates Kitty transmit-and-display placement" {
+    const alloc = std.testing.allocator;
+    var term = try vt.Terminal.init(std.testing.io, alloc, .{ .cols = 10, .rows = 10 });
+    defer term.deinit(alloc);
+    term.width_px = 100;
+    term.height_px = 100;
+
+    const S = struct {
+        var written: ?[]const u8 = null;
+        fn writePty(_: *vt.TerminalStream.Handler, data: [:0]const u8) void {
+            if (written) |old| std.testing.allocator.free(old);
+            written = std.testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+    };
+    S.written = null;
+    defer if (S.written) |old| alloc.free(old);
+
+    var handler = term.vtHandler();
+    handler.effects.write_pty = S.writePty;
+    var stream = vt.TerminalStream.init(.{ .allocator = alloc, .handler = handler });
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b_Ga=T,t=d,f=24,i=41001,s=1,v=1,c=2,r=1;/wAA\x1b\\");
+
+    try std.testing.expectEqualStrings("\x1b_Gi=41001;OK\x1b\\", S.written.?);
+    const storage = &term.screens.active.kitty_images;
+    const image = storage.imageById(41001).?;
+    try std.testing.expectEqual(.rgb, image.format);
+    try std.testing.expectEqual(@as(usize, 1), storage.placements.count());
+    var it = storage.placements.iterator();
+    const placement = it.next().?.value_ptr;
+    try std.testing.expectEqual(@as(u32, 2), placement.columns);
+    try std.testing.expectEqual(@as(u32, 1), placement.rows);
+    try std.testing.expect(placement.location == .pin);
 }

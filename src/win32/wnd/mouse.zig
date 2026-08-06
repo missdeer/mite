@@ -431,7 +431,7 @@ fn selectWordCJK(pin: vt.Pin, boundary_codepoints: []const u21) ?vt.Selection {
     const expect_boundary = std.mem.indexOfScalar(
         u21,
         boundary_codepoints,
-        start_cell.content.codepoint,
+        start_cell.content.codepoint.data,
     ) != null;
 
     const end: vt.Pin = end: {
@@ -440,7 +440,7 @@ fn selectWordCJK(pin: vt.Pin, boundary_codepoints: []const u21) ?vt.Selection {
         while (it.next()) |p| {
             const rac = p.rowAndCell();
             const cell = rac.cell;
-            const last_col = p.x == p.node.data.size.cols - 1;
+            const last_col = p.x == p.node.cols() - 1;
 
             // spacer_tail is the right half of a wide char on the current row;
             // it travels with the primary, so include it in `prev` so the
@@ -472,7 +472,7 @@ fn selectWordCJK(pin: vt.Pin, boundary_codepoints: []const u21) ?vt.Selection {
             const this_boundary = std.mem.indexOfScalar(
                 u21,
                 boundary_codepoints,
-                cell.content.codepoint,
+                cell.content.codepoint.data,
             ) != null;
             if (this_boundary != expect_boundary) break :end prev;
 
@@ -492,7 +492,7 @@ fn selectWordCJK(pin: vt.Pin, boundary_codepoints: []const u21) ?vt.Selection {
 
             // Backwards crossing into the previous row's last column: if that
             // row isn't wrapped to ours, stop. Matches ghostty selectWord.
-            if (p.x == p.node.data.size.cols - 1 and !rac.row.wrap) break :start prev;
+            if (p.x == p.node.cols() - 1 and !rac.row.wrap) break :start prev;
 
             // spacer_tail belongs to the wide char to its LEFT, which the
             // backward walk hasn't visited yet. Skip without updating prev so
@@ -519,7 +519,7 @@ fn selectWordCJK(pin: vt.Pin, boundary_codepoints: []const u21) ?vt.Selection {
             const this_boundary = std.mem.indexOfScalar(
                 u21,
                 boundary_codepoints,
-                cell.content.codepoint,
+                cell.content.codepoint.data,
             ) != null;
             if (this_boundary != expect_boundary) break :start prev;
 

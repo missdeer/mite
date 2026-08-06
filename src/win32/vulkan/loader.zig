@@ -1,9 +1,10 @@
 const std = @import("std");
+const win32 = @import("win32").everything;
 
 pub const vk = @cImport({
     @cDefine("VK_NO_PROTOTYPES", "1");
     @cDefine("VK_USE_PLATFORM_WIN32_KHR", "1");
-    @cInclude("vulkan/vulkan.h");
+    @cInclude("vulkan/vulkan_win32_abi.h");
 });
 
 pub const LoadError = error{ LibraryUnavailable, ProcedureUnavailable };
@@ -18,17 +19,17 @@ fn castProc(comptime T: type, raw: vk.PFN_vkVoidFunction) ?Fn(T) {
 }
 
 pub const Global = struct {
-    library: std.DynLib,
+    library: win32.HINSTANCE,
     get_instance_proc_addr: Fn(vk.PFN_vkGetInstanceProcAddr),
     create_instance: Fn(vk.PFN_vkCreateInstance),
 
     pub fn init() LoadError!Global {
-        var library = std.DynLib.open("vulkan-1.dll") catch return error.LibraryUnavailable;
-        errdefer library.close();
-        const get_instance_proc_addr = library.lookup(
-            Fn(vk.PFN_vkGetInstanceProcAddr),
-            "vkGetInstanceProcAddr",
-        ) orelse return error.ProcedureUnavailable;
+        const library = win32.LoadLibraryW(win32.L("vulkan-1.dll")) orelse
+            return error.LibraryUnavailable;
+        errdefer _ = win32.FreeLibrary(library);
+        const raw_get = win32.GetProcAddress(library, "vkGetInstanceProcAddr") orelse
+            return error.ProcedureUnavailable;
+        const get_instance_proc_addr: Fn(vk.PFN_vkGetInstanceProcAddr) = @ptrCast(raw_get);
         const create_instance = castProc(
             vk.PFN_vkCreateInstance,
             get_instance_proc_addr(null, "vkCreateInstance"),
@@ -41,7 +42,7 @@ pub const Global = struct {
     }
 
     pub fn deinit(self: *Global) void {
-        self.library.close();
+        _ = win32.FreeLibrary(self.library);
         self.* = undefined;
     }
 

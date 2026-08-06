@@ -12,9 +12,13 @@ pub fn build(b: *std.Build) void {
         // own build.zig forces it, so the exe ABI must match or clang's
         // intrinsics headers break under MSVC SDK include paths. Mirror the
         // override from ghostty's src/build/Config.zig.
-        if (result.result.os.tag == .windows and result.query.abi == null) {
+        if (result.result.os.tag == .windows and
+            (result.query.os_tag == null or result.query.abi == null))
+        {
             var query = result.query;
-            query.abi = .msvc;
+            if (query.cpu_arch == null) query.cpu_arch = result.result.cpu.arch;
+            query.os_tag = .windows;
+            if (query.abi == null) query.abi = .msvc;
             result = b.resolveTargetQuery(query);
         }
         // Mostty's Windows build only supports MSVC ABI today: the WinMain
@@ -54,7 +58,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("gdi32", .{});
     addShaderValidationDependencies(&exe.step, shader_assets);
 
-    exe.addWin32ResourceFile(.{
+    exe.root_module.addWin32ResourceFile(.{
         .file = b.path("src/win32/mostty.rc"),
     });
     exe.subsystem = .Windows;
@@ -331,20 +335,20 @@ fn findSdkTool(b: *std.Build, options: SdkToolOptions) []const u8 {
         }
         return resolved;
     }
-    if (b.graph.env_map.get(options.env_name)) |root| {
+    if (b.graph.environ_map.get(options.env_name)) |root| {
         const path = b.pathJoin(&.{ root, options.env_suffix });
         if (usableTool(b, path, options.sibling)) return path;
     }
 
-    var root = std.fs.openDirAbsolute(options.search_root, .{ .iterate = true }) catch {
+    var root = std.Io.Dir.openDirAbsolute(b.graph.io, options.search_root, .{ .iterate = true }) catch {
         std.debug.panic("shader compiler not found: {s}", .{options.install_hint});
     };
-    defer root.close();
+    defer root.close(b.graph.io);
 
     var newest_version: ?[]const u8 = null;
     var newest_path: ?[]const u8 = null;
     var iterator = root.iterate();
-    while (iterator.next() catch @panic("failed to enumerate SDK versions")) |entry| {
+    while (iterator.next(b.graph.io) catch @panic("failed to enumerate SDK versions")) |entry| {
         if (entry.kind != .directory) continue;
         const candidate = b.pathJoin(&.{ options.search_root, entry.name, options.search_suffix });
         if (!usableTool(b, candidate, options.sibling)) continue;
@@ -357,9 +361,9 @@ fn findSdkTool(b: *std.Build, options: SdkToolOptions) []const u8 {
 }
 
 fn usableTool(b: *std.Build, path: []const u8, sibling: ?[]const u8) bool {
-    if (!toolExists(path)) return false;
+    if (!toolExists(b, path)) return false;
     const required = sibling orelse return true;
-    return toolExists(siblingPath(b, path, required));
+    return toolExists(b, siblingPath(b, path, required));
 }
 
 fn siblingPath(b: *std.Build, path: []const u8, name: []const u8) []const u8 {
@@ -367,15 +371,15 @@ fn siblingPath(b: *std.Build, path: []const u8, name: []const u8) []const u8 {
 }
 
 fn requireTool(b: *std.Build, path: []const u8, install_hint: []const u8) []const u8 {
-    if (!toolExists(path)) std.debug.panic("shader compiler not found at '{s}': {s}", .{ path, install_hint });
+    if (!toolExists(b, path)) std.debug.panic("shader compiler not found at '{s}': {s}", .{ path, install_hint });
     return b.dupe(path);
 }
 
-fn toolExists(path: []const u8) bool {
+fn toolExists(b: *std.Build, path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        std.fs.accessAbsolute(path, .{}) catch return false;
+        std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch return false;
     } else {
-        std.fs.cwd().access(path, .{}) catch return false;
+        std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
     }
     return true;
 }
@@ -385,21 +389,21 @@ fn findVulkanInclude(b: *std.Build) []const u8 {
     if (b.option([]const u8, "vulkan-include-path", "Path containing vulkan/vulkan.h")) |path| {
         return requireVulkanInclude(b, path, install_hint);
     }
-    if (b.graph.env_map.get("VULKAN_SDK")) |root| {
+    if (b.graph.environ_map.get("VULKAN_SDK")) |root| {
         const path = b.pathJoin(&.{ root, "Include" });
         if (vulkanIncludeExists(b, path)) return path;
     }
 
     const search_root = "C:/VulkanSDK";
-    var root = std.fs.openDirAbsolute(search_root, .{ .iterate = true }) catch {
+    var root = std.Io.Dir.openDirAbsolute(b.graph.io, search_root, .{ .iterate = true }) catch {
         std.debug.panic("Vulkan headers not found: {s}", .{install_hint});
     };
-    defer root.close();
+    defer root.close(b.graph.io);
 
     var newest_version: ?[]const u8 = null;
     var newest_path: ?[]const u8 = null;
     var iterator = root.iterate();
-    while (iterator.next() catch @panic("failed to enumerate Vulkan SDK versions")) |entry| {
+    while (iterator.next(b.graph.io) catch @panic("failed to enumerate Vulkan SDK versions")) |entry| {
         if (entry.kind != .directory) continue;
         const candidate = b.pathJoin(&.{ search_root, entry.name, "Include" });
         if (!vulkanIncludeExists(b, candidate)) continue;
@@ -419,7 +423,7 @@ fn requireVulkanInclude(b: *std.Build, path: []const u8, install_hint: []const u
 }
 
 fn vulkanIncludeExists(b: *std.Build, path: []const u8) bool {
-    return toolExists(b.pathJoin(&.{ path, "vulkan", "vulkan.h" }));
+    return toolExists(b, b.pathJoin(&.{ path, "vulkan", "vulkan.h" }));
 }
 
 fn versionLessThan(lhs: []const u8, rhs: []const u8) bool {

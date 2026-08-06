@@ -21,7 +21,7 @@ const Key = struct {
 pub fn Entry(comptime Image: type) type {
     return struct {
         image: Image,
-        transmit_time: std.time.Instant,
+        generation: u64,
         width: u32,
         height: u32,
 
@@ -60,7 +60,7 @@ pub fn Cache(comptime Image: type) type {
         pub const CachedImage = Image;
 
         images: std.AutoHashMapUnmanaged(Key, Entry(Image)) = .{},
-        placements: std.ArrayListUnmanaged(Placement) = .{},
+        placements: std.ArrayListUnmanaged(Placement) = .empty,
         last_hash: u64 = 0,
         last_tab_id: types.TabId = 0,
         last_tab_valid: bool = false,
@@ -74,7 +74,7 @@ pub fn Cache(comptime Image: type) type {
         }
 
         pub fn releaseForTab(self: *Self, alloc: std.mem.Allocator, tab_id: types.TabId) void {
-            var keys_to_remove: std.ArrayListUnmanaged(Key) = .{};
+            var keys_to_remove: std.ArrayListUnmanaged(Key) = .empty;
             defer keys_to_remove.deinit(alloc);
 
             var it = self.images.iterator();
@@ -171,7 +171,7 @@ fn pruneRemovedImages(
     storage: *const vt.kitty.graphics.ImageStorage,
     invalidated: *bool,
 ) void {
-    var keys_to_remove: std.ArrayListUnmanaged(Key) = .{};
+    var keys_to_remove: std.ArrayListUnmanaged(Key) = .empty;
     defer keys_to_remove.deinit(alloc);
 
     var it = self.images.iterator();
@@ -253,7 +253,7 @@ fn uploadImageIfNeeded(
 ) !void {
     const key: Key = .{ .tab_id = tab_id, .image_id = image.id };
     if (self.images.get(key)) |entry| {
-        if (entry.transmit_time.order(image.transmit_time) == .eq) return;
+        if (entry.generation == image.generation) return;
     }
 
     const rgba = try imageToRgba(alloc, image);
@@ -270,7 +270,7 @@ fn uploadImageIfNeeded(
     if (gop.found_existing) gop.value_ptr.release();
     gop.value_ptr.* = .{
         .image = uploaded,
-        .transmit_time = image.transmit_time,
+        .generation = image.generation,
         .width = image.width,
         .height = image.height,
     };
@@ -281,25 +281,26 @@ fn imageToRgba(alloc: std.mem.Allocator, image: vt.kitty.graphics.Image) ![]u8 {
     const pixel_count: usize = @as(usize, image.width) * image.height;
     const out = try alloc.alloc(u8, pixel_count * 4);
     errdefer alloc.free(out);
+    const data = image.data.bytes() orelse return error.InvalidData;
 
     switch (image.format) {
         .rgba => {
-            if (image.data.len != out.len) return error.InvalidData;
-            @memcpy(out, image.data);
+            if (data.len != out.len) return error.InvalidData;
+            @memcpy(out, data);
         },
         .rgb => {
-            if (image.data.len != pixel_count * 3) return error.InvalidData;
+            if (data.len != pixel_count * 3) return error.InvalidData;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
-                out[i * 4 + 0] = image.data[i * 3 + 0];
-                out[i * 4 + 1] = image.data[i * 3 + 1];
-                out[i * 4 + 2] = image.data[i * 3 + 2];
+                out[i * 4 + 0] = data[i * 3 + 0];
+                out[i * 4 + 1] = data[i * 3 + 1];
+                out[i * 4 + 2] = data[i * 3 + 2];
                 out[i * 4 + 3] = 255;
             }
         },
         .gray => {
-            if (image.data.len != pixel_count) return error.InvalidData;
-            for (image.data, 0..) |v, i| {
+            if (data.len != pixel_count) return error.InvalidData;
+            for (data, 0..) |v, i| {
                 out[i * 4 + 0] = v;
                 out[i * 4 + 1] = v;
                 out[i * 4 + 2] = v;
@@ -307,14 +308,14 @@ fn imageToRgba(alloc: std.mem.Allocator, image: vt.kitty.graphics.Image) ![]u8 {
             }
         },
         .gray_alpha => {
-            if (image.data.len != pixel_count * 2) return error.InvalidData;
+            if (data.len != pixel_count * 2) return error.InvalidData;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
-                const gray = image.data[i * 2 + 0];
+                const gray = data[i * 2 + 0];
                 out[i * 4 + 0] = gray;
                 out[i * 4 + 1] = gray;
                 out[i * 4 + 2] = gray;
-                out[i * 4 + 3] = image.data[i * 2 + 1];
+                out[i * 4 + 3] = data[i * 2 + 1];
             }
         },
         .png => return error.InvalidData,

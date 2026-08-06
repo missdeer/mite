@@ -26,9 +26,11 @@ fn loadSshHosts(arena: std.mem.Allocator) []const SshHost {
 }
 
 fn loadSshHostsErr(arena: std.mem.Allocator) ![]const SshHost {
-    const home = std.process.getEnvVarOwned(arena, "USERPROFILE") catch return &.{};
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const environ: std.process.Environ = .{ .block = .global };
+    const home = environ.getAlloc(arena, "USERPROFILE") catch return &.{};
     const path = try std.fs.path.join(arena, &.{ home, ".ssh", "config" });
-    const raw = std.fs.cwd().readFileAlloc(arena, path, 1024 * 1024) catch |e| switch (e) {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => return &.{},
         else => return e,
     };

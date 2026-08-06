@@ -278,10 +278,19 @@ renderer: RendererBackend = .d3d11,
 
 arena: ?std.heap.ArenaAllocator = null,
 
+fn runtimeIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn envVarOwned(gpa: std.mem.Allocator, key: []const u8) ![]u8 {
+    const environ: std.process.Environ = .{ .block = .global };
+    return environ.getAlloc(gpa, key);
+}
+
 // The default config location, %LOCALAPPDATA%/Mostty/config. Returns null when
 // LOCALAPPDATA is unset. Caller owns the returned slice.
 pub fn defaultPath(gpa: std.mem.Allocator) ?[]const u8 {
-    const localappdata = std.process.getEnvVarOwned(gpa, "LOCALAPPDATA") catch return null;
+    const localappdata = envVarOwned(gpa, "LOCALAPPDATA") catch return null;
     defer gpa.free(localappdata);
     return std.fs.path.join(gpa, &.{ localappdata, "Mostty", "config" }) catch oom();
 }
@@ -306,7 +315,7 @@ pub const ReloadError = error{ReadFailed};
 pub fn loadDefaultChecked(gpa: std.mem.Allocator) ReloadError!Config {
     const path = defaultPath(gpa) orelse return parse(gpa, "", "<defaults>");
     defer gpa.free(path);
-    const bytes = std.fs.cwd().readFileAlloc(gpa, path, 64 * 1024) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(runtimeIo(), path, gpa, .limited(64 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return parse(gpa, "", path),
         else => return error.ReadFailed,
     };
@@ -315,7 +324,7 @@ pub fn loadDefaultChecked(gpa: std.mem.Allocator) ReloadError!Config {
 }
 
 pub fn loadPath(gpa: std.mem.Allocator, path: []const u8) Config {
-    const bytes = std.fs.cwd().readFileAlloc(gpa, path, 64 * 1024) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(runtimeIo(), path, gpa, .limited(64 * 1024)) catch |err| switch (err) {
         error.FileNotFound => {
             std.log.info("config: '{s}' not found; using defaults", .{path});
             return parse(gpa, "", path);
@@ -1010,7 +1019,7 @@ fn applyThemeFile(gpa: std.mem.Allocator, theme: *ThemeColors, value: []const u8
         };
     defer gpa.free(path);
 
-    const bytes = std.fs.cwd().readFileAlloc(gpa, path, 64 * 1024) catch |err| {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(runtimeIo(), path, gpa, .limited(64 * 1024)) catch |err| {
         std.log.warn("config: theme read '{s}' failed: {s}", .{ path, @errorName(err) });
         return;
     };
@@ -1051,7 +1060,7 @@ pub fn loadThemeColorsByName(gpa: std.mem.Allocator, name: []const u8) ?ThemeCol
         };
     defer gpa.free(path);
 
-    const bytes = std.fs.cwd().readFileAlloc(gpa, path, 64 * 1024) catch |err| {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(runtimeIo(), path, gpa, .limited(64 * 1024)) catch |err| {
         std.log.warn("theme read '{s}' failed: {s}", .{ path, @errorName(err) });
         return null;
     };
@@ -1071,7 +1080,7 @@ pub fn listThemeNames(gpa: std.mem.Allocator) [][]u8 {
     var names: std.ArrayListUnmanaged([]u8) = .empty;
     defer names.deinit(gpa);
 
-    if (std.process.getEnvVarOwned(gpa, "LOCALAPPDATA")) |lad| {
+    if (envVarOwned(gpa, "LOCALAPPDATA")) |lad| {
         defer gpa.free(lad);
         const dir = std.fs.path.join(gpa, &.{ lad, "Mostty", "themes" }) catch oom();
         defer gpa.free(dir);
@@ -1090,10 +1099,11 @@ pub fn listThemeNames(gpa: std.mem.Allocator) [][]u8 {
 }
 
 fn appendThemesFromDir(gpa: std.mem.Allocator, path: []const u8, out: *std.ArrayListUnmanaged([]u8)) void {
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    const io = runtimeIo();
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
     var it = dir.iterate();
-    while (it.next() catch null) |entry| {
+    while (it.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         if (!std.unicode.utf8ValidateSlice(entry.name)) continue;
@@ -1168,7 +1178,7 @@ fn systemPrefersDark() bool {
 // Searches the theme name under %LOCALAPPDATA%/Mostty/themes then <exeDir>/themes.
 // Returns the first existing path (caller owns it) or null.
 fn findThemeFile(gpa: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    if (std.process.getEnvVarOwned(gpa, "LOCALAPPDATA")) |lad| {
+    if (envVarOwned(gpa, "LOCALAPPDATA")) |lad| {
         defer gpa.free(lad);
         const p = std.fs.path.join(gpa, &.{ lad, "Mostty", "themes", name }) catch oom();
         if (fileExists(p)) return p;
@@ -1185,7 +1195,7 @@ fn findThemeFile(gpa: std.mem.Allocator, name: []const u8) ?[]const u8 {
 }
 
 fn fileExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std.Io.Dir.accessAbsolute(runtimeIo(), path, .{}) catch return false;
     return true;
 }
 

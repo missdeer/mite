@@ -133,7 +133,8 @@ pub fn buildAndUpload(
         .foreground = bg_rgba,
         .attrs = 0,
     };
-    const blink_visible = @mod(@divFloor(std.time.milliTimestamp(), 500), 2) == 0;
+    const now_ms = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).toMilliseconds();
+    const blink_visible = @mod(@divFloor(now_ms, 500), 2) == 0;
 
     const screen = term.screens.active;
     const palette = &term.colors.palette.current;
@@ -174,7 +175,7 @@ pub fn buildAndUpload(
         defer screen_row += 1;
         if (screen_row >= term_shader_row) break;
 
-        const page = &row_pin.node.data;
+        const page = row_pin.node.page();
         const page_cells = page.getCells(row_pin.rowAndCell().row);
 
         // URL hover underline range on this row (null if the row is outside
@@ -404,7 +405,7 @@ fn visualFromCell(
 ) VisualCell {
     const cell = page_cells[cell_i];
     const raw_cp: u21 = switch (cell.content_tag) {
-        .codepoint, .codepoint_grapheme => cell.content.codepoint,
+        .codepoint, .codepoint_grapheme => cell.content.codepoint.data,
         .bg_color_palette, .bg_color_rgb => ' ',
     };
     const codepoint: u21 = if (raw_cp == 0) ' ' else raw_cp;
@@ -452,7 +453,7 @@ fn visualFromCell(
 
     switch (cell.content_tag) {
         .bg_color_palette => {
-            cell_bg = color.rgbToU24(palette[cell.content.color_palette]);
+            cell_bg = color.rgbToU24(palette[cell.content.color_palette.data]);
             is_default_bg = false;
         },
         .bg_color_rgb => {

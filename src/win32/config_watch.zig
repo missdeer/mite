@@ -29,7 +29,7 @@ fn watchThread(hwnd: win32.HWND) void {
     const dir = std.fs.path.dirname(cfg_path) orelse return;
     // Open requires the directory to exist; "Open Settings File..." also
     // creates it lazily, but the watcher may run first.
-    std.fs.cwd().makePath(dir) catch |e| {
+    std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), dir) catch |e| {
         std.log.warn("config watch: makePath '{s}' failed: {s}", .{ dir, @errorName(e) });
         return;
     };

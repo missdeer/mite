@@ -11,7 +11,8 @@ pub const RendererSelection = union(enum) {
 };
 
 pub fn usage() !void {
-    try std.fs.File.stderr().writeAll(
+    try std.Io.File.stderr().writeStreamingAll(
+        std.Io.Threaded.global_single_threaded.io(),
         \\Usage: Mostty [options]
         \\
         \\Font Options:
@@ -25,7 +26,7 @@ pub fn usage() !void {
     );
 }
 
-pub fn parse(args: *std.process.ArgIterator) !Cmdline {
+pub fn parse(args: *std.process.Args.Iterator) !Cmdline {
     var result: Cmdline = .{};
     _ = args.next(); // skip program name
     while (args.next()) |arg| {

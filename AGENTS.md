@@ -39,7 +39,7 @@ Define success criteria up front, then iterate until verified. Don't follow a fi
 
 # Build & run
 
-Requires Zig `0.15.2`, the Windows SDK shader compilers (`fxc.exe` for SM5/DXBC and `dxc.exe` with `dxil.dll` beside it for signed SM6/DXIL), and the LunarG Vulkan SDK (`dxc.exe`, `spirv-cross.exe`, `glslangValidator.exe`, and `spirv-val.exe` for SPIR-V). The two DXC installs are not interchangeable: the Vulkan SDK one emits SPIR-V but ships no `dxil.dll`, and D3D12 rejects unsigned DXIL. Windows-only. Dependencies are declared in `build.zig.zon`; `win32` is marked `lazy = true`. The build discovers the newest installed SDK versions from their standard locations or the `WindowsSdkVerBinPath` / `VULKAN_SDK` environment variables; use `-Dfxc-path=<path>`, `-Ddxil-dxc-path=<path>`, `-Ddxc-path=<path>`, `-Dspirv-cross-path=<path>`, `-Dglslang-validator-path=<path>`, or `-Dspirv-val-path=<path>` to override discovery.
+Requires Zig `0.16.0`, the Windows SDK shader compilers (`fxc.exe` for SM5/DXBC and `dxc.exe` with `dxil.dll` beside it for signed SM6/DXIL), and the LunarG Vulkan SDK (`dxc.exe`, `spirv-cross.exe`, `glslangValidator.exe`, and `spirv-val.exe` for SPIR-V). The two DXC installs are not interchangeable: the Vulkan SDK one emits SPIR-V but ships no `dxil.dll`, and D3D12 rejects unsigned DXIL. Windows-only. Dependencies are declared in `build.zig.zon`; `win32` is marked `lazy = true`. The build discovers the newest installed SDK versions from their standard locations or the `WindowsSdkVerBinPath` / `VULKAN_SDK` environment variables; use `-Dfxc-path=<path>`, `-Ddxil-dxc-path=<path>`, `-Ddxc-path=<path>`, `-Dspirv-cross-path=<path>`, `-Dglslang-validator-path=<path>`, or `-Dspirv-val-path=<path>` to override discovery.
 
 - `zig build` — build the `Mostty` executable into `zig-out/bin/`.
 - `zig build run -- [args]` — build and run; everything after `--` is forwarded as cmdline args (see `src/Cmdline.zig`: `--ttf <path>`, `--font-size <float>`).
@@ -50,7 +50,7 @@ There is no separate lint step. The Windows build requires the MSVC ABI (`build.
 
 ## Build Command for Developer
 
-- Use `cmd.exe /c "D:\zig-x86_64-windows-0.15.2\zig.exe build --global-cache-dir D:\zig-cache"` to build the project.
+- Use `cmd.exe /c "D:\zig-x86_64-windows-0.16.0\zig.exe build --global-cache-dir D:\zig-cache"` to build the project.
 - Use `D:\zig-cache` as the build cache.
 - Don't always wrap commands by `cmd.exe /c`, run it directly except the **build command**.
 

@@ -5,8 +5,8 @@ of every key path. Mostty is a Windows-only terminal emulator that pairs Ghostty
 VT state machine (`libghostty-vt`) with a hand-rolled Win32 / D3D11 /
 DirectWrite shell.
 
-Pinned versions: Zig `0.15.2`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI only. The build also requires Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-cross.exe` / `glslangValidator.exe` / `spirv-val.exe`. Build with
-`cmd.exe /c "D:\zig-x86_64-windows-0.15.2\zig.exe build --global-cache-dir D:\zig-cache"`.
+Pinned versions: Zig `0.16.0`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI only. The build also requires Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-cross.exe` / `glslangValidator.exe` / `spirv-val.exe`. Build with
+`cmd.exe /c "D:\zig-x86_64-windows-0.16.0\zig.exe build --global-cache-dir D:\zig-cache"`.
 
 ---
 
@@ -36,8 +36,7 @@ src/
 
     # Per-tab plumbing
     child_process.zig      ConPTY spawn, env block, reader thread
-    vt_stream.zig          vt.Stream wrapper + Handler effects callbacks
-    tab_mgmt.zig           newTab / destroyTab, terminal init, drain protocol
+    tab_mgmt.zig           terminal/stream init, Handler effects, tab lifecycle
     tab_bar.zig            tab-bar layout + hit testing (paint is in d3d11/)
 
     # Window procedure (UI thread) — split by message family
@@ -404,20 +403,16 @@ a full ring. Retry-until-stop, with `Sleep(1 ms)` between attempts, is
 the only safe option: (a) clears within a frame once the UI drains; (b)
 is paired with `reader_stop` being set by `destroyTab`.
 
-### 5.3 `vt.Stream` wrapper (`vt_stream.zig`) and effects (`tab_mgmt.zig`)
+### 5.3 `vt.TerminalStream` and effects (`tab_mgmt.zig`)
 
-`vt_stream.zig` is a thin wrapper around `vt_mod.TerminalStream.Handler`.
-Its only behavioural addition is **wide-char repair**
-(`repairCursorCellForPrint`): before delegating `.print` / `.print_repeat`,
-it clears stale `wide` / `spacer_tail` / `spacer_head` state on the cell
-about to be overwritten, so a partial wide-char overwrite can't leave the
-page in an inconsistent state.
+Each `Tab` directly owns an upstream `vt.TerminalStream`. Wide-character
+overwrite consistency is handled by `libghostty-vt`; Mostty does not wrap or
+pre-process print actions.
 
 Everything else the parser would normally side-effect on (title changes,
 PTY writeback, device attributes / xtversion / size reports) is supplied as
 free functions in `tab_mgmt.zig`, packed into a
-`vt_mod.TerminalStream.Handler.Effects` struct at tab creation
-(`tab_mgmt.zig:185`):
+`vt.TerminalStream.Handler.Effects` struct at tab creation:
 
 - **`onTitleChanged`** (`tab_mgmt.zig:33`): walks back via `@fieldParentPtr`
   to the owning `Tab`, copies into `title_buf`, refreshes the tooltip if it
@@ -439,7 +434,7 @@ ReadFile bytes
     or ~8 ms for TIMER_PTY_DRAIN backlog continuations
     → up to two contiguous slices passed to
        Tab.vt_stream.nextSlice
-       → vt.Stream parser dispatches: print, control, CSI, OSC, DCS, ...
+       → vt.TerminalStream parser dispatches: print, control, CSI, OSC, DCS, ...
          → Handler effects mutate Tab.term (screen state)
          → write-PTY replies (CSI 18 t etc.) go back via ChildProcess
   → SetEvent(pty_ring.wake_event)  (resumes a full-ring writer)
@@ -455,14 +450,14 @@ ReadFile bytes
 
 ### 5.4 Kitty graphics
 
-Kitty graphics support is wired through `vt_stream.zig` and
+Kitty graphics support is wired through `Tab.vt_stream` and
 `libghostty-vt`'s Kitty image storage:
 
 1. The child app writes APC sequences into ConPTY. Kitty sequences start
    with `ESC _ G` and terminate with ST (`ESC` followed by `\`). The
    bundled Microsoft Terminal ConPTY is used when available because the
    Windows inbox ConPTY can discard APC payloads before Mostty sees them.
-2. The UI thread drains PTY bytes into `vt_stream.nextSlice`. The handler
+2. The UI thread drains PTY bytes into `Tab.vt_stream.nextSlice`. The handler
    lets `libghostty-vt` parse Kitty graphics, including direct RGB/gray
    payloads, PNG payloads decoded by `png_decode.zig`, placements, deletes,
    and ACK responses.

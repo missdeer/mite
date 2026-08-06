@@ -13,6 +13,10 @@ const PtyRing = pty_ring_mod.PtyRing;
 
 const CONPTY_DLL_ENV = "MOSTTY_CONPTY_DLL";
 
+fn runtimeIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const ChildProcess = struct {
     pty: ?Pty,
     read: win32.HANDLE,
@@ -21,15 +25,15 @@ pub const ChildProcess = struct {
     process_handle: win32.HANDLE,
 
     pub const Pty = struct {
-        write: std.fs.File,
+        write: std.Io.File,
         hpcon: win32.HPCON,
         conpty: ConptyApi,
         pub fn deinit(self: *Pty) void {
             self.conpty.close(self.hpcon);
-            win32.closeHandle(self.write.handle);
+            self.write.close(runtimeIo());
         }
         pub fn writeFlushAll(self: *const Pty, slice: []const u8) !void {
-            try self.write.writeAll(slice);
+            try self.write.writeStreamingAll(runtimeIo(), slice);
         }
     };
 
@@ -390,7 +394,11 @@ pub const ChildProcess = struct {
         _ = win32.ResumeThread(process_info.hThread.?);
 
         return .{
-            .pty = .{ .write = .{ .handle = our_write }, .hpcon = hpcon, .conpty = conpty },
+            .pty = .{
+                .write = .{ .handle = our_write, .flags = .{ .nonblocking = false } },
+                .hpcon = hpcon,
+                .conpty = conpty,
+            },
             .read = our_read,
             .thread = thread,
             .job = job,
@@ -472,7 +480,7 @@ pub const ChildProcess = struct {
                             .{ tab_id, attempt, win32.GetLastError() },
                         );
                     }
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    std.Io.sleep(runtimeIo(), .fromMilliseconds(1), .awake) catch {};
                 }
             }
             if (stop_flag.load(.acquire)) return;
@@ -563,8 +571,9 @@ const ConptyApi = union(enum) {
     }
 
     fn conptyDllPathOwned(out_err: *Error, allocator: std.mem.Allocator) error{Error}!?[]u8 {
-        const env_path = std.process.getEnvVarOwned(allocator, CONPTY_DLL_ENV) catch |e| switch (e) {
-            error.EnvironmentVariableNotFound => null,
+        const environ: std.process.Environ = .{ .block = .global };
+        const env_path = environ.getAlloc(allocator, CONPTY_DLL_ENV) catch |e| switch (e) {
+            error.EnvironmentVariableMissing => null,
             error.OutOfMemory => return out_err.setZig("ReadConptyDllEnv", error.OutOfMemory),
             else => |err| return out_err.setZig("ReadConptyDllEnv", err),
         };
@@ -573,7 +582,7 @@ const ConptyApi = union(enum) {
             allocator.free(path);
         }
 
-        const exe_path = std.fs.selfExePathAlloc(allocator) catch |e| switch (e) {
+        const exe_path = std.process.executablePathAlloc(runtimeIo(), allocator) catch |e| switch (e) {
             error.OutOfMemory => return out_err.setZig("FindBundledConptyDll", error.OutOfMemory),
             else => |err| {
                 std.log.warn("cannot locate Mostty executable path for bundled ConPTY: {s}", .{@errorName(err)});
@@ -587,7 +596,7 @@ const ConptyApi = union(enum) {
             return out_err.setZig("FindBundledConptyDll", e);
         errdefer allocator.free(bundled_path);
 
-        std.fs.accessAbsolute(bundled_path, .{}) catch |e| switch (e) {
+        std.Io.Dir.accessAbsolute(runtimeIo(), bundled_path, .{}) catch |e| switch (e) {
             error.FileNotFound => {
                 allocator.free(bundled_path);
                 return null;

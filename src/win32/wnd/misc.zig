@@ -188,7 +188,10 @@ fn reloadConfig(hwnd: win32.HWND) void {
                 for (window.tabs.items) |tab| {
                     if (tab.closing) continue;
                     if (tab.term.cols != cell_count.col or tab.term.rows != cell_count.row) {
-                        tab.term.resize(tab.term_arena.allocator(), cell_count.col, cell_count.row) catch |e|
+                        tab.term.resize(tab.term_arena.allocator(), .{
+                            .cols = cell_count.col,
+                            .rows = cell_count.row,
+                        }) catch |e|
                             std.debug.panic("Terminal.resize: {}", .{e});
                         var resize_err: Error = undefined;
                         tab.child_process.resize(&resize_err, cell_count) catch |e| switch (e) {
@@ -600,12 +603,13 @@ fn openSettingsFile(hwnd: win32.HWND) void {
 fn ensureFileExists(path: []const u8) !void {
     // Don't require write access to a config that already exists (it may be
     // read-only); only create one when it's actually missing.
-    std.fs.cwd().access(path, .{}) catch |err| switch (err) {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
-            if (std.fs.path.dirname(path)) |dir| try std.fs.cwd().makePath(dir);
+            if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
             // truncate=false guards against clobbering if a racing writer wins.
-            const f = try std.fs.cwd().createFile(path, .{ .truncate = false });
-            f.close();
+            const f = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false });
+            f.close(io);
         },
         else => return err,
     };

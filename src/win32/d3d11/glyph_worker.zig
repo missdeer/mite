@@ -155,8 +155,8 @@ pub const Worker = struct {
 
     hwnd: std.atomic.Value(usize) = .init(0),
 
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     queue: [queue_cap]*RasterJob = undefined,
     head: usize = 0,
     tail: usize = 0,
@@ -184,9 +184,10 @@ pub const Worker = struct {
     // UI thread. Returns false if the queue is full; caller falls back to
     // a blank-glyph placeholder (Stage C).
     pub fn submit(self: *Worker, job: *RasterJob) bool {
-        self.mutex.lock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
         if (self.count == queue_cap or self.stop) {
-            self.mutex.unlock();
+            self.mutex.unlock(io);
             return false;
         }
         self.queue[self.tail] = job;
@@ -195,17 +196,18 @@ pub const Worker = struct {
         // Bump under the mutex so the worker can never decrement before the
         // increment lands: it can't pop this job until we drop the lock.
         _ = self.pending_count.fetchAdd(1, .monotonic);
-        self.mutex.unlock();
-        self.cond.signal();
+        self.mutex.unlock(io);
+        self.cond.signal(io);
         return true;
     }
 
     pub fn shutdown(self: *Worker) void {
         if (self.thread == null) return;
-        self.mutex.lock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
         self.stop = true;
-        self.mutex.unlock();
-        self.cond.signal();
+        self.mutex.unlock(io);
+        self.cond.signal(io);
         self.thread.?.join();
         self.thread = null;
 
@@ -224,10 +226,11 @@ pub const Worker = struct {
     }
 
     fn pop(self: *Worker) ?*RasterJob {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         while (self.count == 0 and !self.stop) {
-            self.cond.wait(&self.mutex);
+            self.cond.waitUncancelable(io, &self.mutex);
         }
         if (self.stop) return null;
         const job = self.queue[self.head];

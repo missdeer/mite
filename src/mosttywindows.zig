@@ -32,7 +32,7 @@ comptime {
 fn winMain(
     _: ?win32.HINSTANCE,
     _: ?win32.HINSTANCE,
-    _: ?win32.PSTR,
+    _: ?[*:0]u8,
     _: c_int,
 ) callconv(.winapi) c_int {
     main() catch return 1;
@@ -41,7 +41,10 @@ fn winMain(
 
 pub fn main() !void {
     diag.init();
-    var args = try std.process.argsWithAllocator(global.gpa.allocator());
+    const process_args: std.process.Args = .{
+        .vector = std.os.windows.peb().ProcessParameters.CommandLine.slice(),
+    };
+    var args = try process_args.iterateAllocator(global.gpa.allocator());
     defer args.deinit();
     var cmdline = try Cmdline.parse(&args);
     switch (cmdline.renderer) {

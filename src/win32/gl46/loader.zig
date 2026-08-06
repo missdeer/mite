@@ -4165,5 +4165,5 @@ pub const ProcTable = struct {
 
 test {
     @setEvalBranchQuota(1_000_000);
-    std.testing.refAllDeclsRecursive(@This());
+    std.testing.refAllDecls(@This());
 }

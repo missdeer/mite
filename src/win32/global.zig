@@ -11,7 +11,7 @@ pub const global = struct {
     pub var icons: icons_mod.Icons = undefined;
     pub var renderer: Renderer = undefined;
     pub var window: ?state.Window = null;
-    pub var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    pub var gpa: std.heap.DebugAllocator(.{}) = .init;
     pub var config: Config = .{};
 };
 

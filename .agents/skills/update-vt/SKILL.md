@@ -23,7 +23,7 @@ actual `vt` API usage. Produce a `PLAN.md`, update the dep, build, smoke test.
 
 - `cmd.exe` is **not** on PATH in the bash tool. Ignore AGENTS.md's
   `cmd.exe /c "..."` build wrapper here and call the zig exe directly:
-  `"D:/zig-x86_64-windows-0.15.2/zig.exe" build --global-cache-dir D:/zig-cache`
+  `"D:/zig-x86_64-windows-0.16.0/zig.exe" build --global-cache-dir D:/zig-cache`
 - Setting `.hash = ""` in `build.zig.zon` makes `zig build` **panic** ("Bad
   @dependencies source") instead of printing the expected hash. Do **not** blank
   the hash. Use `zig fetch --save` (below), which computes and writes it.
@@ -115,7 +115,7 @@ but say so.
 Do **not** hand-edit the hash. Let zig fetch compute it:
 
 ```bash
-"D:/zig-x86_64-windows-0.15.2/zig.exe" fetch --global-cache-dir D:/zig-cache \
+"D:/zig-x86_64-windows-0.16.0/zig.exe" fetch --global-cache-dir D:/zig-cache \
   --save=ghostty "git+https://github.com/ghostty-org/ghostty#<TARGET>"
 ```
 
@@ -125,7 +125,7 @@ This rewrites `.ghostty.url` and `.ghostty.hash` in `build.zig.zon`. A
 ### 6. Build + smoke test
 
 ```bash
-"D:/zig-x86_64-windows-0.15.2/zig.exe" build --global-cache-dir D:/zig-cache
+"D:/zig-x86_64-windows-0.16.0/zig.exe" build --global-cache-dir D:/zig-cache
 ```
 
 Clean build (no output) = pass. Then verify the binary is fresh and starts:

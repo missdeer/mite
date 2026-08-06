@@ -80,7 +80,7 @@ fn isUrlChar(cp: u21) bool {
 fn cellCodepoint(cell: vt.Cell) ?u21 {
     if (cell.wide == .spacer_tail or cell.wide == .spacer_head) return null;
     return switch (cell.content_tag) {
-        .codepoint, .codepoint_grapheme => cell.content.codepoint,
+        .codepoint, .codepoint_grapheme => cell.content.codepoint.data,
         else => null,
     };
 }
@@ -97,7 +97,7 @@ fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
 fn viewRowCells(screen: anytype, vrow: u16, cols: u16) ?[]vt.Cell {
     const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = vrow } }) orelse return null;
     const rac = pin.rowAndCell();
-    const all_cells = pin.node.data.getCells(rac.row);
+    const all_cells = pin.node.page().getCells(rac.row);
     if (all_cells.len < cols) return null;
     return all_cells[0..cols];
 }
