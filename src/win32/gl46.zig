@@ -49,6 +49,23 @@ pub const Presentation = enum {
     }
 };
 
+const RenderPass = enum {
+    grid,
+    overlay,
+
+    fn blendEnabled(self: RenderPass) bool {
+        return self == .overlay;
+    }
+
+    fn begin(self: RenderPass) void {
+        if (self.blendEnabled()) {
+            gl.Enable(gl.BLEND);
+        } else {
+            gl.Disable(gl.BLEND);
+        }
+    }
+};
+
 pub const StartupError = error{
     GpuOverrideUnsupported,
     GetDcFailed,
@@ -681,7 +698,6 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
     if (context_procs.swap_interval(1) == 0) return error.SwapIntervalFailed;
     gl.ClipControl(gl.UPPER_LEFT, gl.ZERO_TO_ONE);
     gl.Enable(gl.FRAMEBUFFER_SRGB);
-    gl.Enable(gl.BLEND);
     gl.BlendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.PixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
@@ -1083,6 +1099,11 @@ test "pure WGL presentation never selects the interoperability bridge" {
     try std.testing.expect(Presentation.interop.usesInterop());
 }
 
+test "OpenGL grid replaces stale pixels before overlays blend" {
+    try std.testing.expect(!RenderPass.grid.blendEnabled());
+    try std.testing.expect(RenderPass.overlay.blendEnabled());
+}
+
 test "pure WGL pixel format contract requires alpha sRGB and DWM composition" {
     var pfd = pixelFormatDescriptor();
     const valid = [_]i32{ 1, 1, 1, WGL_TYPE_RGBA_ARB, 24, 8, 1 };
@@ -1250,8 +1271,10 @@ fn drawFrame(self: *Gl46Renderer, prepared: PreparedFrame, tabbar: types.TabBarD
     gl.BindTextureUnit(3, self.background_image.texture);
     gl.Viewport(0, @intCast(prepared.tab_bar_h), @intCast(prepared.client_w), @intCast(prepared.term_pixel_h));
     gl.UseProgram(self.grid_program);
+    RenderPass.grid.begin();
     gl.DrawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
+    RenderPass.overlay.begin();
     const visible_images = self.countVisiblePlacements();
     self.ensureImageUboCapacity(visible_images + 1);
     var config_index: usize = 0;
