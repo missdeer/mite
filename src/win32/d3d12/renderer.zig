@@ -137,6 +137,12 @@ glyph_cache_cell_size: ?CellXY = null,
 cache_gen: u32 = 0,
 grid_force_full: bool = true,
 last_const_snapshot: grid.ConfigSnapshot = .{},
+// Signature of the content last painted into the CPU band, plus the D2D target
+// it came from. The band pixels survive across frames, so a matching signature
+// skips the D2D pass; the staging copy still runs because each frame gets a
+// fresh back buffer and a fresh upload-arena allocation.
+tabbar_sig: u64 = 0,
+tabbar_sig_rt: ?*win32.ID2D1RenderTarget = null,
 stats: DebugStats = .{},
 diag_rows_uploaded: u64 = 0,
 diag_rows_skipped: u64 = 0,
@@ -871,11 +877,7 @@ pub fn render(
         background_opacity,
         url_highlight,
     );
-    if (build.has_blink) {
-        _ = win32.SetTimer(hwnd, types.TIMER_TEXT_BLINK, 250, null);
-    } else {
-        _ = win32.KillTimer(hwnd, types.TIMER_TEXT_BLINK);
-    }
+    self.common.syncBlinkTimer(hwnd, build.has_blink);
 
     self.drawAndPresent(prepared, tabbar, remote_session, .{
         .cell_count = cell_count,
@@ -1349,16 +1351,21 @@ fn refreshSharedDescriptors(self: *D3d12Renderer) void {
 fn copyTabBarBand(self: *D3d12Renderer, prepared: PreparedFrame, tabbar: types.TabBarDraw) void {
     if (prepared.tab_bar_h == 0) return;
     const band = self.font_service.cpuBand(prepared.client_w, prepared.tab_bar_h);
-    tabbar_paint.paint(
-        band.render_target,
-        band.brush,
-        &self.font_service.dwrite_factory.IDWriteFactory,
-        self.font_service.tabbar_text_format,
-        self.font_service.tabbar_trimming_sign,
-        tabbar,
-        prepared.cs.x,
-        prepared.tab_bar_h,
-    );
+    const sig = tabbar_paint.signature(tabbar, self.cache_gen, prepared.cs.x, prepared.client_w, prepared.tab_bar_h);
+    if (self.tabbar_sig_rt != band.render_target or self.tabbar_sig != sig) {
+        tabbar_paint.paint(
+            band.render_target,
+            band.brush,
+            &self.font_service.dwrite_factory.IDWriteFactory,
+            self.font_service.tabbar_text_format,
+            self.font_service.tabbar_trimming_sign,
+            tabbar,
+            prepared.cs.x,
+            prepared.tab_bar_h,
+        );
+        self.tabbar_sig = sig;
+        self.tabbar_sig_rt = band.render_target;
+    }
     const pixels = band.readPixels();
 
     const copy_h = @min(prepared.tab_bar_h, prepared.client_h);

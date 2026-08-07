@@ -117,6 +117,11 @@ glyph_cache_cell_size: ?CellXY = null,
 cache_gen: u32 = 0,
 grid_force_full: bool = true,
 last_const_snapshot: grid.ConfigSnapshot = .{},
+// Signature of the content last painted into the tab-bar image, plus the D2D
+// target it came from. Both the CPU band and the Vulkan image survive across
+// frames, so a matching signature skips the D2D pass and the image upload.
+tabbar_sig: u64 = 0,
+tabbar_sig_rt: ?*win32.ID2D1RenderTarget = null,
 stats: DebugStats = .{},
 diag_rows_uploaded: u64 = 0,
 diag_rows_skipped: u64 = 0,
@@ -387,11 +392,7 @@ pub fn render(
         background_opacity,
         url_highlight,
     );
-    if (build.has_blink) {
-        _ = win32.SetTimer(hwnd, types.TIMER_TEXT_BLINK, 250, null);
-    } else {
-        _ = win32.KillTimer(hwnd, types.TIMER_TEXT_BLINK);
-    }
+    self.common.syncBlinkTimer(hwnd, build.has_blink);
 
     self.prepareTabbar(prepared, tabbar) catch |err| return .{
         .operation = if (err == error.ImageUnavailable) .tab_bar_image else .tab_bar_upload,
@@ -495,6 +496,22 @@ fn prepareFrame(
 fn prepareTabbar(self: *VulkanRenderer, prepared: PreparedFrame, tabbar: types.TabBarDraw) !void {
     if (prepared.tab_bar_h == 0) return;
     const band = self.font_service.cpuBand(prepared.client_w, prepared.tab_bar_h);
+    var core = &self.core.?;
+    if (!self.tabbar_image.loaded() or
+        self.tabbar_size.cx != @as(i32, @intCast(prepared.client_w)) or
+        self.tabbar_size.cy != @as(i32, @intCast(prepared.tab_bar_h)))
+    {
+        _ = core.dp.device_wait_idle(core.device);
+        self.tabbar_image.release(core);
+        self.tabbar_image = core.createImage(prepared.client_w, prepared.tab_bar_h, vk.VK_FORMAT_B8G8R8A8_UNORM) catch
+            return error.ImageUnavailable;
+        self.tabbar_size = .{ .cx = @intCast(prepared.client_w), .cy = @intCast(prepared.tab_bar_h) };
+        // Fresh image contents are undefined; repaint even if the signature
+        // happens to repeat (resize A -> B -> A).
+        self.tabbar_sig_rt = null;
+    }
+    const sig = tabbar_paint.signature(tabbar, self.cache_gen, prepared.cs.x, prepared.client_w, prepared.tab_bar_h);
+    if (self.tabbar_sig_rt == band.render_target and self.tabbar_sig == sig) return;
     tabbar_paint.paint(
         band.render_target,
         band.brush,
@@ -506,17 +523,6 @@ fn prepareTabbar(self: *VulkanRenderer, prepared: PreparedFrame, tabbar: types.T
         prepared.tab_bar_h,
     );
     const pixels = band.readPixels();
-    var core = &self.core.?;
-    if (!self.tabbar_image.loaded() or
-        self.tabbar_size.cx != @as(i32, @intCast(prepared.client_w)) or
-        self.tabbar_size.cy != @as(i32, @intCast(prepared.tab_bar_h)))
-    {
-        _ = core.dp.device_wait_idle(core.device);
-        self.tabbar_image.release(core);
-        self.tabbar_image = core.createImage(prepared.client_w, prepared.tab_bar_h, vk.VK_FORMAT_B8G8R8A8_UNORM) catch
-            return error.ImageUnavailable;
-        self.tabbar_size = .{ .cx = @intCast(prepared.client_w), .cy = @intCast(prepared.tab_bar_h) };
-    }
     try core.uploadImage(
         &self.tabbar_image,
         0,
@@ -526,6 +532,8 @@ fn prepareTabbar(self: *VulkanRenderer, prepared: PreparedFrame, tabbar: types.T
         pixels.ptr,
         prepared.client_w * 4,
     );
+    self.tabbar_sig = sig;
+    self.tabbar_sig_rt = band.render_target;
 }
 
 fn recordAndPresent(self: *VulkanRenderer, hwnd: win32.HWND, prepared: PreparedFrame) !PresentOutcome {

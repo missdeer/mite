@@ -1,8 +1,24 @@
 const RendererCommon = @This();
 
 const win32 = @import("win32").everything;
+const types = @import("types.zig");
 
 cell_size: win32.SIZE,
 tab_bar_height: i32,
 font_ligatures: bool,
 remote_or_software_adapter: bool,
+// Whether TIMER_TEXT_BLINK is currently armed. Every backend re-derives the
+// desired state from `build.has_blink` on every frame; without this the
+// renderer issues a SetTimer or KillTimer syscall per frame forever.
+blink_timer_armed: bool = false,
+
+// Arm or cancel the SGR-blink timer only on a state change.
+pub fn syncBlinkTimer(self: *RendererCommon, hwnd: win32.HWND, want: bool) void {
+    if (want == self.blink_timer_armed) return;
+    if (want) {
+        _ = win32.SetTimer(hwnd, types.TIMER_TEXT_BLINK, 250, null);
+    } else {
+        _ = win32.KillTimer(hwnd, types.TIMER_TEXT_BLINK);
+    }
+    self.blink_timer_armed = want;
+}

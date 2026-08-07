@@ -54,6 +54,43 @@ fn toUtf16(buf: []u16, s: []const u8) []const u16 {
     return buf[0..n];
 }
 
+// Content signature of one band paint. The band texture persists across frames,
+// so two frames with equal signatures would redraw identical pixels and the D2D
+// pass can be skipped entirely. `font_gen` folds in text-format/DPI rebuilds,
+// which change glyph metrics without touching `draw`. Hashed field by field
+// because `TabDrawInfo` has padding bytes that `asBytes` would include.
+pub fn signature(
+    draw: types.TabBarDraw,
+    font_gen: u32,
+    cell_w: u32,
+    band_w: u32,
+    band_h: u32,
+) u64 {
+    var h = std.hash.Wyhash.init(font_gen);
+    h.update(std.mem.asBytes(&cell_w));
+    h.update(std.mem.asBytes(&band_w));
+    h.update(std.mem.asBytes(&band_h));
+    for (draw.tabs) |t| {
+        h.update(std.mem.asBytes(&t.col_start));
+        h.update(std.mem.asBytes(&t.col_end));
+        h.update(std.mem.asBytes(&t.close_col));
+        h.update(std.mem.asBytes(&t.tab_number));
+        const flags: u8 = @as(u8, @intFromBool(t.active)) |
+            (@as(u8, @intFromBool(t.hovered)) << 1) |
+            (@as(u8, @intFromBool(t.close_hovered)) << 2);
+        h.update(std.mem.asBytes(&flags));
+        // Length-prefixed so ("ab","c") and ("a","bc") hash differently.
+        const title_len: u32 = @intCast(t.title.len);
+        h.update(std.mem.asBytes(&title_len));
+        h.update(t.title);
+    }
+    const new_col: u32 = draw.new_tab_col orelse std.math.maxInt(u32);
+    h.update(std.mem.asBytes(&new_col));
+    const new_hovered: u8 = @intFromBool(draw.new_tab_hovered);
+    h.update(std.mem.asBytes(&new_hovered));
+    return h.final();
+}
+
 // Draws a single character centered in [x, x+w) x [0, h) (used for the close
 // 'x' and new-tab '+'). Borrows the shared brush, setting its color first.
 fn drawCenteredChar(

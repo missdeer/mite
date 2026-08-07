@@ -301,6 +301,11 @@ glyph_cache_cell_size: ?CellXY = null,
 cache_gen: u32 = 0,
 grid_force_full: bool = true,
 last_const_snapshot: grid.ConfigSnapshot = .{},
+// Signature of the content last painted into the tab-bar texture, plus the
+// D2D target it came from. Both the CPU band and the GL texture survive across
+// frames, so a matching signature skips the D2D pass and the texture upload.
+tabbar_sig: u64 = 0,
+tabbar_sig_rt: ?*win32.ID2D1RenderTarget = null,
 stats: DebugStats = .{},
 diag_rows_uploaded: u64 = 0,
 diag_rows_skipped: u64 = 0,
@@ -1048,11 +1053,7 @@ pub fn render(
         background_opacity,
         url_highlight,
     );
-    if (build.has_blink) {
-        _ = win32.SetTimer(hwnd, types.TIMER_TEXT_BLINK, 250, null);
-    } else {
-        _ = win32.KillTimer(hwnd, types.TIMER_TEXT_BLINK);
-    }
+    self.common.syncBlinkTimer(hwnd, build.has_blink);
 
     const presentation = self.beginPresentation(hwnd, prepared.client_w, prepared.client_h);
     self.drawFrame(prepared, tabbar);
@@ -1308,29 +1309,34 @@ fn drawFrame(self: *Gl46Renderer, prepared: PreparedFrame, tabbar: types.TabBarD
 
     if (prepared.tab_bar_h != 0) {
         const band = self.font_service.cpuBand(prepared.client_w, prepared.tab_bar_h);
-        tabbar_paint.paint(
-            band.render_target,
-            band.brush,
-            &self.font_service.dwrite_factory.IDWriteFactory,
-            self.font_service.tabbar_text_format,
-            self.font_service.tabbar_trimming_sign,
-            tabbar,
-            prepared.cs.x,
-            prepared.tab_bar_h,
-        );
-        const pixels = band.readPixels();
         self.ensureTabbarTexture(prepared.client_w, prepared.tab_bar_h);
-        gl.TextureSubImage2D(
-            self.tabbar_texture,
-            0,
-            0,
-            0,
-            @intCast(prepared.client_w),
-            @intCast(prepared.tab_bar_h),
-            gl.BGRA,
-            gl.UNSIGNED_BYTE,
-            pixels.ptr,
-        );
+        const sig = tabbar_paint.signature(tabbar, self.cache_gen, prepared.cs.x, prepared.client_w, prepared.tab_bar_h);
+        if (self.tabbar_sig_rt != band.render_target or self.tabbar_sig != sig) {
+            tabbar_paint.paint(
+                band.render_target,
+                band.brush,
+                &self.font_service.dwrite_factory.IDWriteFactory,
+                self.font_service.tabbar_text_format,
+                self.font_service.tabbar_trimming_sign,
+                tabbar,
+                prepared.cs.x,
+                prepared.tab_bar_h,
+            );
+            const pixels = band.readPixels();
+            gl.TextureSubImage2D(
+                self.tabbar_texture,
+                0,
+                0,
+                0,
+                @intCast(prepared.client_w),
+                @intCast(prepared.tab_bar_h),
+                gl.BGRA,
+                gl.UNSIGNED_BYTE,
+                pixels.ptr,
+            );
+            self.tabbar_sig = sig;
+            self.tabbar_sig_rt = band.render_target;
+        }
         var config: kitty_image_mod.ImageConfig = .{
             .dest = .{ 0, 0, @floatFromInt(prepared.client_w), @floatFromInt(prepared.tab_bar_h) },
             .source = .{ 0, 0, @floatFromInt(prepared.client_w), @floatFromInt(prepared.tab_bar_h) },
@@ -1387,6 +1393,9 @@ fn ensureTabbarTexture(self: *Gl46Renderer, width: u32, height: u32) void {
     if (self.tabbar_texture != 0) gl.DeleteTextures(1, @ptrCast(&self.tabbar_texture));
     self.tabbar_texture = createTexture(width, height, gl.RGBA8);
     self.tabbar_size = .{ .cx = @intCast(width), .cy = @intCast(height) };
+    // Fresh texture contents are undefined; force the next frame to repaint and
+    // re-upload even if the band signature happens to repeat (resize A -> B -> A).
+    self.tabbar_sig_rt = null;
 }
 
 pub fn applyGlyphResult(self: *Gl46Renderer, result: *RasterResult) bool {

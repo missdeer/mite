@@ -148,6 +148,20 @@ grid_force_full: bool = true,
 last_const_snapshot: grid.ConfigSnapshot = .{},
 
 band_bridge: gpu.SharedTexture = .{},
+// Signature of the content last painted into the band texture, plus the
+// texture identity it was painted into. The band survives across frames, so a
+// frame whose signature matches can skip the D2D pass. The identity check
+// covers a `getOrCreate` rebuild handing back undefined pixels at a size the
+// signature has seen before (e.g. resize A -> B -> A).
+tabbar_sig: u64 = 0,
+tabbar_sig_tex: ?*win32.ID3D11Texture2D = null,
+// Render-device-local copy of the band. The flip-model back buffer is undefined
+// every frame, so the strip must be re-copied even when the band content is
+// unchanged — but copying from here instead of the shared texture keeps the
+// cross-device keyed-mutex handoff off the steady-state path entirely.
+band_local: ?*win32.ID3D11Texture2D = null,
+band_local_w: u32 = 0,
+band_local_h: u32 = 0,
 // Back-buffer texture retained so the persistent grid texture and tab-bar band
 // can be copied into the current flip-model back buffer. Released/reacquired
 // on swap-chain resize.
@@ -460,6 +474,7 @@ pub fn deinit(self: *D3d11Renderer) void {
     }
     self.glyph_staging_bridge.release();
     self.band_bridge.release();
+    if (self.band_local) |t| _ = t.IUnknown.Release();
     self.kitty_images.deinit(std.heap.page_allocator);
     if (self.glyph_cache) |*c| {
         c.deinit(self.glyph_cache_arena.allocator());
@@ -591,11 +606,7 @@ pub fn render(
         url_highlight,
     );
     const build_us = if (diag_on) diag.qpcUsSince(build_t0) else 0;
-    if (build.has_blink) {
-        _ = win32.SetTimer(hwnd, types.TIMER_TEXT_BLINK, 250, null);
-    } else {
-        _ = win32.KillTimer(hwnd, types.TIMER_TEXT_BLINK);
-    }
+    self.common.syncBlinkTimer(hwnd, build.has_blink);
 
     // Phase 3: persistent grid draw decision + back-buffer delivery.
     const grid_t0 = if (diag_on) diag.qpcNow() else 0;
@@ -864,33 +875,72 @@ fn prepareFrame(
     };
 }
 
+// Render-device-local band copy, (re)created on size change. A rebuild drops
+// the paint signature so the next frame repaints and refills it — a fresh
+// texture's contents are undefined.
+fn bandLocal(self: *D3d11Renderer, width: u32, height: u32) *win32.ID3D11Texture2D {
+    if (self.band_local) |t| {
+        if (self.band_local_w == width and self.band_local_h == height) return t;
+        _ = t.IUnknown.Release();
+        self.band_local = null;
+    }
+    const desc: win32.D3D11_TEXTURE2D_DESC = .{
+        .Width = width,
+        .Height = height,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = .B8G8R8A8_UNORM,
+        .SampleDesc = .{ .Count = 1, .Quality = 0 },
+        .Usage = .DEFAULT,
+        .BindFlags = .{ .SHADER_RESOURCE = 1 },
+        .CPUAccessFlags = .{},
+        .MiscFlags = .{},
+    };
+    var texture: *win32.ID3D11Texture2D = undefined;
+    const hr = self.device.CreateTexture2D(&desc, null, &texture);
+    if (hr < 0) fatalHr("CreateBandLocalTexture", hr);
+    self.band_local = texture;
+    self.band_local_w = width;
+    self.band_local_h = height;
+    self.tabbar_sig_tex = null;
+    return texture;
+}
+
 fn paintChromeAndPresent(self: *D3d11Renderer, prepared: PreparedFrame, tabbar: types.TabBarDraw, remote_session: bool) void {
     // Tab-bar band: paint proportionally into the offscreen band texture,
     // then copy it onto the back buffer's top strip. Mirrors the
     // glyph-staging pattern (D2D EndDraw flushes before the D3D copy reads
     // the texture).
     if (prepared.tab_bar_h > 0) {
-        self.diag_tabbar_paints += 1;
         const band = self.font_service.band_texture.getOrCreate(
             self.font_service.device,
             self.font_service.d2d_factory,
             prepared.client_w,
             prepared.tab_bar_h,
         );
-        gpu.acquireFontWrite(band.mutex);
-        tabbar_paint.paint(
-            band.render_target,
-            band.brush,
-            &self.font_service.dwrite_factory.IDWriteFactory,
-            self.font_service.tabbar_text_format,
-            self.font_service.tabbar_trimming_sign,
-            tabbar,
-            prepared.cs.x,
-            prepared.tab_bar_h,
-        );
-        gpu.releaseFontWrite(band.mutex);
-        const imported_band = self.band_bridge.acquireRead(self.device, band.texture);
-        defer self.band_bridge.releaseRead();
+        const local = self.bandLocal(prepared.client_w, prepared.tab_bar_h);
+        const sig = tabbar_paint.signature(tabbar, self.cache_gen, prepared.cs.x, prepared.client_w, prepared.tab_bar_h);
+        const reusable = self.tabbar_sig_tex == band.texture and self.tabbar_sig == sig;
+        if (!reusable) {
+            gpu.acquireFontWrite(band.mutex);
+            tabbar_paint.paint(
+                band.render_target,
+                band.brush,
+                &self.font_service.dwrite_factory.IDWriteFactory,
+                self.font_service.tabbar_text_format,
+                self.font_service.tabbar_trimming_sign,
+                tabbar,
+                prepared.cs.x,
+                prepared.tab_bar_h,
+            );
+            gpu.releaseFontWrite(band.mutex);
+            const imported_band = self.band_bridge.acquireRead(self.device, band.texture);
+            defer self.band_bridge.releaseRead();
+            self.context.CopyResource(&local.ID3D11Resource, &imported_band.ID3D11Resource);
+            self.tabbar_sig = sig;
+            self.tabbar_sig_tex = band.texture;
+            self.diag_tabbar_paints += 1;
+        }
         // Unbind the RTV so the back buffer can be a CopySubresourceRegion dest.
         self.context.OMSetRenderTargets(0, null, null);
         if (self.back_buffer_tex) |bb| {
@@ -903,7 +953,7 @@ fn paintChromeAndPresent(self: *D3d11Renderer, prepared: PreparedFrame, tabbar: 
                 .bottom = copy_h,
                 .back = 1,
             };
-            self.context.CopySubresourceRegion(&bb.ID3D11Resource, 0, 0, 0, 0, &imported_band.ID3D11Resource, 0, &src_box);
+            self.context.CopySubresourceRegion(&bb.ID3D11Resource, 0, 0, 0, 0, &local.ID3D11Resource, 0, &src_box);
         }
     }
 
