@@ -56,29 +56,15 @@ There is no separate lint step. The Windows build requires the MSVC ABI (`build.
 
 # Architecture
 
-> For the full architecture & workflow reference (module layout, threading model, startup sequence, message dispatch, ConPTY/VT pipeline, rendering pipeline, render throttle, hot-reload, key data flows, invariants), see **`ARCHITECTURE.md`** at the repo root. The summary below is the quick-orientation map; consult `ARCHITECTURE.md` whenever a change touches more than one module or you need to verify an invariant.
-
 Mostty is a Windows-only terminal emulator that wraps `libghostty-vt` (the VT parser/state machine from Ghostty, imported as the `vt` module) and provides its own windowing + rendering layer:
 
-| Target  | Entry point             | Window/IO                           | Rendering             |
-| ------- | ----------------------- | ----------------------------------- | --------------------- |
-| Windows | `src/mosttywindows.zig` | Win32 message loop + ConPTY per tab | D3D11 + DirectWrite   |
+| Target  | Entry point             | Window/IO                           | Rendering                                     |
+| ------- | ----------------------- | ----------------------------------- | --------------------------------------------- |
+| Windows | `src/mosttywindows.zig` | Win32 message loop + ConPTY per tab | D3D11 (default), D3D12, OpenGL 4.6, or Vulkan |
 
-The build is multi-threaded because each tab has a dedicated `std.Thread` reading from its ConPTY.
+The backend is picked per process by `--renderer` or `renderer =` in the config; the accepted values are `d3d11`, `d3d12`, `opengl`, `pure-opengl`, `vulkan`, and `native-vulkan` (`Config.RendererBackend`). Everything except D3D11 is an explicit research variant. All of them share one process-lifetime `FontService` (DirectWrite + Direct2D), so text layout and glyph rasterization are backend-independent, and `terminal.hlsl` is the single shader source compiled to DXBC / signed DXIL / SPIR-V.
 
-## Windows side (`src/mosttywindows.zig`, `src/win32/d3d11.zig`)
-
-- Multi-tab from the start: `Window.tabs` is a list of `*Tab`, each owning its own `vt.Terminal`, `vt.Stream(VtHandler)`, `ChildProcess` (ConPTY) and reader thread. Tab IDs (`TabId`) are stable; never index tabs by position across messages because tabs can close mid-flight.
-- The main loop is `MsgWaitForMultipleObjectsEx` over `{all tab process handles, message queue}`. Child-process-exited fires before WM_APP_CLOSE_TAB drains, so tabs always go through `closing = true` first and the reader thread's `reader_stop` flag is set together with `CancelIoEx`.
-- Reader threads ship PTY bytes to the UI thread via `SendMessage(WM_APP_CHILD_PROCESS_DATA, ...)`. The WndProc returns the magic value `WM_APP_CHILD_PROCESS_DATA_RESULT` so the reader can assert the message was actually handled (and not silently dropped, e.g. during teardown).
-- Surrogate state for `WM_CHAR` (`Tab.high_surrogate`) is **per tab**, not global — keyboard shortcuts can switch the active tab between the high and low surrogate arriving.
-- Rendering is a single full-screen triangle in HLSL (`src/win32/terminal.hlsl`); the CPU uploads a `StructuredBuffer<Cell>` plus a glyph atlas texture. `GlyphIndexCache.zig` is an LRU mapping `(codepoint, half)` → atlas slot; when `reserve` evicts, the renderer must re-rasterize into the freed slot.
-- Window chrome: custom tab bar painted into the top cell row of the same D3D11 surface, plus DWM dark-mode/blur-behind. The "title bar" color is set via `DwmSetWindowAttribute` — there's no separate Win32 title bar control.
-
-## Shared
-
-- `vt` (libghostty-vt) drives terminal state. Mostty wires its own `Stream` handler (`VtHandler`) on top of `vt.ReadonlyHandler` to intercept `window_title` actions; everything else falls through to the readonly handler.
-- `TERM` is forced to `xterm-256color` (Windows sets the child env directly when spawning the ConPTY).
+**`ARCHITECTURE.md`** at the repo root is the single source of truth for everything else: module layout, threading model, startup sequence, message dispatch, ConPTY/VT pipeline, rendering pipeline, render throttle, hot-reload, key data flows, and invariants. Read it before any change that spans more than one module or leans on an invariant. Do not restate its contents here — the summary this section used to carry had drifted into describing a `SendMessage` PTY hand-off and a `VtHandler`/`ReadonlyHandler` pair that no longer exist.
 
 ## Temp Dir
 
