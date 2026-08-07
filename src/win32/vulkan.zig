@@ -152,26 +152,67 @@ pub fn init(
 
 pub fn initializeWindow(self: *VulkanRenderer, hwnd: win32.HWND) StartupError!void {
     if (self.core != null) return;
-    self.core = try core_mod.Core.init(
-        hwnd,
+    const context: StartupContext = .{ .renderer = self, .hwnd = hwnd };
+    try initializeCandidates(context, initializeCandidate);
+    const properties = self.core.?.physical_properties;
+    self.common.remote_or_software_adapter = properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_CPU or
+        properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
+}
+
+const StartupContext = struct {
+    renderer: *VulkanRenderer,
+    hwnd: win32.HWND,
+};
+
+fn initializeCandidate(
+    context: StartupContext,
+    candidate_index: usize,
+    attempt: *core_mod.CandidateAttempt,
+) StartupError!void {
+    const self = context.renderer;
+    var core = try core_mod.Core.init(
+        context.hwnd,
         self.configured_gpu,
         self.presentation,
+        candidate_index,
+        attempt,
         shader_assets.vertex.vulkan_spirv,
         shader_assets.pixel.vulkan_spirv,
         shader_assets.image_pixel.vulkan_spirv,
     );
-    if (self.presentation == .dcomp_bridge) {
-        const size = win32.getClientSize(hwnd);
-        self.bridge = try bridge_mod.Bridge.init(
-            &self.core.?,
-            hwnd,
+    errdefer core.deinit();
+    const bridge = if (self.presentation == .dcomp_bridge) blk: {
+        const size = win32.getClientSize(context.hwnd);
+        break :blk try bridge_mod.Bridge.init(
+            &core,
+            context.hwnd,
             @intCast(@max(1, size.cx)),
             @intCast(@max(1, size.cy)),
         );
+    } else null;
+    self.core = core;
+    self.bridge = bridge;
+    if (self.presentation == .dcomp_bridge) {
+        log.info("Vulkan DirectComposition bridge device active: {s}", .{attempt.name()});
     }
-    const properties = self.core.?.physical_properties;
-    self.common.remote_or_software_adapter = properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_CPU or
-        properties.deviceType == vk.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
+}
+
+fn initializeCandidates(context: anytype, comptime attempt_fn: anytype) StartupError!void {
+    var candidate_index: usize = 0;
+    while (true) {
+        var attempt: core_mod.CandidateAttempt = .{};
+        attempt_fn(context, candidate_index, &attempt) catch |err| {
+            if (attempt.name_len == 0) return err;
+            log.warn(
+                "Vulkan candidate '{s}' failed complete initialization ({s}): {s}",
+                .{ attempt.name(), @errorName(err), startupErrorDescription(err) },
+            );
+            candidate_index += 1;
+            if (candidate_index < attempt.candidate_count) continue;
+            return err;
+        };
+        return;
+    }
 }
 
 pub fn deinit(self: *VulkanRenderer) void {
@@ -930,4 +971,51 @@ test "native Vulkan remains separate from the DirectComposition bridge" {
     const source = @embedFile("vulkan/core.zig");
     try std.testing.expect(std.mem.indexOf(u8, source, "DCompositionCreateDevice") == null);
     try std.testing.expect(std.mem.indexOf(u8, source, "CreateSwapChainForComposition") == null);
+}
+
+const FakeCandidateContext = struct {
+    candidate_count: usize,
+    failures_before_success: usize,
+    failure: StartupError = error.DeviceUnavailable,
+    always_fail: bool = false,
+    attempted: [4]usize = @splat(0),
+    attempt_count: usize = 0,
+};
+
+fn fakeInitializeCandidate(
+    context: *FakeCandidateContext,
+    candidate_index: usize,
+    attempt: *core_mod.CandidateAttempt,
+) StartupError!void {
+    const names = [_][]const u8{ "discrete", "integrated", "virtual", "cpu" };
+    const name = names[candidate_index];
+    attempt.candidate_count = context.candidate_count;
+    attempt.name_len = name.len;
+    @memcpy(attempt.name_buf[0..name.len], name);
+    context.attempted[context.attempt_count] = candidate_index;
+    context.attempt_count += 1;
+    if (context.always_fail or candidate_index < context.failures_before_success)
+        return context.failure;
+}
+
+test "Vulkan initialization continues until a later candidate succeeds" {
+    var context: FakeCandidateContext = .{
+        .candidate_count = 3,
+        .failures_before_success = 1,
+        .failure = error.RequiredApiVersionUnavailable,
+    };
+    try initializeCandidates(&context, fakeInitializeCandidate);
+    try std.testing.expectEqual(@as(usize, 2), context.attempt_count);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, context.attempted[0..context.attempt_count]);
+}
+
+test "Vulkan initialization reports failure only after every candidate fails" {
+    var context: FakeCandidateContext = .{
+        .candidate_count = 3,
+        .failures_before_success = 0,
+        .always_fail = true,
+    };
+    try std.testing.expectError(error.DeviceUnavailable, initializeCandidates(&context, fakeInitializeCandidate));
+    try std.testing.expectEqual(@as(usize, 3), context.attempt_count);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, context.attempted[0..context.attempt_count]);
 }

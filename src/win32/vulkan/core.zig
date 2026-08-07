@@ -22,6 +22,7 @@ pub const StartupError = error{
     InstanceUnavailable,
     SurfaceUnavailable,
     PhysicalDeviceUnavailable,
+    RequiredApiVersionUnavailable,
     GpuOverrideUnavailable,
     GraphicsPresentQueueUnavailable,
     RequiredDeviceExtensionUnavailable,
@@ -55,6 +56,7 @@ pub fn startupErrorDescription(err: StartupError) []const u8 {
         error.InstanceUnavailable => "the Vulkan loader rejected the required instance capabilities",
         error.SurfaceUnavailable => "the Win32 Vulkan presentation surface is unavailable",
         error.PhysicalDeviceUnavailable => "no Vulkan 1.3 physical device is available",
+        error.RequiredApiVersionUnavailable => "the selected device exposes a Vulkan API version older than 1.3",
         error.GpuOverrideUnavailable => "the configured GPU does not expose the required Vulkan presentation capabilities",
         error.GraphicsPresentQueueUnavailable => "no queue family supports both graphics and Win32 presentation",
         error.RequiredDeviceExtensionUnavailable => "the selected device does not support Vulkan swapchains",
@@ -238,6 +240,8 @@ pub const Core = struct {
         hwnd: win32.HWND,
         configured_gpu: ?[]const u8,
         presentation: Presentation,
+        candidate_index: usize,
+        attempt: *CandidateAttempt,
         vertex_spirv: []align(4) const u8,
         pixel_spirv: []align(4) const u8,
         image_pixel_spirv: []align(4) const u8,
@@ -299,7 +303,15 @@ pub const Core = struct {
         }
         errdefer if (surface_owned) ip.destroy_surface.?(instance, surface, null);
 
-        const selection = try selectPhysicalDevice(&ip, instance, presentation, surface, configured_gpu);
+        const selection = try selectPhysicalDevice(
+            &ip,
+            instance,
+            presentation,
+            surface,
+            configured_gpu,
+            candidate_index,
+            attempt,
+        );
         const physical_device = selection.device;
         const queue_family = selection.queue_family;
         var present_wait_enabled = selection.present_wait and
@@ -478,8 +490,6 @@ pub const Core = struct {
                 "native Vulkan device active: {s}; present tier={s}; alpha composition enabled",
                 .{ name, @tagName(core.present_tier) },
             );
-        } else {
-            log.info("Vulkan DirectComposition bridge device active: {s}", .{name});
         }
         return core;
     }
@@ -1392,12 +1402,36 @@ const Selection = struct {
     present_wait: bool,
 };
 
+pub const CandidateAttempt = struct {
+    candidate_count: usize = 0,
+    name_buf: [vk.VK_MAX_PHYSICAL_DEVICE_NAME_SIZE]u8 = @splat(0),
+    name_len: usize = 0,
+
+    pub fn name(self: *const CandidateAttempt) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    fn select(self: *CandidateAttempt, count: usize, device_name: []const u8) void {
+        self.candidate_count = count;
+        self.name_len = @min(device_name.len, self.name_buf.len);
+        @memcpy(self.name_buf[0..self.name_len], device_name[0..self.name_len]);
+    }
+};
+
+const RankedDevice = struct {
+    device: vk.VkPhysicalDevice,
+    properties: vk.VkPhysicalDeviceProperties,
+    enumeration_index: u32,
+};
+
 fn selectPhysicalDevice(
     ip: *const loader.Instance,
     instance: vk.VkInstance,
     presentation: Presentation,
     surface: vk.VkSurfaceKHR,
     configured_gpu: ?[]const u8,
+    candidate_index: usize,
+    attempt: *CandidateAttempt,
 ) StartupError!Selection {
     var count: u32 = 0;
     if (ip.enumerate_physical_devices(instance, &count, null) != vk.VK_SUCCESS or count == 0)
@@ -1406,60 +1440,83 @@ fn selectPhysicalDevice(
     count = @min(count, devices.len);
     if (ip.enumerate_physical_devices(instance, &count, &devices) != vk.VK_SUCCESS)
         return error.PhysicalDeviceUnavailable;
-    var best: ?Selection = null;
-    var best_score: i32 = -1;
-    var override_seen = false;
-    for (devices[0..count]) |device| {
+    var ranked: [32]RankedDevice = undefined;
+    var ranked_count: usize = 0;
+    for (devices[0..count], 0..) |device, enumeration_index| {
         var properties: vk.VkPhysicalDeviceProperties = undefined;
         ip.get_physical_device_properties(device, &properties);
-        if (properties.apiVersion < apiVersion(1, 3, 0)) continue;
         const name = std.mem.sliceTo(&properties.deviceName, 0);
-        if (configured_gpu) |wanted| {
-            if (std.mem.indexOf(u8, name, wanted) == null) continue;
-            override_seen = true;
-        }
-        if (!supportsRequiredFeatures(ip, device)) continue;
-        const queue_family = switch (presentation) {
-            .native_wsi => blk: {
-                if (!hasExtension(ip, device, "VK_KHR_swapchain")) continue;
-                break :blk findGraphicsPresentQueue(ip, device, surface) orelse continue;
-            },
-            .dcomp_bridge => blk: {
-                if (!hasExtension(ip, device, "VK_KHR_external_memory_win32")) {
-                    log.warn("Vulkan DComp candidate '{s}' lacks VK_KHR_external_memory_win32", .{name});
-                    continue;
-                }
-                if (!hasExtension(ip, device, "VK_KHR_external_semaphore_win32")) {
-                    log.warn("Vulkan DComp candidate '{s}' lacks VK_KHR_external_semaphore_win32", .{name});
-                    continue;
-                }
-                if (!supportsExternalInterop(ip, device)) {
-                    log.warn("Vulkan DComp candidate '{s}' lacks required D3D11 texture or fence interop", .{name});
-                    continue;
-                }
-                break :blk findGraphicsQueue(ip, device) orelse continue;
-            },
-        };
-        const present_wait = presentation == .native_wsi and
-            hasExtension(ip, device, "VK_KHR_present_id") and
-            hasExtension(ip, device, "VK_KHR_present_wait");
-        const score: i32 = switch (properties.deviceType) {
-            vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => 3,
-            vk.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => 2,
-            vk.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => 1,
-            else => 0,
-        };
-        if (configured_gpu != null or score > best_score) {
-            best = .{ .device = device, .queue_family = queue_family, .present_wait = present_wait };
-            best_score = score;
-        }
-        if (configured_gpu != null) break;
+        if (!matchesConfiguredGpu(configured_gpu, name)) continue;
+        insertRankedDevice(&ranked, &ranked_count, .{
+            .device = device,
+            .properties = properties,
+            .enumeration_index = @intCast(enumeration_index),
+        });
     }
-    if (configured_gpu != null and !override_seen) return error.GpuOverrideUnavailable;
-    return best orelse if (configured_gpu != null)
+    if (ranked_count == 0) return if (configured_gpu != null)
         error.GpuOverrideUnavailable
     else
         error.PhysicalDeviceUnavailable;
+    if (candidate_index >= ranked_count) return error.PhysicalDeviceUnavailable;
+
+    const candidate = ranked[candidate_index];
+    const device = candidate.device;
+    const name = std.mem.sliceTo(&candidate.properties.deviceName, 0);
+    attempt.select(ranked_count, name);
+    if (candidate.properties.apiVersion < apiVersion(1, 3, 0))
+        return error.RequiredApiVersionUnavailable;
+    if (!supportsRequiredFeatures(ip, device)) return error.RequiredFeatureUnavailable;
+
+    const queue_family = switch (presentation) {
+        .native_wsi => blk: {
+            if (!hasExtension(ip, device, "VK_KHR_swapchain"))
+                return error.RequiredDeviceExtensionUnavailable;
+            break :blk findGraphicsPresentQueue(ip, device, surface) orelse
+                return error.GraphicsPresentQueueUnavailable;
+        },
+        .dcomp_bridge => blk: {
+            if (!hasExtension(ip, device, "VK_KHR_external_memory_win32"))
+                return error.ExternalMemoryUnavailable;
+            if (!hasExtension(ip, device, "VK_KHR_external_semaphore_win32"))
+                return error.ExternalSemaphoreUnavailable;
+            try requireExternalInterop(ip, device);
+            break :blk findGraphicsQueue(ip, device) orelse
+                return error.GraphicsPresentQueueUnavailable;
+        },
+    };
+    return .{
+        .device = device,
+        .queue_family = queue_family,
+        .present_wait = presentation == .native_wsi and
+            hasExtension(ip, device, "VK_KHR_present_id") and
+            hasExtension(ip, device, "VK_KHR_present_wait"),
+    };
+}
+
+fn matchesConfiguredGpu(configured_gpu: ?[]const u8, name: []const u8) bool {
+    const wanted = configured_gpu orelse return true;
+    return std.mem.indexOf(u8, name, wanted) != null;
+}
+
+fn deviceTypeScore(device_type: vk.VkPhysicalDeviceType) u32 {
+    return switch (device_type) {
+        vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => 3,
+        vk.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => 2,
+        vk.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => 1,
+        else => 0,
+    };
+}
+
+fn insertRankedDevice(devices: *[32]RankedDevice, count: *usize, candidate: RankedDevice) void {
+    var index = count.*;
+    while (index > 0 and
+        deviceTypeScore(candidate.properties.deviceType) > deviceTypeScore(devices[index - 1].properties.deviceType))
+    {
+        devices[index] = devices[index - 1];
+        index -= 1;
+    }
+    devices[index] = candidate;
+    count.* += 1;
 }
 
 fn supportsRequiredFeatures(ip: *const loader.Instance, device: vk.VkPhysicalDevice) bool {
@@ -1504,7 +1561,7 @@ fn findGraphicsQueue(ip: *const loader.Instance, device: vk.VkPhysicalDevice) ?u
     return null;
 }
 
-fn supportsExternalInterop(ip: *const loader.Instance, device: vk.VkPhysicalDevice) bool {
+fn requireExternalInterop(ip: *const loader.Instance, device: vk.VkPhysicalDevice) StartupError!void {
     var external_image_info = std.mem.zeroes(vk.VkPhysicalDeviceExternalImageFormatInfo);
     external_image_info.sType = vk.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
     external_image_info.handleType = vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
@@ -1528,7 +1585,7 @@ fn supportsExternalInterop(ip: *const loader.Instance, device: vk.VkPhysicalDevi
             "Vulkan DComp external image rejected: result={} features=0x{x}",
             .{ image_result, external_image.externalMemoryProperties.externalMemoryFeatures },
         );
-        return false;
+        return error.ExternalMemoryUnavailable;
     }
 
     var semaphore_info = std.mem.zeroes(vk.VkPhysicalDeviceExternalSemaphoreInfo);
@@ -1538,13 +1595,7 @@ fn supportsExternalInterop(ip: *const loader.Instance, device: vk.VkPhysicalDevi
     semaphore_properties.sType = vk.VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES;
     ip.get_physical_device_external_semaphore_properties(device, &semaphore_info, &semaphore_properties);
     const importable = semaphore_properties.externalSemaphoreFeatures & vk.VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT != 0;
-    if (!importable) {
-        log.warn(
-            "Vulkan DComp external semaphore is not importable: features=0x{x}",
-            .{semaphore_properties.externalSemaphoreFeatures},
-        );
-    }
-    return importable;
+    if (!importable) return error.ExternalSemaphoreUnavailable;
 }
 
 fn hasExtension(ip: *const loader.Instance, device: vk.VkPhysicalDevice, wanted: []const u8) bool {
@@ -1652,4 +1703,37 @@ test "opaque Win32 Vulkan handles preserve unaligned handle values" {
 test "native alpha policy rejects opaque-only surfaces" {
     try std.testing.expectEqual(@as(?vk.VkCompositeAlphaFlagBitsKHR, null), chooseCompositeAlpha(vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR));
     try std.testing.expectEqual(vk.VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, chooseCompositeAlpha(vk.VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR).?);
+}
+
+test "Vulkan candidates prefer discrete GPUs and preserve equal-rank enumeration order" {
+    var devices: [32]RankedDevice = undefined;
+    var count: usize = 0;
+    const device_types = [_]vk.VkPhysicalDeviceType{
+        vk.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
+        vk.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+        vk.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
+        vk.VK_PHYSICAL_DEVICE_TYPE_CPU,
+    };
+    for (device_types, 0..) |device_type, enumeration_index| {
+        var properties = std.mem.zeroes(vk.VkPhysicalDeviceProperties);
+        properties.deviceType = device_type;
+        insertRankedDevice(&devices, &count, .{
+            .device = null,
+            .properties = properties,
+            .enumeration_index = @intCast(enumeration_index),
+        });
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 1, 0, 2, 3 }, &.{
+        devices[0].enumeration_index,
+        devices[1].enumeration_index,
+        devices[2].enumeration_index,
+        devices[3].enumeration_index,
+    });
+}
+
+test "configured Vulkan GPU restricts candidates to matching device names" {
+    try std.testing.expect(matchesConfiguredGpu(null, "Intel(R) Iris(R) Xe Graphics"));
+    try std.testing.expect(matchesConfiguredGpu("Iris(R) Xe", "Intel(R) Iris(R) Xe Graphics"));
+    try std.testing.expect(!matchesConfiguredGpu("NVIDIA", "Intel(R) Iris(R) Xe Graphics"));
+    try std.testing.expect(!matchesConfiguredGpu("iris", "Intel(R) Iris(R) Xe Graphics"));
 }
