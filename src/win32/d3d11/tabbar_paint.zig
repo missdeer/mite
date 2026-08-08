@@ -91,6 +91,116 @@ pub fn signature(
     return h.final();
 }
 
+// The cache is only sound if every input `paint` reads reaches the signature:
+// an unhashed input pins the band to stale pixels for as long as it alone
+// changes. The field-count guard fails the build when `TabDrawInfo` grows a
+// field, forcing that decision instead of letting it default to "not hashed".
+test "band signature covers every paint input" {
+    comptime std.debug.assert(std.meta.fields(types.TabDrawInfo).len == 8);
+
+    const base = types.TabDrawInfo{
+        .col_start = 0,
+        .col_end = 20,
+        .close_col = 18,
+        .tab_number = 1,
+        .active = true,
+        .hovered = false,
+        .close_hovered = false,
+        .title = "shell",
+    };
+    const one = struct {
+        fn sig(t: types.TabDrawInfo) u64 {
+            const tabs = [_]types.TabDrawInfo{t};
+            return signature(.{ .tabs = &tabs, .new_tab_col = 21, .new_tab_hovered = false }, 3, 8, 640, 24);
+        }
+    }.sig;
+
+    const baseline = one(base);
+    try std.testing.expectEqual(baseline, one(base));
+
+    var variants: [8]types.TabDrawInfo = .{base} ** 8;
+    variants[0].col_start += 1;
+    variants[1].col_end += 1;
+    variants[2].close_col += 1;
+    variants[3].tab_number += 1;
+    variants[4].active = !base.active;
+    variants[5].hovered = !base.hovered;
+    variants[6].close_hovered = !base.close_hovered;
+    variants[7].title = "shel";
+    for (variants) |v| try std.testing.expect(one(v) != baseline);
+
+    // Non-tab inputs: font generation, cell width, and band extent all change
+    // glyph metrics or geometry without touching `TabBarDraw`.
+    const tabs = [_]types.TabDrawInfo{base};
+    const draw = types.TabBarDraw{ .tabs = &tabs, .new_tab_col = 21, .new_tab_hovered = false };
+    try std.testing.expect(signature(draw, 4, 8, 640, 24) != baseline);
+    try std.testing.expect(signature(draw, 3, 9, 640, 24) != baseline);
+    try std.testing.expect(signature(draw, 3, 8, 641, 24) != baseline);
+    try std.testing.expect(signature(draw, 3, 8, 640, 25) != baseline);
+
+    // New-tab button state.
+    try std.testing.expect(signature(
+        .{ .tabs = &tabs, .new_tab_col = 22, .new_tab_hovered = false },
+        3,
+        8,
+        640,
+        24,
+    ) != baseline);
+    try std.testing.expect(signature(
+        .{ .tabs = &tabs, .new_tab_col = null, .new_tab_hovered = false },
+        3,
+        8,
+        640,
+        24,
+    ) != baseline);
+    try std.testing.expect(signature(
+        .{ .tabs = &tabs, .new_tab_col = 21, .new_tab_hovered = true },
+        3,
+        8,
+        640,
+        24,
+    ) != baseline);
+
+    // Tab count, and the title length prefix that keeps ("ab","c") distinct
+    // from ("a","bc") when the concatenated bytes are identical.
+    var second = base;
+    second.col_start = 20;
+    second.col_end = 40;
+    second.close_col = 38;
+    second.tab_number = 2;
+    const two = [_]types.TabDrawInfo{ base, second };
+    const two_sig = signature(
+        .{ .tabs = &two, .new_tab_col = 21, .new_tab_hovered = false },
+        3,
+        8,
+        640,
+        24,
+    );
+    try std.testing.expect(two_sig != baseline);
+
+    var split_a = base;
+    var split_b = second;
+    split_a.title = "ab";
+    split_b.title = "c";
+    const ab_c = [_]types.TabDrawInfo{ split_a, split_b };
+    split_a.title = "a";
+    split_b.title = "bc";
+    const a_bc = [_]types.TabDrawInfo{ split_a, split_b };
+    try std.testing.expect(signature(
+        .{ .tabs = &ab_c, .new_tab_col = 21, .new_tab_hovered = false },
+        3,
+        8,
+        640,
+        24,
+    ) != signature(
+        .{ .tabs = &a_bc, .new_tab_col = 21, .new_tab_hovered = false },
+        3,
+        8,
+        640,
+        24,
+    ));
+}
+
 // Draws a single character centered in [x, x+w) x [0, h) (used for the close
 // 'x' and new-tab '+'). Borrows the shared brush, setting its color first.
 fn drawCenteredChar(

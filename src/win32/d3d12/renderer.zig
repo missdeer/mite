@@ -1346,8 +1346,8 @@ fn refreshSharedDescriptors(self: *D3d12Renderer) void {
 /// Paint the tab bar into ordinary memory and stage it onto the back buffer.
 ///
 /// The font service owns this drawing for both backends; only the destination
-/// differs. It is repainted every frame because its content tracks tab state
-/// that the renderer does not diff.
+/// differs. The band texture persists across frames, so the D2D pass is skipped
+/// whenever the content signature is unchanged.
 fn copyTabBarBand(self: *D3d12Renderer, prepared: PreparedFrame, tabbar: types.TabBarDraw) void {
     if (prepared.tab_bar_h == 0) return;
     const band = self.font_service.cpuBand(prepared.client_w, prepared.tab_bar_h);

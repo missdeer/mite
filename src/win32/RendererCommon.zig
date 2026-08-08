@@ -16,7 +16,10 @@ blink_timer_armed: bool = false,
 pub fn syncBlinkTimer(self: *RendererCommon, hwnd: win32.HWND, want: bool) void {
     if (want == self.blink_timer_armed) return;
     if (want) {
-        _ = win32.SetTimer(hwnd, types.TIMER_TEXT_BLINK, 250, null);
+        // Only mark armed once SetTimer succeeds: the early-out above would
+        // otherwise suppress every later retry, leaving blinking text frozen
+        // in its current phase once the window goes idle.
+        if (win32.SetTimer(hwnd, types.TIMER_TEXT_BLINK, 250, null) == 0) return;
     } else {
         _ = win32.KillTimer(hwnd, types.TIMER_TEXT_BLINK);
     }
