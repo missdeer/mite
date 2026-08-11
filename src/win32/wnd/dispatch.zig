@@ -1,5 +1,7 @@
+const std = @import("std");
 const win32 = @import("win32").everything;
 
+const panic_mod = @import("../panic.zig");
 const types = @import("../types.zig");
 
 const ime = @import("ime.zig");
@@ -89,19 +91,55 @@ comptime {
     }
 }
 
+fn handlerFor(msg: u32) ?HandlerFn {
+    // The crash MessageBox runs a modal loop that pumps this thread's queue, so
+    // dispatch is re-entered while the process is already dying. Running a
+    // handler there panics a second time and buries the first crash site.
+    if (panic_mod.threadIsPanicking()) return null;
+    // `inline for` unrolls into a chain of constant compares; for ~25 entries
+    // the overhead is negligible compared to handler work. We don't depend on
+    // LLVM forming a jump table here.
+    inline for (TABLE) |e| {
+        if (e.msg == msg) return e.handler;
+    }
+    return null;
+}
+
 pub fn WndProc(
     hwnd: win32.HWND,
     msg: u32,
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
 ) callconv(.winapi) win32.LRESULT {
-    // `inline for` unrolls into a chain of constant compares; for ~25 entries
-    // the overhead is negligible compared to handler work. We don't depend on
-    // LLVM forming a jump table here.
-    inline for (TABLE) |e| {
-        if (e.msg == msg) {
-            return e.handler(hwnd, wparam, lparam) orelse win32.DefWindowProcW(hwnd, msg, wparam, lparam);
-        }
+    if (handlerFor(msg)) |handler| {
+        if (handler(hwnd, wparam, lparam)) |result| return result;
     }
     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+test "a panicking thread routes every window message to the default proc" {
+    const Probe = struct {
+        routed_before: bool = false,
+        latched: bool = false,
+        routed_glyph: bool = false,
+        routed_paint: bool = false,
+
+        fn run(self: *@This()) void {
+            self.routed_before = handlerFor(types.WM_APP_GLYPH_READY) != null;
+            self.latched = panic_mod.enterPanic();
+            self.routed_glyph = handlerFor(types.WM_APP_GLYPH_READY) != null;
+            self.routed_paint = handlerFor(win32.WM_PAINT) != null;
+        }
+    };
+
+    var probe: Probe = .{};
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    thread.join();
+
+    try std.testing.expect(probe.routed_before);
+    try std.testing.expect(probe.latched);
+    try std.testing.expect(!probe.routed_glyph);
+    try std.testing.expect(!probe.routed_paint);
+    // Suppression is per-thread: a panic elsewhere must not deafen this thread.
+    try std.testing.expect(handlerFor(types.WM_APP_GLYPH_READY) != null);
 }

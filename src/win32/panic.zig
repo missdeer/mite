@@ -3,9 +3,19 @@ const win32 = @import("win32").everything;
 
 threadlocal var thread_is_panicking = false;
 
+pub fn threadIsPanicking() bool {
+    return thread_is_panicking;
+}
+
+/// Latches the panic state; true only for the entry that owns crash reporting.
+pub fn enterPanic() bool {
+    if (thread_is_panicking) return false;
+    thread_is_panicking = true;
+    return true;
+}
+
 pub fn panicHandler(msg: []const u8, ret_addr: ?usize) noreturn {
-    if (!thread_is_panicking) {
-        thread_is_panicking = true;
+    if (enterPanic()) {
         crashMessageBox(msg, ret_addr orelse @returnAddress());
     }
     std.debug.defaultPanic(msg, ret_addr);
@@ -39,4 +49,26 @@ fn writeCrash(writer: *std.Io.Writer, msg: []const u8, ret_addr: usize) error{Wr
         .{ .writer = writer, .mode = .no_color },
     );
     try writer.writeByte(0);
+}
+
+test "only the first panic entry on a thread reports the crash" {
+    const Probe = struct {
+        first: bool = false,
+        nested: bool = false,
+
+        fn run(self: *@This()) void {
+            self.first = enterPanic();
+            self.nested = enterPanic();
+        }
+    };
+
+    var probe: Probe = .{};
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    thread.join();
+
+    try std.testing.expect(probe.first);
+    // A re-entrant panic must not report again, so the crash the user sees stays
+    // the first one.
+    try std.testing.expect(!probe.nested);
+    try std.testing.expect(!threadIsPanicking());
 }
