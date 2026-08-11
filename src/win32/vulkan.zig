@@ -45,6 +45,7 @@ pub const RuntimeFailure = struct {
         tab_bar_image,
         tab_bar_upload,
         frame_submission,
+        glyph_atlas_upload,
 
         pub fn description(self: Operation) []const u8 {
             return switch (self) {
@@ -52,6 +53,7 @@ pub const RuntimeFailure = struct {
                 .tab_bar_image => "creating the Vulkan tab bar image",
                 .tab_bar_upload => "uploading the Vulkan tab bar image",
                 .frame_submission => "submitting or presenting a Vulkan frame",
+                .glyph_atlas_upload => "uploading a Vulkan glyph atlas slot",
             };
         }
     };
@@ -140,6 +142,7 @@ atlas_size: ?CellXY = null,
 cells_count: u32 = 0,
 tabbar_image: core_mod.Image = .{},
 tabbar_size: win32.SIZE = .{ .cx = 0, .cy = 0 },
+pending_failure: ?RuntimeFailure = null,
 
 pub fn init(
     common: *RendererCommon,
@@ -292,6 +295,7 @@ pub fn atlasWriteCpu(
     source: [*]const u8,
     source_pitch: u32,
 ) void {
+    if (self.pending_failure != null) return;
     if (!self.atlas.loaded()) return;
     self.core.?.uploadImage(
         &self.atlas,
@@ -301,7 +305,7 @@ pub fn atlasWriteCpu(
         region.y,
         source,
         source_pitch,
-    ) catch |err| fatal("glyph atlas upload", err);
+    ) catch |err| self.recordFailure(.glyph_atlas_upload, err);
 }
 
 pub fn atlasClear(self: *VulkanRenderer, dst_coord: CellXY) void {
@@ -353,6 +357,19 @@ pub fn kittyImageUpload(self: *VulkanRenderer, width: u32, height: u32, rgba: []
     return .{ .owner = self, .image = image };
 }
 
+/// Park a failure raised outside `render`'s error union so the next frame can
+/// hand it to the runtime recovery path. The first cause is the diagnostic one;
+/// everything after it is fallout from the same dead device.
+fn recordFailure(self: *VulkanRenderer, operation: RuntimeFailure.Operation, cause: anyerror) void {
+    if (self.pending_failure == null)
+        self.pending_failure = .{ .operation = operation, .cause = cause };
+}
+
+fn takeFailure(self: *VulkanRenderer) ?RuntimeFailure {
+    defer self.pending_failure = null;
+    return self.pending_failure;
+}
+
 pub fn render(
     self: *VulkanRenderer,
     hwnd: win32.HWND,
@@ -371,6 +388,7 @@ pub fn render(
 ) ?RuntimeFailure {
     _ = remote_session;
     if (self.core == null) fatal("render before startup capability gate", error.ResourceUnavailable);
+    if (self.takeFailure()) |failure| return failure;
     const prepared = (self.prepareFrame(hwnd, term, mouse_in_scrollbar) catch |err| return .{
         .operation = .frame_generation,
         .cause = err,
@@ -393,6 +411,7 @@ pub fn render(
         url_highlight,
     );
     self.common.syncBlinkTimer(hwnd, build.has_blink);
+    if (self.takeFailure()) |failure| return failure;
 
     self.prepareTabbar(prepared, tabbar) catch |err| return .{
         .operation = if (err == error.ImageUnavailable) .tab_bar_image else .tab_bar_upload,
@@ -972,6 +991,26 @@ test "native Vulkan uses the shared shader and CPU glyph contracts" {
     try std.testing.expectEqual(shared.GlyphHandoff.cpu_pixels, glyph_handoff);
     inline for (.{ shader_assets.vertex, shader_assets.pixel, shader_assets.image_pixel }) |asset| {
         try std.testing.expectEqualSlices(u8, &.{ 0x03, 0x02, 0x23, 0x07 }, asset.vulkan_spirv[0..4]);
+    }
+}
+
+test "a glyph atlas upload failure reaches the runtime recovery path instead of panicking" {
+    var renderer = init(undefined, undefined, null, .dcomp_bridge);
+    try std.testing.expect(renderer.takeFailure() == null);
+
+    renderer.recordFailure(.glyph_atlas_upload, error.SynchronizationUnavailable);
+    renderer.recordFailure(.frame_submission, error.PresentationFailed);
+
+    const failure = renderer.takeFailure().?;
+    try std.testing.expectEqual(RuntimeFailure.Operation.glyph_atlas_upload, failure.operation);
+    try std.testing.expectEqual(error.SynchronizationUnavailable, failure.cause);
+    try std.testing.expect(renderer.takeFailure() == null);
+}
+
+test "every Vulkan runtime failure operation can be named in the fallback prompt" {
+    inline for (@typeInfo(RuntimeFailure.Operation).@"enum".fields) |field| {
+        const operation: RuntimeFailure.Operation = @enumFromInt(field.value);
+        try std.testing.expect(operation.description().len > 0);
     }
 }
 

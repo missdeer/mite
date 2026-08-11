@@ -84,6 +84,10 @@ pub const Window = struct {
     // messages, so a second WM_CLOSE (e.g. Alt+F4 hammering) or another
     // tab-bar 'x' click could otherwise stack a nested dialog.
     confirming_close: bool = false,
+    // True while the renderer-fallback MessageBox is up. That modal pumps
+    // messages too, and a dead GPU keeps failing every repaint it pumps, so
+    // without this the prompt would recursively stack on itself.
+    confirming_renderer_fallback: bool = false,
     // Coalesce paint requests: PTY data arrives in small chunks and each
     // chunk currently asks for a redraw. Without this, bursty output
     // (`find /`, `cat large.log`) submits one InvalidateRect syscall per

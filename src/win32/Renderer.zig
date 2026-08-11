@@ -186,6 +186,12 @@ test "Vulkan bridge startup failure never selects native Vulkan" {
     try std.testing.expect(fallback.selectedBackend(true).? != .@"native-vulkan");
 }
 
+test "glyph results are dropped instead of panicking while no backend exists" {
+    var renderer: Renderer = undefined;
+    renderer.backend = null;
+    try std.testing.expect(!renderer.applyGlyphResult(undefined));
+}
+
 test "native Vulkan runtime failure retains operation and cause" {
     const failure: RuntimeFailure = .{ .@"native-vulkan" = .{
         .operation = .frame_submission,
@@ -425,7 +431,10 @@ pub fn setWorkerHwnd(self: *Renderer, gpa: std.mem.Allocator, hwnd: win32.HWND) 
 }
 
 pub fn applyGlyphResult(self: *Renderer, result: *RasterResult) bool {
-    return switch (self.activeBackend().*) {
+    // A failed recoverVulkan leaves no backend while the fallback prompt pumps
+    // the queue, and the raster worker keeps posting results into it.
+    const active = if (self.backend) |*backend| backend else return false;
+    return switch (active.*) {
         inline else => |*backend| backend.applyGlyphResult(result),
     };
 }

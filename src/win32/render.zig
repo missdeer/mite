@@ -13,6 +13,8 @@ const Window = state.Window;
 const global = global_mod.global;
 
 pub fn renderWindow(window: *Window) void {
+    if (window.confirming_renderer_fallback) return;
+
     // Revalidate cached URL hover against current viewport contents. Anything
     // that asked for a repaint (PTY data, resize, keyboard-driven viewport
     // scroll-snap, config reload) automatically refreshes the highlight here;
@@ -65,7 +67,10 @@ pub fn renderWindow(window: *Window) void {
             _ = win32.InvalidateRect(window.hwnd, null, 0);
             return;
         }
-        if (!Renderer.confirmRuntimeFallback(window.hwnd, failure)) {
+        window.confirming_renderer_fallback = true;
+        const accepted = Renderer.confirmRuntimeFallback(window.hwnd, failure);
+        window.confirming_renderer_fallback = false;
+        if (!accepted) {
             _ = win32.DestroyWindow(window.hwnd);
             return;
         }
