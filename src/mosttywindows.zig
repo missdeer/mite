@@ -368,8 +368,8 @@ fn confirmRendererFallback(
 ) bool {
     var message_buf: [768]u8 = undefined;
     const remote_note: []const u8 = if (win32.GetSystemMetrics(win32.SM_REMOTESESSION) != 0)
-        "The capability check failed in a Remote Desktop session. RDP hardware " ++
-            "acceleration may expose OpenGL 4.6, but this session did not satisfy the requirement.\n\n"
+        "The capability check failed in a Remote Desktop session. RDP graphics " ++
+            "capabilities vary by host and session, and this session did not satisfy the configured renderer's requirements.\n\n"
     else
         "";
     const message = std.fmt.bufPrintZ(
