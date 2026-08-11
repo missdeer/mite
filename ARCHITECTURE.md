@@ -161,7 +161,7 @@ Entry sequence in `mosttywindows.zig`:
    10. `DragAcceptFiles` + `ChangeWindowMessageFilterEx` for `WM_DROPFILES` and
        `WM_COPYGLOBALDATA` — needed when running elevated so Explorer drops
        still arrive.
-   11. `ShowWindow` (maximized if configured), `SetForegroundWindow`,
+   11. `ShowWindow` (maximized if configured or requested by the launcher), `SetForegroundWindow`,
        `BringWindowToTop`, then `config_watch.start(hwnd)`.
 3. **Main loop** (`mosttywindows.zig:207`):
    ```

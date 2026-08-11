@@ -33,13 +33,17 @@ fn winMain(
     _: ?win32.HINSTANCE,
     _: ?win32.HINSTANCE,
     _: ?[*:0]u8,
-    _: c_int,
+    show_cmd: c_int,
 ) callconv(.winapi) c_int {
-    main() catch return 1;
+    mainWithShowCommand(@bitCast(@as(u32, @intCast(show_cmd)))) catch return 1;
     return 0;
 }
 
 pub fn main() !void {
+    return mainWithShowCommand(win32.SW_SHOWNORMAL);
+}
+
+fn mainWithShowCommand(startup_show_cmd: win32.SHOW_WINDOW_CMD) !void {
     diag.init();
     const process_args: std.process.Args = .{
         .vector = std.os.windows.peb().ProcessParameters.CommandLine.slice(),
@@ -276,10 +280,7 @@ pub fn main() !void {
     // Show maximized first when configured so that toggling fullscreen off
     // later restores the maximized state, not a normal-sized window — the
     // toggle snapshots WINDOWPLACEMENT at entry.
-    const show_cmd: win32.SHOW_WINDOW_CMD = if (global.config.maximize)
-        win32.SW_SHOWMAXIMIZED
-    else
-        .{ .SHOWNORMAL = 1 };
+    const show_cmd = initialShowCommand(global.config.maximize, startup_show_cmd);
     _ = win32.ShowWindow(hwnd, show_cmd);
     if (global.config.fullscreen) wnd_misc.toggleFullscreen(hwnd);
 
@@ -343,6 +344,21 @@ pub fn main() !void {
         std.debug.assert(wait_result == n_tabs);
         global_mod.flushMessages();
     }
+}
+
+fn initialShowCommand(config_maximize: bool, startup_show_cmd: win32.SHOW_WINDOW_CMD) win32.SHOW_WINDOW_CMD {
+    return if (config_maximize) win32.SW_SHOWMAXIMIZED else startup_show_cmd;
+}
+
+test "shortcut maximize survives startup fallback dialogs" {
+    try std.testing.expectEqual(
+        win32.SW_SHOWMAXIMIZED,
+        initialShowCommand(false, win32.SW_SHOWMAXIMIZED),
+    );
+    try std.testing.expectEqual(
+        win32.SW_SHOWMAXIMIZED,
+        initialShowCommand(true, win32.SW_SHOWNORMAL),
+    );
 }
 
 fn confirmRendererFallback(
