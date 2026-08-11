@@ -64,11 +64,14 @@ const DebugStats = struct {
     rows_skipped: u64 = 0,
 };
 
+const DeviceSource = enum { dedicated, font_service };
+
 // D3D11 core
 common: *RendererCommon,
 font_service: *FontService,
 device: *win32.ID3D11Device,
 context: *win32.ID3D11DeviceContext,
+device_source: DeviceSource,
 
 // Shaders
 vertex_shader: *win32.ID3D11VertexShader,
@@ -158,7 +161,7 @@ tabbar_sig_tex: ?*win32.ID3D11Texture2D = null,
 // Render-device-local copy of the band. The flip-model back buffer is undefined
 // every frame, so the strip must be re-copied even when the band content is
 // unchanged — but copying from here instead of the shared texture keeps the
-// cross-device keyed-mutex handoff off the steady-state path entirely.
+// keyed-mutex handoff off the steady-state path entirely.
 band_local: ?*win32.ID3D11Texture2D = null,
 band_local_w: u32 = 0,
 band_local_h: u32 = 0,
@@ -195,11 +198,31 @@ kitty_images: kitty_image_mod.Cache(gpu.KittyImage) = .{},
 // of the whole cache being thrown out.
 cache_gen: u32 = 0,
 
-pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu: ?[]const u8) D3d11Renderer {
+pub const InitError = error{DeviceUnavailable};
+
+pub fn initErrorDescription(_: InitError) []const u8 {
+    return "the D3D11 renderer could not create or retain a usable device";
+}
+
+fn deviceSourceForCreateResult(hr: i32) DeviceSource {
+    return if (hr >= 0) .dedicated else .font_service;
+}
+
+fn initFailure(operation: []const u8, hr: i32) InitError {
+    log.err("{s} failed, hresult=0x{x}", .{ operation, @as(u32, @bitCast(hr)) });
+    return error.DeviceUnavailable;
+}
+
+pub fn init(
+    common: *RendererCommon,
+    font_service: *FontService,
+    configured_gpu: ?[]const u8,
+) InitError!D3d11Renderer {
     // Create D3D11 device
     const levels = [_]win32.D3D_FEATURE_LEVEL{.@"11_0"};
     var device: *win32.ID3D11Device = undefined;
     var context: *win32.ID3D11DeviceContext = undefined;
+    var device_source: DeviceSource = .dedicated;
     const selected_adapter = if (configured_gpu) |name|
         swap_chain_mod.findHardwareAdapterByName(name) orelse
             std.debug.panic("configured GPU '{s}' was not found among hardware adapters", .{name})
@@ -221,14 +244,27 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
             null,
             &context,
         );
-        if (hr < 0) {
-            if (configured_gpu) |name| std.debug.panic(
-                "D3D11CreateDevice failed for configured GPU '{s}', hresult=0x{x}",
-                .{ name, @as(u32, @bitCast(hr)) },
+        device_source = deviceSourceForCreateResult(hr);
+        if (device_source == .font_service) {
+            log.warn(
+                "D3D11CreateDevice failed for {s} GPU{s}{s}, hresult=0x{x}; reusing font service device",
+                .{
+                    if (configured_gpu != null) "configured" else "default",
+                    if (configured_gpu != null) " " else "",
+                    configured_gpu orelse "",
+                    @as(u32, @bitCast(hr)),
+                },
             );
-            fatalHr("D3D11CreateDevice", hr);
+            const retained = font_service.retainD3d11Device();
+            device = retained.device;
+            context = retained.context;
         }
     }
+    errdefer _ = device.IUnknown.Release();
+    errdefer _ = context.IUnknown.Release();
+    const removed_reason = device.GetDeviceRemovedReason();
+    if (removed_reason < 0) return initFailure("GetDeviceRemovedReason", removed_reason);
+
     const adapter_info = swap_chain_mod.detectAdapter(device);
     log.info(
         "D3D11 device created: selection={s}, adapter='{s}', remote_or_software={}",
@@ -250,8 +286,9 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
             null,
             &vertex_shader,
         );
-        if (hr < 0) fatalHr("CreateVertexShader", hr);
+        if (hr < 0) return initFailure("CreateVertexShader", hr);
     }
+    errdefer _ = vertex_shader.IUnknown.Release();
 
     var pixel_shader: *win32.ID3D11PixelShader = undefined;
     {
@@ -261,8 +298,9 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
             null,
             &pixel_shader,
         );
-        if (hr < 0) fatalHr("CreatePixelShader", hr);
+        if (hr < 0) return initFailure("CreatePixelShader", hr);
     }
+    errdefer _ = pixel_shader.IUnknown.Release();
     var image_pixel_shader: *win32.ID3D11PixelShader = undefined;
     {
         const hr = device.CreatePixelShader(
@@ -271,8 +309,9 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
             null,
             &image_pixel_shader,
         );
-        if (hr < 0) fatalHr("CreatePixelShader(image)", hr);
+        if (hr < 0) return initFailure("CreatePixelShader(image)", hr);
     }
+    errdefer _ = image_pixel_shader.IUnknown.Release();
 
     // Constant buffer
     var const_buf: *win32.ID3D11Buffer = undefined;
@@ -286,8 +325,9 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
             .StructureByteStride = 0,
         };
         const hr = device.CreateBuffer(&desc, null, &const_buf);
-        if (hr < 0) fatalHr("CreateConstBuffer", hr);
+        if (hr < 0) return initFailure("CreateConstBuffer", hr);
     }
+    errdefer _ = const_buf.IUnknown.Release();
     var image_const_buf: *win32.ID3D11Buffer = undefined;
     {
         const desc: win32.D3D11_BUFFER_DESC = .{
@@ -299,8 +339,12 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
             .StructureByteStride = 0,
         };
         const hr = device.CreateBuffer(&desc, null, &image_const_buf);
-        if (hr < 0) fatalHr("CreateConstBuffer(image)", hr);
+        if (hr < 0) return initFailure("CreateConstBuffer(image)", hr);
     }
+    errdefer _ = image_const_buf.IUnknown.Release();
+
+    const image_blend_state = try kitty_image_mod.createBlendState(device);
+    errdefer _ = image_blend_state.IUnknown.Release();
 
     common.remote_or_software_adapter = adapter_info.remote_or_software;
 
@@ -309,12 +353,13 @@ pub fn init(common: *RendererCommon, font_service: *FontService, configured_gpu:
         .font_service = font_service,
         .device = device,
         .context = context,
+        .device_source = device_source,
         .vertex_shader = vertex_shader,
         .pixel_shader = pixel_shader,
         .const_buf = const_buf,
         .image_pixel_shader = image_pixel_shader,
         .image_const_buf = image_const_buf,
-        .image_blend_state = kitty_image_mod.createBlendState(device),
+        .image_blend_state = image_blend_state,
     };
 }
 
@@ -485,9 +530,17 @@ pub fn deinit(self: *D3d11Renderer) void {
     self.shader_cells.release();
     std.heap.page_allocator.free(self.shadow_cells);
     self.shadow_cells = &.{};
-    // Clear all D3D state and flush before releasing the swap chain,
-    // otherwise DXGI keeps the window surface and GDI can't draw to it.
-    self.context.ClearState();
+    // Clear all D3D state and flush before releasing the swap chain, otherwise
+    // DXGI keeps the window surface and GDI can't draw to it. The retained
+    // path delegates this mutation to FontService so the shared-context
+    // ownership is explicit; its D3D state is not used concurrently.
+    switch (self.device_source) {
+        .dedicated => {
+            self.context.ClearState();
+            self.context.Flush();
+        },
+        .font_service => self.font_service.resetRetainedD3d11Context(),
+    }
     if (self.back_buffer_tex) |bb| _ = bb.IUnknown.Release();
     self.back_buffer_tex = null;
     // Step B persistent grid: release RTV before its underlying texture
@@ -502,7 +555,6 @@ pub fn deinit(self: *D3d11Renderer) void {
     self.background_image.release();
     if (self.bg_sampler) |s| _ = s.IUnknown.Release();
     self.bg_sampler = null;
-    self.context.Flush();
     // DirectComposition tree + swap chain share a lifecycle: all four are
     // created together in swap_chain_mod.init and left `undefined` until then.
     // Release in reverse-creation order (visual → target → device → swap
@@ -1092,4 +1144,9 @@ test "D3D11 accepts every generated DirectX shader asset" {
     );
     try std.testing.expect(image_pixel_hr >= 0);
     defer _ = image_pixel_shader.IUnknown.Release();
+}
+
+test "a failed second D3D11 device creation retains the font service device" {
+    try std.testing.expectEqual(DeviceSource.dedicated, deviceSourceForCreateResult(0));
+    try std.testing.expectEqual(DeviceSource.font_service, deviceSourceForCreateResult(-1));
 }

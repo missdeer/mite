@@ -142,7 +142,11 @@ pub fn main() !void {
         global.config.font_ligatures,
         global.config.gpu,
         global.config.renderer,
-    );
+    ) catch |err| {
+        std.log.err("renderer: d3d11 startup failed ({s}): {s}", .{ @errorName(err), Renderer.d3d11InitErrorDescription(err) });
+        Renderer.reportD3d11Unavailable(null, err);
+        return error.RendererStartupFailed;
+    };
     const cell_size = global.renderer.common.cell_size;
     const placement = window_geom.calcWindowPlacement(
         maybe_monitor,
@@ -205,7 +209,12 @@ pub fn main() !void {
             _ = win32.DestroyWindow(hwnd);
             return error.RendererFallbackDeclined;
         }
-        global.renderer.fallbackToD3d11(global.config.gpu);
+        global.renderer.fallbackToD3d11(global.config.gpu) catch |err| {
+            std.log.err("renderer: d3d11 startup fallback failed ({s}): {s}", .{ @errorName(err), Renderer.d3d11InitErrorDescription(err) });
+            Renderer.reportD3d11Unavailable(hwnd, err);
+            _ = win32.DestroyWindow(hwnd);
+            return error.RendererFallbackUnavailable;
+        };
         global.config.renderer = fallback.replacement;
         std.log.warn(
             "renderer: user accepted startup fallback from {s} to {s} after {s}",

@@ -740,10 +740,12 @@ pub fn releaseFontWrite(mutex: *win32.IDXGIKeyedMutex) void {
     if (hr != 0) com.fatalHr("ReleaseSync(font write)", hr);
 }
 
-// Backend-side view of one font-service texture. The source is AddRef'd so a
-// DPI/size rebuild cannot invalidate the identity while the imported view is
-// still cached. Key 1 belongs to the consumer; releasing key 0 hands the
-// surface back to the font service for its next D2D draw.
+// Backend-side view of one font-service texture. Normally the backend imports
+// it on a distinct D3D11 device; recovery may import it on the retained font
+// device itself. The source is AddRef'd so a DPI/size rebuild cannot invalidate
+// the identity while the imported view is still cached. Key 1 belongs to the
+// consumer; releasing key 0 hands the surface back to the font service for its
+// next D2D draw.
 pub const SharedTexture = struct {
     source: ?*win32.ID3D11Texture2D = null,
     imported: ?*win32.ID3D11Texture2D = null,

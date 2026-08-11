@@ -4,7 +4,6 @@ const win32 = @import("win32").everything;
 
 const D3d11Renderer = @import("../d3d11.zig");
 const bg_image = @import("background_image.zig");
-const com = @import("com.zig");
 const gpu = @import("gpu.zig");
 const types = @import("../types.zig");
 
@@ -363,7 +362,7 @@ fn hashPlacements(tab_id: types.TabId, placements: []const Placement) u64 {
     return hasher.final();
 }
 
-pub fn createBlendState(device: *win32.ID3D11Device) *win32.ID3D11BlendState {
+pub fn createBlendState(device: *win32.ID3D11Device) error{DeviceUnavailable}!*win32.ID3D11BlendState {
     var desc = std.mem.zeroes(win32.D3D11_BLEND_DESC);
     desc.RenderTarget[0] = .{
         .BlendEnable = 1,
@@ -377,7 +376,10 @@ pub fn createBlendState(device: *win32.ID3D11Device) *win32.ID3D11BlendState {
     };
     var state: *win32.ID3D11BlendState = undefined;
     const hr = device.CreateBlendState(&desc, &state);
-    if (hr < 0) com.fatalHr("CreateBlendState(kitty-images)", hr);
+    if (hr < 0) {
+        log.err("CreateBlendState(kitty-images) failed, hresult=0x{x}", .{@as(u32, @bitCast(hr))});
+        return error.DeviceUnavailable;
+    }
     return state;
 }
 

@@ -22,9 +22,11 @@ const log = std.log.scoped(.font_service);
 
 common: *RendererCommon,
 
-// This device is process-lifetime font infrastructure. It is deliberately
-// distinct from every renderer backend device; D2D output crosses that
-// boundary through keyed shared textures owned by this service.
+// This device is process-lifetime font infrastructure. Renderer backends
+// normally create a distinct device, and D2D output crosses that boundary
+// through keyed shared textures owned by this service. If the driver refuses
+// to create a second D3D11 device, the D3D11 backend may retain this device;
+// the same keyed handoff is kept so both cases use one rendering path.
 device: *win32.ID3D11Device,
 context: *win32.ID3D11DeviceContext,
 dwrite_factory: *win32.IDWriteFactory2,
@@ -228,6 +230,22 @@ pub fn setWorkerHwnd(self: *FontService, gpa: std.mem.Allocator, hwnd: win32.HWN
     };
     self.glyph_worker_started = true;
     self.glyph_worker.setHwnd(hwnd);
+}
+
+pub const RetainedD3d11Device = struct {
+    device: *win32.ID3D11Device,
+    context: *win32.ID3D11DeviceContext,
+};
+
+pub fn retainD3d11Device(self: *FontService) RetainedD3d11Device {
+    _ = self.device.IUnknown.AddRef();
+    _ = self.context.IUnknown.AddRef();
+    return .{ .device = self.device, .context = self.context };
+}
+
+pub fn resetRetainedD3d11Context(self: *FontService) void {
+    self.context.ClearState();
+    self.context.Flush();
 }
 
 pub fn deinit(self: *FontService) void {

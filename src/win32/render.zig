@@ -69,13 +69,25 @@ pub fn renderWindow(window: *Window) void {
         }
         window.confirming_renderer_fallback = true;
         const accepted = Renderer.confirmRuntimeFallback(window.hwnd, failure);
-        window.confirming_renderer_fallback = false;
         if (!accepted) {
+            window.confirming_renderer_fallback = false;
             _ = win32.DestroyWindow(window.hwnd);
             return;
         }
-        global.renderer.fallbackToD3d11(global.config.gpu);
+        global.renderer.fallbackToD3d11(global.config.gpu) catch |err| {
+            std.log.err(
+                "renderer: d3d11 fallback from {s} failed ({s}): {s}",
+                .{ failure.backendName(), @errorName(err), Renderer.d3d11InitErrorDescription(err) },
+            );
+            Renderer.reportD3d11Unavailable(window.hwnd, err);
+            // Leave paint suppression armed while the current WM_PAINT
+            // unwinds, then let the normal message loop process the quit.
+            win32.PostQuitMessage(1);
+            return;
+        };
+        window.confirming_renderer_fallback = false;
         global.config.renderer = .d3d11;
+        global.renderer.reloadBackgroundImage(global.gpa.allocator(), &global.config, window.hwnd);
         std.log.warn("renderer: user accepted runtime fallback from {s} to d3d11", .{failure.backendName()});
         _ = win32.InvalidateRect(window.hwnd, null, 0);
     }

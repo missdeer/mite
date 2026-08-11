@@ -20,9 +20,14 @@ const gpu = @import("d3d11/gpu.zig");
 pub const BgImageDecoded = d3d11.BgImageDecoded;
 pub const RasterResult = FontService.RasterResult;
 pub const FontConfig = FontService.FontConfig;
+pub const D3d11InitError = d3d11.InitError;
 pub const scrollbarWidth = d3d11.scrollbarWidth;
 pub const default_primary_font_family = FontService.default_primary_font_family;
 pub const default_font_size_pt = FontService.default_font_size_pt;
+
+pub fn d3d11InitErrorDescription(err: D3d11InitError) []const u8 {
+    return d3d11.initErrorDescription(err);
+}
 
 /// Backends are all-or-nothing: every variant here fulfils the whole contract
 /// below, because the facade dispatches every method to whichever one is
@@ -122,7 +127,7 @@ pub fn init(
     font_ligatures: bool,
     configured_gpu: ?[]const u8,
     backend: Config.RendererBackend,
-) void {
+) d3d11.InitError!void {
     // The font service and the backend resolve the adapter from the same
     // configured name, which is what keeps them on one GPU. Splitting them
     // across adapters would leave rasterization and compositing on different
@@ -137,7 +142,7 @@ pub fn init(
     self.configured_backend = backend;
     self.vulkan_recovery_attempted = false;
     self.backend = switch (backend) {
-        .d3d11 => .{ .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu) },
+        .d3d11 => .{ .d3d11 = try d3d11.init(&self.common, &self.font_service, configured_gpu) },
         .d3d12 => null,
         .opengl => .{
             .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .interop),
@@ -186,9 +191,35 @@ test "Vulkan bridge startup failure never selects native Vulkan" {
     try std.testing.expect(fallback.selectedBackend(true).? != .@"native-vulkan");
 }
 
-test "glyph results are dropped instead of panicking while no backend exists" {
+test "failed D3D11 fallback is returned without leaving a stale backend" {
+    const FailingInit = struct {
+        fn run(_: *RendererCommon, _: *FontService, _: ?[]const u8) d3d11.InitError!d3d11 {
+            return error.DeviceUnavailable;
+        }
+    };
+
     var renderer: Renderer = undefined;
     renderer.backend = null;
+    renderer.configured_backend = .vulkan;
+    renderer.vulkan_recovery_attempted = true;
+
+    try std.testing.expectError(
+        error.DeviceUnavailable,
+        renderer.fallbackToD3d11With(null, FailingInit.run),
+    );
+    try std.testing.expect(renderer.backend == null);
+    try std.testing.expectEqual(Config.RendererBackend.d3d11, renderer.configured_backend);
+    try std.testing.expect(!renderer.vulkan_recovery_attempted);
+}
+
+test "backend-dependent facade calls are ignored while no backend exists" {
+    var renderer: Renderer = undefined;
+    renderer.backend = null;
+
+    renderer.onFontStateChanged();
+    renderer.reloadBackgroundImage(std.testing.allocator, undefined, undefined);
+    renderer.applyDecodedBackgroundImage(undefined);
+    renderer.releaseKittyImagesForTab(0);
     try std.testing.expect(!renderer.applyGlyphResult(undefined));
 }
 
@@ -264,14 +295,40 @@ pub fn initializeWindow(
     };
 }
 
-pub fn fallbackToD3d11(self: *Renderer, configured_gpu: ?[]const u8) void {
+pub fn fallbackToD3d11(self: *Renderer, configured_gpu: ?[]const u8) d3d11.InitError!void {
+    return self.fallbackToD3d11With(configured_gpu, d3d11.init);
+}
+
+fn fallbackToD3d11With(
+    self: *Renderer,
+    configured_gpu: ?[]const u8,
+    comptime init_fn: anytype,
+) d3d11.InitError!void {
     if (self.backend) |*active| switch (active.*) {
         .d3d11 => return,
         inline else => |*backend| backend.deinit(),
     };
+    self.backend = null;
     self.configured_backend = .d3d11;
     self.vulkan_recovery_attempted = false;
-    self.backend = .{ .d3d11 = d3d11.init(&self.common, &self.font_service, configured_gpu) };
+    const replacement = try init_fn(&self.common, &self.font_service, configured_gpu);
+    self.backend = .{ .d3d11 = replacement };
+}
+
+pub fn reportD3d11Unavailable(hwnd: ?win32.HWND, err: D3d11InitError) void {
+    var message_buf: [512]u8 = undefined;
+    const message = std.fmt.bufPrintZ(
+        &message_buf,
+        "Mostty could not initialize its D3D11 renderer ({s}).\n\n" ++
+            "There is no usable renderer left, so Mostty will exit.",
+        .{@errorName(err)},
+    ) catch "Mostty could not initialize its D3D11 renderer. Mostty will exit.";
+    _ = win32.MessageBoxA(
+        hwnd,
+        message,
+        "Mostty Renderer Unavailable",
+        .{ .ICONHAND = 1 },
+    );
 }
 
 pub fn recoverVulkan(self: *Renderer, hwnd: win32.HWND, configured_gpu: ?[]const u8) bool {
@@ -314,15 +371,18 @@ pub fn tabBarHeightForDpi(self: *Renderer, dpi: u32) i32 {
 
 pub fn updateDpi(self: *Renderer, dpi: u32) void {
     if (self.font_service.updateDpi(dpi)) {
-        switch (self.activeBackend().*) {
-            inline else => |*backend| backend.onFontStateChanged(),
-        }
+        self.onFontStateChanged();
     }
 }
 
 pub fn updateFont(self: *Renderer, font_config: FontConfig) void {
     self.font_service.updateFont(font_config);
-    switch (self.activeBackend().*) {
+    self.onFontStateChanged();
+}
+
+fn onFontStateChanged(self: *Renderer) void {
+    const active = if (self.backend) |*backend| backend else return;
+    switch (active.*) {
         inline else => |*backend| backend.onFontStateChanged(),
     }
 }
@@ -445,13 +505,15 @@ pub fn reloadBackgroundImage(
     cfg: *const Config,
     hwnd: win32.HWND,
 ) void {
-    switch (self.activeBackend().*) {
+    const active = if (self.backend) |*backend| backend else return;
+    switch (active.*) {
         inline else => |*backend| backend.reloadBackgroundImage(gpa, cfg, hwnd),
     }
 }
 
 pub fn applyDecodedBackgroundImage(self: *Renderer, result: *const BgImageDecoded) void {
-    switch (self.activeBackend().*) {
+    const active = if (self.backend) |*backend| backend else return;
+    switch (active.*) {
         inline else => |*backend| backend.applyDecodedBackgroundImage(result),
     }
 }
