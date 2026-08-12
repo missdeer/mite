@@ -67,6 +67,7 @@ const TABLE = [_]struct { msg: u32, handler: HandlerFn }{
     .{ .msg = win32.WM_IME_STARTCOMPOSITION, .handler = &ime.onImeStartComposition },
     .{ .msg = win32.WM_IME_COMPOSITION, .handler = &ime.onImeComposition },
     .{ .msg = win32.WM_IME_NOTIFY, .handler = &ime.onImeNotify },
+    .{ .msg = win32.WM_INPUTLANGCHANGE, .handler = &ime.onInputLangChange },
     // misc
     .{ .msg = win32.WM_TIMER, .handler = &misc.onTimer },
     .{ .msg = win32.WM_SYSCOMMAND, .handler = &misc.onSysCommand },
@@ -81,6 +82,9 @@ const TABLE = [_]struct { msg: u32, handler: HandlerFn }{
 };
 
 comptime {
+    // The O(n^2) uniqueness scan below exceeds the default backwards-branch
+    // quota once the table grows past ~25 entries.
+    @setEvalBranchQuota(4000);
     // Duplicate msg entries would silently shadow the later one; the switch
     // form used to make this a compile error, but a flat table can be
     // reordered without noticing. Enforce uniqueness up front.

@@ -65,3 +65,15 @@ pub fn onImeNotify(hwnd: win32.HWND, wparam: win32.WPARAM, _: win32.LPARAM) ?win
     }
     return null;
 }
+
+// The user switched input method (Win+Space, language bar, Ctrl+Shift, ...).
+// lparam is the new input-locale HKL; remember it on the active tab so the
+// choice is restored when this tab is activated again (MOSTTY-44). Fall
+// through to DefWindowProcW so the OS completes the change.
+pub fn onInputLangChange(hwnd: win32.HWND, _: win32.WPARAM, lparam: win32.LPARAM) ?win32.LRESULT {
+    const window = global_mod.windowFromHwnd(hwnd);
+    const raw: usize = @bitCast(lparam);
+    const hkl: ?win32.HKL = if (raw == 0) null else @ptrFromInt(raw);
+    window.recordActiveInputLayout(hkl);
+    return null;
+}
