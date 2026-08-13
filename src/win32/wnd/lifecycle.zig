@@ -16,9 +16,6 @@ pub fn onCreate(hwnd: win32.HWND, _: win32.WPARAM, _: win32.LPARAM) ?win32.LRESU
         .dwm_redirected = global.config.renderer.usesDwmRedirection(),
     };
     const window = &global.window.?;
-    // Capture the input method active at startup as the default that new tabs
-    // (and tabs that never switched) fall back to (MOSTTY-44).
-    window.default_hkl = win32.GetKeyboardLayout(0);
     // Boot the renderer at whatever cadence the current session deserves, then
     // keep it in sync by subscribing to WTS session-change notifications so
     // an RDP connect/disconnect after launch toggles the cap dynamically.

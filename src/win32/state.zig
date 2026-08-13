@@ -41,9 +41,10 @@ pub const Tab = struct {
     // never moves.
     pty_ring: pty_ring_mod.PtyRing = undefined,
     // Input method (keyboard layout / IME) this tab should use, remembered
-    // across tab switches (MOSTTY-44). null means "use the window default".
-    // Recorded on WM_INPUTLANGCHANGE while this tab is active and reapplied
-    // when it becomes active again. Process-memory only, never persisted.
+    // across tab switches (MOSTTY-44). Seeded at tab creation with the system
+    // default input language and updated on WM_INPUTLANGCHANGE while this tab is
+    // active; reapplied when the tab becomes active again. null only during
+    // teardown (no active tab) or if the OS query failed. Process-memory only.
     input_layout: ?win32.HKL = null,
 };
 
@@ -135,10 +136,6 @@ pub const Window = struct {
     // is captured so a tab switch doesn't leak the hover onto another tab's
     // grid. The hit itself carries the multi-row viewport range.
     hovered_url: ?HoveredUrl = null,
-    // Input method (keyboard layout / IME) active when the window was created,
-    // used as the fallback for tabs that have not recorded their own layout
-    // (MOSTTY-44). null if the OS query failed.
-    default_hkl: ?win32.HKL = null,
     // Last (col, row, tab) the URL hover detection looked at. Set on every
     // WM_MOUSEMOVE that hits a grid cell and cleared whenever hovered_url is
     // invalidated. Lets updateUrlHover short-circuit when the mouse stays
@@ -279,16 +276,22 @@ pub const Window = struct {
         self.active().input_layout = hkl;
     }
 
-    // The input method that should be active for the current tab: its recorded
-    // layout, or the window default when it has none (which is the case for a
-    // freshly created tab). (MOSTTY-44)
+    // The input method to restore for the current tab: the layout it recorded
+    // (seeded at creation, updated on WM_INPUTLANGCHANGE). null only during
+    // teardown when no tab is active. (MOSTTY-44)
     pub fn activeInputLayout(self: *Window) ?win32.HKL {
-        if (self.tabs.items.len == 0) return self.default_hkl;
-        return self.active().input_layout orelse self.default_hkl;
+        if (self.tabs.items.len == 0) return null;
+        return self.active().input_layout;
     }
 
     fn applyActiveInputLayout(self: *Window) void {
         const hkl = self.activeInputLayout() orelse return;
+        // Skip when the target already matches the OS layout. Re-posting the
+        // current HKL is not harmless for CJK IMEs: the HKL encodes only the
+        // input *language*, not the conversion mode, so re-activating it resets
+        // the IME to its default (e.g. Chinese) mode — an unwanted flip when the
+        // tab is already on that layout. (MOSTTY-44)
+        if (hkl == win32.GetKeyboardLayout(0)) return;
         // Ask the OS to activate this tab's input method the documented way:
         // posting WM_INPUTLANGCHANGEREQUEST to our own window lets DefWindowProcW
         // (and TSF) perform the switch. ActivateKeyboardLayout's flag set has no
@@ -310,12 +313,25 @@ pub const Window = struct {
         // against the new tab.
         self.hovered_url = null;
         self.hover_cell = null;
-        // Restore the input method this tab was last using (MOSTTY-44); a new
-        // tab has none recorded and falls back to the window default.
+        // Switch to the input method this tab recorded (seeded at creation with
+        // the system default, updated as the user switches), unless the OS is
+        // already on it. (MOSTTY-44)
         self.applyActiveInputLayout();
         self.requestRender();
     }
 };
+
+// The system default input language (Language Bar "default input method"), used
+// to seed every new tab so a fresh tab starts on the default keyboard regardless
+// of what the previously active tab was using (MOSTTY-44). Read into a zeroed
+// usize first because SPI_GETDEFAULTINPUTLANG writes only a DWORD-sized HKL;
+// widening from a pointer-sized var would leave its high bytes uninitialized.
+pub fn systemDefaultInputLayout() ?win32.HKL {
+    var raw: usize = 0;
+    if (win32.SystemParametersInfoW(win32.SPI_GETDEFAULTINPUTLANG, 0, @ptrCast(&raw), .{}) == 0) return null;
+    if (raw == 0) return null;
+    return @ptrFromInt(raw);
+}
 
 // QueryPerformanceCounter wrappers for short-interval (sub-ms) render timing.
 // GetTickCount64 is 15.6 ms resolution by default — useless for a 1–10 ms
@@ -345,70 +361,71 @@ pub fn qpcUsSince(prev: u64) u64 {
     return (now - prev) * 1_000_000 / freq;
 }
 
-// MOSTTY-44 business rules: input method is remembered per tab, a tab that has
-// never switched resolves to the window default, and one tab's choice never
-// bleeds into another. These exercise the record/resolve seam that the
-// WM_INPUTLANGCHANGE handler and onActiveChanged drive; fake HKLs stand in for
-// real keyboard-layout handles since only pointer identity matters here.
-fn testWindow(default: ?win32.HKL) Window {
-    return .{ .hwnd = undefined, .default_hkl = default };
+// MOSTTY-44 business rules: each tab is seeded with the system default input
+// language at creation, WM_INPUTLANGCHANGE updates the active tab's record, and
+// one tab's choice never bleeds into another. These exercise the record/resolve
+// seam that the WM_INPUTLANGCHANGE handler and onActiveChanged drive; fake HKLs
+// stand in for real keyboard-layout handles since only pointer identity matters
+// here. The seeding (systemDefaultInputLayout) and the "skip the switch when the
+// target already matches the OS layout" guard both call the OS and are not
+// covered here.
+fn testWindow() Window {
+    return .{ .hwnd = undefined };
 }
 
-test "a tab with no recorded layout falls back to the window default" {
+test "a tab resolves to the layout it was seeded with at creation" {
     const alloc = std.testing.allocator;
-    const default: win32.HKL = @ptrFromInt(0x1000);
+    const seeded: win32.HKL = @ptrFromInt(0x0409);
     var tab: Tab = undefined;
-    tab.input_layout = null;
+    tab.input_layout = seeded;
 
-    var window = testWindow(default);
+    var window = testWindow();
     try window.tabs.append(alloc, &tab);
     defer window.tabs.deinit(alloc);
 
-    // A freshly created tab starts with input_layout == null, so it must use
-    // the default input method rather than whatever the previous tab was using.
-    try std.testing.expectEqual(default, window.activeInputLayout());
+    // newTabWithLauncher seeds input_layout with the system default input
+    // language, so that is what a later switch back to this tab restores.
+    try std.testing.expectEqual(seeded, window.activeInputLayout());
 }
 
 test "recording a layout on the active tab is what later resolves" {
     const alloc = std.testing.allocator;
-    const default: win32.HKL = @ptrFromInt(0x1000);
+    const english: win32.HKL = @ptrFromInt(0x0409);
     const chinese: win32.HKL = @ptrFromInt(0x0804);
     var tab: Tab = undefined;
-    tab.input_layout = null;
+    tab.input_layout = english;
 
-    var window = testWindow(default);
+    var window = testWindow();
     try window.tabs.append(alloc, &tab);
     defer window.tabs.deinit(alloc);
 
     window.recordActiveInputLayout(chinese);
-    // Once the user switches input method, that choice — not the default — is
-    // what the tab restores to.
+    // Once the user switches input method, that choice replaces the seed as what
+    // the tab restores to on reactivation.
     try std.testing.expectEqual(chinese, window.activeInputLayout());
 }
 
 test "each tab keeps its own input method independent of the others" {
     const alloc = std.testing.allocator;
-    const default: win32.HKL = @ptrFromInt(0x1000);
     const chinese: win32.HKL = @ptrFromInt(0x0804);
     const english: win32.HKL = @ptrFromInt(0x0409);
+    // Both tabs were seeded English at creation; A then switches to Chinese.
     var tab_a: Tab = undefined;
-    tab_a.input_layout = null;
+    tab_a.input_layout = english;
     var tab_b: Tab = undefined;
-    tab_b.input_layout = null;
+    tab_b.input_layout = english;
 
-    var window = testWindow(default);
+    var window = testWindow();
     try window.tabs.append(alloc, &tab_a);
     try window.tabs.append(alloc, &tab_b);
     defer window.tabs.deinit(alloc);
 
-    // Tab A switches to Chinese.
     window.active_index = 0;
     window.recordActiveInputLayout(chinese);
 
-    // Switching to tab B must not inherit A's choice — B has none, so default.
+    // Switching to tab B must not inherit A's Chinese — B keeps its own seed.
     window.active_index = 1;
-    try std.testing.expectEqual(default, window.activeInputLayout());
-    window.recordActiveInputLayout(english);
+    try std.testing.expectEqual(english, window.activeInputLayout());
 
     // Switching back to tab A restores Chinese, and B independently keeps
     // English — the per-tab memory is isolated.

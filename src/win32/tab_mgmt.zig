@@ -153,6 +153,10 @@ pub fn newTabWithLauncher(window: *Window, launcher: ?*const Config.Launcher) vo
         .term = undefined,
         .term_arena = .init(std.heap.page_allocator),
         .vt_stream = undefined,
+        // Seed the tab with the system default input language (MOSTTY-44): a new
+        // tab starts on the default keyboard (e.g. English) and switching back to
+        // it later restores that, regardless of what the previous tab was using.
+        .input_layout = state.systemDefaultInputLayout(),
     };
     // Init the SPSC ring AFTER the field-default block (which would otherwise
     // overwrite `pty_ring` with `undefined`). The reader thread spawned by
