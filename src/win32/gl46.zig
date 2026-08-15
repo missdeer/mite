@@ -89,7 +89,6 @@ pub const StartupError = error{
     SpirvSpecializationFailed,
     ProgramObjectFailed,
     ProgramLinkFailed,
-    WindowEffectsUnsupported,
 };
 
 pub fn startupErrorDescription(err: StartupError) []const u8 {
@@ -98,7 +97,7 @@ pub fn startupErrorDescription(err: StartupError) []const u8 {
         error.GetDcFailed => "the window device context is unavailable",
         error.PixelFormatUnavailable => "no composited RGBA pixel format is available",
         error.PixelFormatExtensionUnavailable => "WGL_ARB_pixel_format is unavailable",
-        error.PixelFormatContractUnavailable => "no double-buffered sRGB RGBA pixel format is available",
+        error.PixelFormatContractUnavailable => "no double-buffered alpha+sRGB composited pixel format is available",
         error.SetPixelFormatFailed => "the OpenGL pixel format was rejected",
         error.BootstrapWindowClassFailed => "the WGL bootstrap window class could not be registered",
         error.BootstrapWindowFailed => "the WGL bootstrap window could not be created",
@@ -116,7 +115,6 @@ pub fn startupErrorDescription(err: StartupError) []const u8 {
         error.SpirvSpecializationFailed => "the driver could not specialize the shared SPIR-V shader",
         error.ProgramObjectFailed => "the driver could not create a shader program",
         error.ProgramLinkFailed => "the driver could not link the shared SPIR-V program",
-        error.WindowEffectsUnsupported => "pure WGL presentation cannot guarantee alpha composition; set background-opacity=1 and background-blur=false",
     };
 }
 
@@ -332,7 +330,6 @@ interop_bridge: ?interop.Bridge = null,
 pure_wgl_surface: PureWglSurface = .{},
 gpu_override_configured: bool = false,
 presentation: Presentation,
-requires_alpha_composition: bool,
 
 grid_program: gl.uint = 0,
 image_program: gl.uint = 0,
@@ -364,14 +361,12 @@ pub fn init(
     font_service: *FontService,
     configured_gpu: ?[]const u8,
     presentation: Presentation,
-    requires_alpha_composition: bool,
 ) Gl46Renderer {
     return .{
         .common = common,
         .font_service = font_service,
         .gpu_override_configured = configured_gpu != null,
         .presentation = presentation,
-        .requires_alpha_composition = requires_alpha_composition,
     };
 }
 
@@ -571,13 +566,16 @@ const pure_pixel_format_query = [_]i32{
 
 fn purePixelFormatMeetsContract(
     attributes: [pure_pixel_format_query.len]i32,
+    pfd: win32.PIXELFORMATDESCRIPTOR,
 ) bool {
     return attributes[0] != 0 and
         attributes[1] != 0 and
         attributes[2] != 0 and
         attributes[3] == WGL_TYPE_RGBA_ARB and
         attributes[4] >= 24 and
-        attributes[6] != 0;
+        attributes[5] >= 8 and
+        attributes[6] != 0 and
+        pfd.dwFlags.SUPPORT_COMPOSITION != 0;
 }
 
 fn setPurePixelFormat(dc: win32.HDC, procs: PureWglProcs) StartupError!void {
@@ -592,6 +590,8 @@ fn setPurePixelFormat(dc: win32.HDC, procs: PureWglProcs) StartupError!void {
         WGL_TYPE_RGBA_ARB,
         WGL_COLOR_BITS_ARB,
         24,
+        WGL_ALPHA_BITS_ARB,
+        8,
         WGL_FRAMEBUFFER_SRGB_CAPABLE_ARB,
         1,
         0,
@@ -625,7 +625,7 @@ fn setPurePixelFormat(dc: win32.HDC, procs: PureWglProcs) StartupError!void {
             @sizeOf(win32.PIXELFORMATDESCRIPTOR),
             &pfd,
         ) == 0) continue;
-        if (!purePixelFormatMeetsContract(attributes)) continue;
+        if (!purePixelFormatMeetsContract(attributes, pfd)) continue;
         if (win32.SetPixelFormat(dc, pixel_format, &pfd) == 0)
             return error.SetPixelFormatFailed;
         log.info(
@@ -643,8 +643,6 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
         gl.makeProcTableCurrent(&self.procs);
         return;
     }
-    if (self.presentation == .pure_wgl and self.requires_alpha_composition)
-        return error.WindowEffectsUnsupported;
     if (self.gpu_override_configured) return error.GpuOverrideUnsupported;
 
     const dc = win32.GetDC(hwnd) orelse return error.GetDcFailed;
@@ -746,7 +744,7 @@ fn ensureInitialized(self: *Gl46Renderer, hwnd: win32.HWND) StartupError!void {
         );
     } else {
         log.info(
-            "OpenGL {d}.{d} pure WGL presentation active: opaque sRGB framebuffer, swap interval 1, {d} completion slots",
+            "OpenGL {d}.{d} pure WGL presentation active: alpha+sRGB composited framebuffer, swap interval 1, {d} completion slots",
             .{ major, minor, frame_count },
         );
     }
@@ -1107,26 +1105,25 @@ test "OpenGL grid replaces stale pixels before overlays blend" {
     try std.testing.expect(RenderPass.overlay.blendEnabled());
 }
 
-test "pure WGL opaque pixel format contract requires RGB sRGB and double buffering" {
+test "pure WGL pixel format contract requires alpha sRGB and DWM composition" {
+    var pfd = pixelFormatDescriptor();
     const valid = [_]i32{ 1, 1, 1, WGL_TYPE_RGBA_ARB, 24, 8, 1 };
-    try std.testing.expect(purePixelFormatMeetsContract(valid));
+    try std.testing.expect(purePixelFormatMeetsContract(valid, pfd));
 
     var missing_srgb = valid;
     missing_srgb[6] = 0;
-    try std.testing.expect(!purePixelFormatMeetsContract(missing_srgb));
+    try std.testing.expect(!purePixelFormatMeetsContract(missing_srgb, pfd));
 
     var missing_alpha = valid;
     missing_alpha[5] = 0;
-    try std.testing.expect(purePixelFormatMeetsContract(missing_alpha));
+    try std.testing.expect(!purePixelFormatMeetsContract(missing_alpha, pfd));
 
     var insufficient_rgb = valid;
     insufficient_rgb[4] = 16;
-    try std.testing.expect(!purePixelFormatMeetsContract(insufficient_rgb));
-}
+    try std.testing.expect(!purePixelFormatMeetsContract(insufficient_rgb, pfd));
 
-test "pure WGL rejects requested alpha composition before creating a context" {
-    var renderer = init(undefined, undefined, null, .pure_wgl, true);
-    try std.testing.expectError(error.WindowEffectsUnsupported, renderer.ensureInitialized(undefined));
+    pfd.dwFlags.SUPPORT_COMPOSITION = 0;
+    try std.testing.expect(!purePixelFormatMeetsContract(valid, pfd));
 }
 
 fn failInterop(self: *Gl46Renderer, err: anyerror) void {

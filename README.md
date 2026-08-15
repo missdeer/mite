@@ -25,7 +25,7 @@ Uses DirectWrite for text and supports Direct3D 11, Direct3D 12, OpenGL 4.6, and
 | `d3d11` | Default validated Direct3D 11 renderer with native DirectComposition presentation. |
 | `d3d12` | Direct3D 12 research renderer using signed DXIL and native DirectComposition presentation. |
 | `opengl` | OpenGL 4.6 research renderer using shared SPIR-V shaders and a DirectComposition interoperability bridge when available. |
-| `pure-opengl` | The same OpenGL renderer presented directly through an opaque, double-buffered WGL window. |
+| `pure-opengl` | The same OpenGL renderer presented directly through a double-buffered WGL window. |
 | `vulkan` | Vulkan research renderer presented through the Vulkan/D3D11 DirectComposition bridge. |
 | `native-vulkan` | The same Vulkan renderer presented through a native Win32 Vulkan surface and swapchain; opaque-only surfaces require opaque window settings. |
 

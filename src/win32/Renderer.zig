@@ -148,10 +148,10 @@ pub fn init(
         .d3d11 => .{ .d3d11 = try d3d11.init(&self.common, &self.font_service, configured_gpu) },
         .d3d12 => null,
         .opengl => .{
-            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .interop, requires_alpha_composition),
+            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .interop),
         },
         .@"pure-opengl" => .{
-            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .pure_wgl, requires_alpha_composition),
+            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .pure_wgl),
         },
         .vulkan => null,
         .@"native-vulkan" => null,
@@ -398,7 +398,6 @@ pub fn updateFont(self: *Renderer, font_config: FontConfig) void {
 
 pub fn applyWindowEffects(self: *Renderer, requires_alpha_composition: bool) bool {
     const supported = if (!requires_alpha_composition) true else switch (self.configured_backend) {
-        .@"pure-opengl" => false,
         .@"native-vulkan" => switch (self.activeBackend().*) {
             .@"native-vulkan" => |*backend| backend.supportsAlphaComposition(),
             else => false,

@@ -1009,7 +1009,7 @@ test "native Vulkan uses the shared shader and CPU glyph contracts" {
 }
 
 test "a glyph atlas upload failure reaches the runtime recovery path instead of panicking" {
-    var renderer = init(undefined, undefined, null, .dcomp_bridge);
+    var renderer = init(undefined, undefined, null, .dcomp_bridge, false);
     try std.testing.expect(renderer.takeFailure() == null);
 
     renderer.recordFailure(.glyph_atlas_upload, error.SynchronizationUnavailable);

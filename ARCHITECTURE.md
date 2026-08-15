@@ -603,12 +603,9 @@ The `pure-opengl` choice shares all rendering code but uses a normally
 DWM-redirected HWND and presents with `SwapBuffers`. A hidden class-owned
 bootstrap window loads `WGL_ARB_pixel_format` before the real window's
 immutable pixel format is set; selection and read-back validation require
-double buffering, RGBA, and sRGB. WGL alpha storage and
-`PFD_SUPPORT_COMPOSITION` do not guarantee that DWM consumes framebuffer
-alpha, so this native path is deliberately opaque-only and rejects startup
-unless `background-opacity = 1` and `background-blur = false`. Frames are
-drawn into an OpenGL-owned sRGB renderbuffer, then vertically blitted into the
-window framebuffer to reconcile
+double buffering, RGBA with at least 8 alpha bits, sRGB, and
+`PFD_SUPPORT_COMPOSITION`. Frames are drawn into an OpenGL-owned sRGB
+renderbuffer, then vertically blitted into the window framebuffer to reconcile
 the row orientation that the interop path normally corrects when D3D reads the
 shared texture. It never creates the D3D11 interoperability bridge. Terminal
 and font ownership are identical across both choices; glyph and tab-bar pixels
