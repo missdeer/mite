@@ -439,7 +439,9 @@ renderer = d3d11
   `WGL_NV_DX_interop2` DirectComposition bridge when available.
 - `pure-opengl` uses the same OpenGL renderer but presents directly through
   the window's double-buffered WGL framebuffer. It creates an ordinary
-  DWM-redirected window and never initializes the D3D11 interop bridge.
+  DWM-redirected window and never initializes the D3D11 interop bridge. This
+  native WGL path is opaque-only: set `background-opacity = 1` and
+  `background-blur = false` or startup offers the explicit D3D11 fallback.
 - `vulkan` uses the Vulkan renderer with a DirectComposition bridge. Vulkan
   renders into shared D3D11 textures on the same adapter, external timeline
   synchronization transfers ownership to a D3D11 full-screen blit, and the
@@ -447,15 +449,25 @@ renderer = d3d11
   to native Vulkan WSI.
 - `native-vulkan` uses the same Vulkan rendering core with a native Win32
   Vulkan surface and swapchain. It never initializes the DirectComposition
-  bridge.
+  bridge. A surface that only exposes `COMPOSITE_ALPHA_OPAQUE` remains usable
+  when `background-opacity = 1` and `background-blur = false`; transparent
+  settings still require a non-opaque composite-alpha mode.
+
+The startup-only command-line options `--background-opacity <0..1>` and
+`--background-blur <true|false>` override these two config values for one
+process. For example, an opaque native Vulkan run is:
+
+```powershell
+Mostty.exe --renderer native-vulkan --background-opacity 1 --background-blur false
+```
 
 Both OpenGL choices require an OpenGL 4.6 driver and do not support `gpu`
 adapter overrides. RDP sessions are allowed when their active display driver
 exposes the required capabilities. `pure-opengl` additionally requires a
-double-buffered pixel format with 8-bit alpha, sRGB encoding, and DWM
-composition support so `background-opacity` and `background-blur` retain their
-normal behavior. Missing capabilities are reported by the real-window startup
-gate, which offers an explicit user-confirmed D3D11 fallback.
+double-buffered sRGB RGBA pixel format. WGL does not reliably expose whether
+DWM consumes framebuffer alpha, so this backend deliberately supports only
+opaque window settings. Missing capabilities are reported by the real-window
+startup gate, which offers an explicit user-confirmed D3D11 fallback.
 
 Both Vulkan choices require Vulkan 1.3 dynamic rendering, synchronization2,
 and timeline semaphores. `vulkan` additionally requires D3D11 texture external

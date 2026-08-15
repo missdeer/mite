@@ -109,6 +109,7 @@ common: *RendererCommon,
 font_service: *FontService,
 configured_gpu: ?[]const u8,
 presentation: core_mod.Presentation,
+requires_alpha_composition: bool,
 core: ?core_mod.Core = null,
 bridge: ?bridge_mod.Bridge = null,
 
@@ -149,12 +150,14 @@ pub fn init(
     font_service: *FontService,
     configured_gpu: ?[]const u8,
     presentation: core_mod.Presentation,
+    requires_alpha_composition: bool,
 ) VulkanRenderer {
     return .{
         .common = common,
         .font_service = font_service,
         .configured_gpu = configured_gpu,
         .presentation = presentation,
+        .requires_alpha_composition = requires_alpha_composition,
     };
 }
 
@@ -182,6 +185,7 @@ fn initializeCandidate(
         context.hwnd,
         self.configured_gpu,
         self.presentation,
+        self.requires_alpha_composition,
         candidate_index,
         attempt,
         shader_assets.vertex.vulkan_spirv,
@@ -203,6 +207,16 @@ fn initializeCandidate(
     if (self.presentation == .dcomp_bridge) {
         log.info("Vulkan DirectComposition bridge device active: {s}", .{attempt.name()});
     }
+}
+
+pub fn supportsAlphaComposition(self: *const VulkanRenderer) bool {
+    if (self.presentation == .dcomp_bridge) return true;
+    return if (self.core) |*core| core.alpha_composition_enabled else false;
+}
+
+pub fn setRequiresAlphaComposition(self: *VulkanRenderer, required: bool) void {
+    self.requires_alpha_composition = required;
+    if (self.core) |*core| core.requires_alpha_composition = required;
 }
 
 fn initializeCandidates(context: anytype, comptime attempt_fn: anytype) StartupError!void {

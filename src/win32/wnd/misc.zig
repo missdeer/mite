@@ -101,7 +101,7 @@ fn lparamEqlAscii(lparam: win32.LPARAM, ascii: []const u8) bool {
 // and a full repaint.
 fn reloadConfig(hwnd: win32.HWND) void {
     const gpa = global.gpa.allocator();
-    const new_cfg = Config.loadDefaultChecked(gpa) catch {
+    var new_cfg = Config.loadDefaultChecked(gpa) catch {
         // File unreadable (editor holds it open without read sharing). Re-arm
         // and retry shortly, keeping the previous config rather than defaults.
         // The debounce window already lets most editor saves settle first.
@@ -115,6 +115,15 @@ fn reloadConfig(hwnd: win32.HWND) void {
         return;
     };
     config_reload_retries = 0;
+
+    if (!global.renderer.applyWindowEffects(new_cfg.requiresAlphaComposition())) {
+        std.log.warn(
+            "config: active native renderer cannot enable alpha composition on its surface; keeping background-opacity=1 and background-blur=false",
+            .{},
+        );
+        new_cfg.background_opacity = 1.0;
+        new_cfg.background_blur = false;
+    }
 
     const font_changed = !fontConfigEql(&global.config, &new_cfg);
     // Must be computed before the move below, otherwise global.config == new_cfg.

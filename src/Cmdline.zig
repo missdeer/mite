@@ -3,6 +3,8 @@ const Cmdline = @This();
 font_path: ?[]const u8 = null,
 font_size: f32 = 16.0,
 renderer: RendererSelection = .from_config,
+background_opacity: ?f32 = null,
+background_blur: ?bool = null,
 
 pub const RendererSelection = union(enum) {
     from_config,
@@ -11,8 +13,7 @@ pub const RendererSelection = union(enum) {
 };
 
 pub fn usage() !void {
-    try std.Io.File.stderr().writeStreamingAll(
-        std.Io.Threaded.global_single_threaded.io(),
+    try std.Io.File.stderr().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(),
         \\Usage: Mostty [options]
         \\
         \\Font Options:
@@ -22,6 +23,8 @@ pub fn usage() !void {
         \\Renderer Options:
         \\  --renderer <backend>      Renderer backend (d3d11, d3d12, opengl,
         \\                            pure-opengl, vulkan, or native-vulkan)
+        \\  --background-opacity <n> Default background opacity in [0,1]
+        \\  --background-blur <bool> Enable DWM blur behind (true or false)
         \\
     );
 }
@@ -46,12 +49,30 @@ pub fn parse(args: *std.process.Args.Iterator) !Cmdline {
         } else if (std.mem.eql(u8, arg, "--renderer")) {
             const value = args.next() orelse errExit("--renderer requires an argument", .{});
             result.renderer = parseRenderer(value);
+        } else if (std.mem.eql(u8, arg, "--background-opacity")) {
+            const value = args.next() orelse errExit("--background-opacity requires an argument", .{});
+            result.background_opacity = parseBackgroundOpacity(value) orelse errExit(
+                "invalid --background-opacity '{s}' (expected a number in [0,1])",
+                .{value},
+            );
+        } else if (std.mem.eql(u8, arg, "--background-blur")) {
+            const value = args.next() orelse errExit("--background-blur requires an argument", .{});
+            result.background_blur = parseBackgroundBlur(value) orelse errExit(
+                "invalid --background-blur '{s}' (expected true or false)",
+                .{value},
+            );
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try Cmdline.usage();
             std.process.exit(0);
         } else errExit("unknown cmdline option '{s}'", .{arg});
     }
     return result;
+}
+
+pub fn applyConfigOverrides(self: Cmdline, config: *Config) void {
+    config.renderer = self.rendererOr(config.renderer);
+    if (self.background_opacity) |value| config.background_opacity = value;
+    if (self.background_blur) |value| config.background_blur = value;
 }
 
 pub fn rendererOr(self: Cmdline, configured: Config.RendererBackend) Config.RendererBackend {
@@ -66,6 +87,18 @@ fn parseRenderer(value: []const u8) RendererSelection {
     const backend = std.meta.stringToEnum(Config.RendererBackend, value) orelse
         return .{ .invalid = value };
     return .{ .backend = backend };
+}
+
+fn parseBackgroundOpacity(value: []const u8) ?f32 {
+    const opacity = std.fmt.parseFloat(f32, value) catch return null;
+    if (!std.math.isFinite(opacity) or opacity < 0.0 or opacity > 1.0) return null;
+    return opacity;
+}
+
+fn parseBackgroundBlur(value: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(value, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    return null;
 }
 
 fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
@@ -85,6 +118,35 @@ test "renderer command-line value overrides config and omission preserves it" {
     const configured: Config.RendererBackend = .opengl;
     try std.testing.expectEqual(configured, (Cmdline{}).rendererOr(configured));
     try std.testing.expectEqual(Config.RendererBackend.vulkan, (Cmdline{ .renderer = .{ .backend = .vulkan } }).rendererOr(configured));
+}
+
+test "window effect command-line values are validated" {
+    try std.testing.expectEqual(@as(f32, 0.0), parseBackgroundOpacity("0").?);
+    try std.testing.expectEqual(@as(f32, 0.75), parseBackgroundOpacity("0.75").?);
+    try std.testing.expectEqual(@as(f32, 1.0), parseBackgroundOpacity("1").?);
+    try std.testing.expectEqual(@as(?f32, null), parseBackgroundOpacity("-0.1"));
+    try std.testing.expectEqual(@as(?f32, null), parseBackgroundOpacity("1.1"));
+    try std.testing.expectEqual(@as(?f32, null), parseBackgroundOpacity("nan"));
+
+    try std.testing.expectEqual(true, parseBackgroundBlur("true").?);
+    try std.testing.expectEqual(false, parseBackgroundBlur("FALSE").?);
+    try std.testing.expectEqual(@as(?bool, null), parseBackgroundBlur("1"));
+}
+
+test "window effect command-line values override config and omission preserves it" {
+    var configured: Config = .{};
+    const original_opacity = configured.background_opacity;
+    const original_blur = configured.background_blur;
+    (Cmdline{}).applyConfigOverrides(&configured);
+    try std.testing.expectEqual(original_opacity, configured.background_opacity);
+    try std.testing.expectEqual(original_blur, configured.background_blur);
+
+    (Cmdline{
+        .background_opacity = 1.0,
+        .background_blur = false,
+    }).applyConfigOverrides(&configured);
+    try std.testing.expectEqual(@as(f32, 1.0), configured.background_opacity);
+    try std.testing.expect(!configured.background_blur);
 }
 
 const Config = @import("Config.zig");

@@ -142,7 +142,9 @@ Entry sequence in `mosttywindows.zig`:
    2. Loads icons at that DPI (`icons_mod.getIcons`).
    3. `Config.loadDefault(gpa)` reads `%LOCALAPPDATA%/Mostty/config`, parses
       it into an arena-backed `Config`, resolves the theme, and folds
-      `color_overrides` back over the theme defaults.
+      `color_overrides` back over the theme defaults. `Cmdline` then applies
+      per-process renderer, background-opacity, and background-blur overrides
+      before renderer capability selection.
    4. Converts the font family/codepoint-map strings to sentinel-terminated
       UTF-16 (allocations leaked into the process arena — they live for the
       whole renderer lifetime).
@@ -558,6 +560,9 @@ the same explicit policy rather than silently changing renderers.
 The `native-vulkan` choice loads `vulkan-1.dll` at runtime, requires Vulkan
 1.3 dynamic rendering, synchronization2, timeline semaphores, and a Win32
 surface whose composite-alpha modes preserve the configured window effects.
+When the configuration is fully opaque (`background-opacity = 1` and
+`background-blur = false`), an opaque-only surface is accepted; otherwise a
+non-opaque composite-alpha mode remains mandatory.
 It uses three frame slots, separate acquire/render-finished semaphores, a
 timeline for frame-resource reuse, and native Win32 WSI presentation. Present
 selection prefers present-wait mailbox, then timeline-gated mailbox, then
@@ -598,9 +603,12 @@ The `pure-opengl` choice shares all rendering code but uses a normally
 DWM-redirected HWND and presents with `SwapBuffers`. A hidden class-owned
 bootstrap window loads `WGL_ARB_pixel_format` before the real window's
 immutable pixel format is set; selection and read-back validation require
-double buffering, RGBA with at least 8 alpha bits, sRGB, and
-`PFD_SUPPORT_COMPOSITION`. Frames are drawn into an OpenGL-owned sRGB
-renderbuffer, then vertically blitted into the window framebuffer to reconcile
+double buffering, RGBA, and sRGB. WGL alpha storage and
+`PFD_SUPPORT_COMPOSITION` do not guarantee that DWM consumes framebuffer
+alpha, so this native path is deliberately opaque-only and rejects startup
+unless `background-opacity = 1` and `background-blur = false`. Frames are
+drawn into an OpenGL-owned sRGB renderbuffer, then vertically blitted into the
+window framebuffer to reconcile
 the row orientation that the interop path normally corrects when D3D reads the
 shared texture. It never creates the D3D11 interoperability bridge. Terminal
 and font ownership are identical across both choices; glyph and tab-bar pixels

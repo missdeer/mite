@@ -113,7 +113,7 @@ fn mainWithShowCommand(startup_show_cmd: win32.SHOW_WINDOW_CMD) !void {
     // strings. The UTF-16 storage is leaked: it lives for the lifetime of the
     // global renderer (i.e. the whole process).
     global.config = Config.loadDefault(global.gpa.allocator());
-    global.config.renderer = cmdline.rendererOr(global.config.renderer);
+    cmdline.applyConfigOverrides(&global.config);
     const gpa_alloc = global.gpa.allocator();
     const font_families_u16 = util.utf16FontFamilies(gpa_alloc, global.config.font_families);
     const emoji_families_u16 = util.utf16FontFamilies(gpa_alloc, global.config.emoji_font_families);
@@ -146,6 +146,7 @@ fn mainWithShowCommand(startup_show_cmd: win32.SHOW_WINDOW_CMD) !void {
         global.config.font_ligatures,
         global.config.gpu,
         global.config.renderer,
+        global.config.requiresAlphaComposition(),
     ) catch |err| {
         std.log.err("renderer: d3d11 startup failed ({s}): {s}", .{ @errorName(err), Renderer.d3d11InitErrorDescription(err) });
         Renderer.reportD3d11Unavailable(null, err);

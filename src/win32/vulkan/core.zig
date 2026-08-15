@@ -73,7 +73,7 @@ pub fn startupErrorDescription(err: StartupError) []const u8 {
         error.SwapchainFormatUnavailable => "the Win32 surface has no usable sRGB format",
         error.PresentTierOverrideInvalid => "the diagnostic Vulkan present tier override is invalid",
         error.PresentTierUnavailable => "the requested Vulkan present tier is unavailable on this surface",
-        error.WindowEffectsUnsupported => "native Vulkan presentation cannot preserve alpha composition on this surface",
+        error.WindowEffectsUnsupported => "native Vulkan presentation cannot preserve alpha composition on this surface; set background-opacity=1 and background-blur=false",
         error.SwapchainUnavailable => "the native Vulkan swapchain could not be created",
         error.SynchronizationUnavailable => "the Vulkan synchronization objects could not be created",
         error.CommandResourcesUnavailable => "the Vulkan command resources could not be created",
@@ -200,6 +200,8 @@ pub const Frame = struct {
 
 pub const Core = struct {
     presentation: Presentation,
+    requires_alpha_composition: bool,
+    alpha_composition_enabled: bool,
     global: loader.Global,
     instance: vk.VkInstance,
     ip: loader.Instance,
@@ -240,6 +242,7 @@ pub const Core = struct {
         hwnd: win32.HWND,
         configured_gpu: ?[]const u8,
         presentation: Presentation,
+        requires_alpha_composition: bool,
         candidate_index: usize,
         attempt: *CandidateAttempt,
         vertex_spirv: []align(4) const u8,
@@ -426,6 +429,8 @@ pub const Core = struct {
 
         var core: Core = undefined;
         core.presentation = presentation;
+        core.requires_alpha_composition = requires_alpha_composition;
+        core.alpha_composition_enabled = false;
         core.global = global;
         core.instance = instance;
         core.ip = ip;
@@ -487,8 +492,8 @@ pub const Core = struct {
         const name = std.mem.sliceTo(&physical_properties.deviceName, 0);
         if (presentation == .native_wsi) {
             log.info(
-                "native Vulkan device active: {s}; present tier={s}; alpha composition enabled",
-                .{ name, @tagName(core.present_tier) },
+                "native Vulkan device active: {s}; present tier={s}; alpha composition={s}",
+                .{ name, @tagName(core.present_tier), if (core.alpha_composition_enabled) "enabled" else "opaque" },
             );
         }
         return core;
@@ -943,8 +948,12 @@ pub const Core = struct {
             "native Vulkan surface on '{s}': composite alpha flags=0x{x}",
             .{ std.mem.sliceTo(&self.physical_properties.deviceName, 0), capabilities.supportedCompositeAlpha },
         );
-        const composite_alpha = chooseCompositeAlpha(capabilities.supportedCompositeAlpha) orelse
+        const composite_alpha = chooseCompositeAlpha(
+            capabilities.supportedCompositeAlpha,
+            self.requires_alpha_composition,
+        ) orelse
             return error.WindowEffectsUnsupported;
+        self.alpha_composition_enabled = composite_alpha != vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         var image_count: u32 = @max(3, capabilities.minImageCount);
         if (capabilities.maxImageCount != 0) image_count = @min(image_count, capabilities.maxImageCount);
         const info = vk.VkSwapchainCreateInfoKHR{
@@ -1610,7 +1619,10 @@ fn hasExtension(ip: *const loader.Instance, device: vk.VkPhysicalDevice, wanted:
     return false;
 }
 
-fn chooseCompositeAlpha(flags: vk.VkCompositeAlphaFlagsKHR) ?vk.VkCompositeAlphaFlagBitsKHR {
+fn chooseCompositeAlpha(
+    flags: vk.VkCompositeAlphaFlagsKHR,
+    requires_alpha_composition: bool,
+) ?vk.VkCompositeAlphaFlagBitsKHR {
     inline for (.{
         vk.VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
         vk.VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
@@ -1618,6 +1630,8 @@ fn chooseCompositeAlpha(flags: vk.VkCompositeAlphaFlagsKHR) ?vk.VkCompositeAlpha
     }) |candidate| {
         if (flags & candidate != 0) return candidate;
     }
+    if (!requires_alpha_composition and flags & vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR != 0)
+        return vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     return null;
 }
 
@@ -1700,9 +1714,14 @@ test "opaque Win32 Vulkan handles preserve unaligned handle values" {
     try std.testing.expectEqual(@as(usize, 0x101), @intFromPtr(handle));
 }
 
-test "native alpha policy rejects opaque-only surfaces" {
-    try std.testing.expectEqual(@as(?vk.VkCompositeAlphaFlagBitsKHR, null), chooseCompositeAlpha(vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR));
-    try std.testing.expectEqual(vk.VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR, chooseCompositeAlpha(vk.VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR).?);
+test "native alpha policy accepts opaque surfaces only when window effects do not need alpha" {
+    const opaque_flag = vk.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    try std.testing.expectEqual(@as(?vk.VkCompositeAlphaFlagBitsKHR, null), chooseCompositeAlpha(opaque_flag, true));
+    try std.testing.expectEqual(opaque_flag, chooseCompositeAlpha(opaque_flag, false).?);
+    try std.testing.expectEqual(
+        vk.VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+        chooseCompositeAlpha(vk.VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR | opaque_flag, false).?,
+    );
 }
 
 test "Vulkan candidates prefer discrete GPUs and preserve equal-rank enumeration order" {

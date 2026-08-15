@@ -116,6 +116,7 @@ font_service: FontService,
 configured_backend: Config.RendererBackend,
 backend: ?RendererBackend,
 vulkan_recovery_attempted: bool,
+requires_alpha_composition: bool,
 
 // Initialize in place: the backend borrows `common`, and the async glyph
 // worker later borrows backend state. The process-global renderer provides
@@ -127,6 +128,7 @@ pub fn init(
     font_ligatures: bool,
     configured_gpu: ?[]const u8,
     backend: Config.RendererBackend,
+    requires_alpha_composition: bool,
 ) d3d11.InitError!void {
     // The font service and the backend resolve the adapter from the same
     // configured name, which is what keeps them on one GPU. Splitting them
@@ -141,14 +143,15 @@ pub fn init(
     );
     self.configured_backend = backend;
     self.vulkan_recovery_attempted = false;
+    self.requires_alpha_composition = requires_alpha_composition;
     self.backend = switch (backend) {
         .d3d11 => .{ .d3d11 = try d3d11.init(&self.common, &self.font_service, configured_gpu) },
         .d3d12 => null,
         .opengl => .{
-            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .interop),
+            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .interop, requires_alpha_composition),
         },
         .@"pure-opengl" => .{
-            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .pure_wgl),
+            .opengl = gl46.init(&self.common, &self.font_service, configured_gpu, .pure_wgl, requires_alpha_composition),
         },
         .vulkan => null,
         .@"native-vulkan" => null,
@@ -267,7 +270,13 @@ pub fn initializeWindow(
                 self.backend = .{ .d3d12 = backend };
             },
             .@"native-vulkan" => {
-                var backend = vulkan.init(&self.common, &self.font_service, configured_gpu, .native_wsi);
+                var backend = vulkan.init(
+                    &self.common,
+                    &self.font_service,
+                    configured_gpu,
+                    .native_wsi,
+                    self.requires_alpha_composition,
+                );
                 backend.initializeWindow(hwnd) catch |err| {
                     backend.deinit();
                     return .{ .@"native-vulkan" = err };
@@ -275,7 +284,13 @@ pub fn initializeWindow(
                 self.backend = .{ .@"native-vulkan" = backend };
             },
             .vulkan => {
-                var backend = vulkan.init(&self.common, &self.font_service, configured_gpu, .dcomp_bridge);
+                var backend = vulkan.init(
+                    &self.common,
+                    &self.font_service,
+                    configured_gpu,
+                    .dcomp_bridge,
+                    self.requires_alpha_composition,
+                );
                 backend.initializeWindow(hwnd) catch |err| {
                     backend.deinit();
                     return .{ .vulkan = err };
@@ -311,6 +326,7 @@ fn fallbackToD3d11With(
     self.backend = null;
     self.configured_backend = .d3d11;
     self.vulkan_recovery_attempted = false;
+    self.requires_alpha_composition = false;
     const replacement = try init_fn(&self.common, &self.font_service, configured_gpu);
     self.backend = .{ .d3d11 = replacement };
 }
@@ -378,6 +394,25 @@ pub fn updateDpi(self: *Renderer, dpi: u32) void {
 pub fn updateFont(self: *Renderer, font_config: FontConfig) void {
     self.font_service.updateFont(font_config);
     self.onFontStateChanged();
+}
+
+pub fn applyWindowEffects(self: *Renderer, requires_alpha_composition: bool) bool {
+    const supported = if (!requires_alpha_composition) true else switch (self.configured_backend) {
+        .@"pure-opengl" => false,
+        .@"native-vulkan" => switch (self.activeBackend().*) {
+            .@"native-vulkan" => |*backend| backend.supportsAlphaComposition(),
+            else => false,
+        },
+        else => true,
+    };
+    if (!supported) return false;
+
+    self.requires_alpha_composition = requires_alpha_composition;
+    if (self.backend) |*active| switch (active.*) {
+        .@"native-vulkan" => |*backend| backend.setRequiresAlphaComposition(requires_alpha_composition),
+        else => {},
+    };
+    return true;
 }
 
 fn onFontStateChanged(self: *Renderer) void {

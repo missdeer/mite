@@ -278,6 +278,10 @@ renderer: RendererBackend = .d3d11,
 
 arena: ?std.heap.ArenaAllocator = null,
 
+pub fn requiresAlphaComposition(self: *const Config) bool {
+    return self.background_opacity < 1.0 or self.background_blur;
+}
+
 fn runtimeIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -1578,6 +1582,21 @@ test "native presentation backends request a normally redirected window" {
     inline for (.{ RendererBackend.d3d11, RendererBackend.d3d12, RendererBackend.opengl, RendererBackend.vulkan }) |backend| {
         try std.testing.expect(!backend.usesDwmRedirection());
     }
+}
+
+test "window effects require alpha unless opacity is complete and blur is disabled" {
+    var cfg: Config = .{};
+    try std.testing.expect(cfg.requiresAlphaComposition());
+
+    cfg.background_opacity = 1.0;
+    cfg.background_blur = false;
+    try std.testing.expect(!cfg.requiresAlphaComposition());
+
+    cfg.background_opacity = 0.99;
+    try std.testing.expect(cfg.requiresAlphaComposition());
+    cfg.background_opacity = 1.0;
+    cfg.background_blur = true;
+    try std.testing.expect(cfg.requiresAlphaComposition());
 }
 
 test "parse font-feature settings" {
