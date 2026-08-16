@@ -6,6 +6,7 @@ const types = @import("types.zig");
 const cp_mod = @import("child_process.zig");
 const pty_ring_mod = @import("pty_ring.zig");
 const url_hover = @import("url_hover.zig");
+const TerminalSession = @import("../terminal/Session.zig");
 
 const TabId = types.TabId;
 const TabHit = types.TabHit;
@@ -16,9 +17,9 @@ const ChildProcess = cp_mod.ChildProcess;
 pub const Tab = struct {
     id: TabId,
     child_process: ChildProcess,
+    session: TerminalSession,
+    // Borrowed alias into session for the renderer and interaction paths.
     term: *vt.Terminal,
-    term_arena: std.heap.ArenaAllocator,
-    vt_stream: vt.TerminalStream,
     mouse_last_cell: ?vt.Coordinate = null,
     title_buf: [512]u8 = undefined,
     title_len: usize = 0,

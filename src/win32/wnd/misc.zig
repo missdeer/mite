@@ -197,10 +197,7 @@ fn reloadConfig(hwnd: win32.HWND) void {
                 for (window.tabs.items) |tab| {
                     if (tab.closing) continue;
                     if (tab.term.cols != cell_count.col or tab.term.rows != cell_count.row) {
-                        tab.term.resize(tab.term_arena.allocator(), .{
-                            .cols = cell_count.col,
-                            .rows = cell_count.row,
-                        }) catch |e|
+                        tab.session.resize(cell_count.col, cell_count.row) catch |e|
                             std.debug.panic("Terminal.resize: {}", .{e});
                         var resize_err: Error = undefined;
                         tab.child_process.resize(&resize_err, cell_count) catch |e| switch (e) {
@@ -211,7 +208,7 @@ fn reloadConfig(hwnd: win32.HWND) void {
                             error.Error => std.debug.panic("{f}", .{resize_err}),
                         };
                     }
-                    tab_mgmt.syncTerminalPixelSize(tab.term);
+                    tab_mgmt.syncTerminalPixelSize(tab);
                 }
             }
             window.requestRender();
@@ -222,7 +219,7 @@ fn reloadConfig(hwnd: win32.HWND) void {
         if (global.window) |*window| {
             for (window.tabs.items) |tab| {
                 global.config.theme.rebaseTerminal(tab.term);
-                tab_mgmt.syncTerminalPixelSize(tab.term);
+                tab_mgmt.syncTerminalPixelSize(tab);
             }
             // Config file is the stronger signal than any prior session pick:
             // resync the menu's check mark to whatever the file declares now.
@@ -663,7 +660,7 @@ fn drainPtyTab(window: *Window, tab: *Tab, budget_us: u64) void {
         // until destroyTab runs, the reader is still alive and producing.
         // Drain anyway (no-op cb) to keep tail advanced — drain() internally
         // SetEvents wake_event, so a full-ring reader resumes — but skip
-        // vt_stream so we don't mutate state that destroyTab is about to
+        // the shared session so we don't mutate state that destroyTab is about to
         // tear down.
         _ = tab.pty_ring.drain({}, struct {
             fn cb(_: void, _: []const u8) void {}
@@ -679,7 +676,7 @@ fn drainPtyTab(window: *Window, tab: *Tab, budget_us: u64) void {
         const before = byte_count;
         _ = tab.pty_ring.drainMax(PTY_DRAIN_CHUNK_BYTES, &ctx, struct {
             fn cb(c: *Ctx, slice: []const u8) void {
-                c.tab.vt_stream.nextSlice(slice);
+                c.tab.session.feed(slice);
                 c.n.* += slice.len;
             }
         }.cb);

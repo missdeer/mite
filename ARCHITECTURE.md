@@ -1,11 +1,12 @@
 # Mostty — Architecture & Workflow
 
 A reading guide to the source tree, the runtime model, and the end-to-end data flow
-of every key path. Mostty is a Windows-only terminal emulator that pairs Ghostty's
-VT state machine (`libghostty-vt`) with a hand-rolled Win32 / D3D11 /
-DirectWrite shell.
+of every key path. Mostty's runnable application is currently a Windows terminal
+emulator that pairs Ghostty's VT state machine (`libghostty-vt`) with a hand-rolled
+Win32 / D3D11 / DirectWrite shell. The macOS target currently builds only the
+platform-neutral terminal core; PTY, rendering, and UI integration are pending.
 
-Pinned versions: Zig `0.16.0`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI only. The build also requires Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-cross.exe` / `glslangValidator.exe` / `spirv-val.exe`. Build with
+Pinned versions: Zig `0.16.0`, Vulkan SDK `1.4.350.0` in CI. The Windows application requires the MSVC ABI, Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-cross.exe` / `glslangValidator.exe` / `spirv-val.exe`. The macOS core target does not discover or depend on those Windows tools. Build the Windows application with
 `cmd.exe /c "D:\zig-x86_64-windows-0.16.0\zig.exe build --global-cache-dir D:\zig-cache"`.
 
 ---
@@ -15,6 +16,8 @@ Pinned versions: Zig `0.16.0`, Vulkan SDK `1.4.350.0` in CI, Windows + MSVC ABI 
 ```
 src/
   mosttywindows.zig        process entry, WinMain shim, main message loop
+  mosttymacos.zig          macOS static-core library entry
+  terminal/Session.zig     platform-neutral VT state, stream, and effects owner
   Cmdline.zig              startup options, including the per-process renderer override
   Config.zig               1.4 kLOC — config file parser, theme resolution, arena owner
   vendor/ghostty-sprite/   vendored Ghostty sprite face (block/box/braille/...)
@@ -36,7 +39,7 @@ src/
 
     # Per-tab plumbing
     child_process.zig      ConPTY spawn, env block, reader thread
-    tab_mgmt.zig           terminal/stream init, Handler effects, tab lifecycle
+    tab_mgmt.zig           Windows session hooks and tab lifecycle
     tab_bar.zig            tab-bar layout + hit testing (paint is in d3d11/)
 
     # Window procedure (UI thread) — split by message family
@@ -267,7 +270,7 @@ Handlers by family:
     `TIMER_PTY_DRAIN` continues bounded PTY backlog drains.
   - `WM_APP_CHILD_PROCESS_DATA` (`wparam = tab_id`) is the reader-thread →
     UI wake-up. Handler repeatedly drains at most 256 bytes from the ring
-    into `Tab.vt_stream.nextSlice` until the initial ~2 ms budget is spent,
+    into `Tab.session.feed` until the initial ~2 ms budget is spent,
     `SetEvent`s the ring's `wake_event` (resumes a full-ring writer), and
     — only if bytes were drained — increments the per-second PTY byte
     counter and calls `requestRender`. If data remains, it arms
@@ -338,17 +341,18 @@ Handlers by family:
      unless overridden.
    - `CreateProcessW(CREATE_SUSPENDED)` so the job object can be applied,
      then `ResumeThread`.
-6. Allocate `vt.Terminal` (page allocator) at the chosen size and apply
-   theme colors.
-7. Wrap it in `vt_stream.Handler` with effects callbacks (`title_changed`,
-   `write_pty`, `device_attributes`, `xtversion`, `size`).
+6. Initialize `TerminalSession` in place at the chosen size. It owns the
+   `vt.Terminal`, arena, persistent stream, and shared effects; `Tab.term` is a
+   borrowed alias retained for renderer and interaction callers.
+7. Supply the Windows effects callbacks (`title_changed`, `write_pty`, `size`)
+   and apply theme colors.
 8. Append, set active, `Window.onActiveChanged` (resets viewport, clears
    selection, drops URL hover, requests render).
 
 `destroyTab`:
 
 1. `tab.closing = true` (the UI handler still drains the ring with a
-   no-op cb to keep the reader productive, but skips `vt_stream`).
+   no-op cb to keep the reader productive, but skips `TerminalSession`).
 2. Unhook from `window.tabs`. Queued `WM_APP_CHILD_PROCESS_DATA` posts
    for this tab id will resolve via `findById → null` and drop; tab ids
    are monotonic and never reused.
@@ -366,7 +370,7 @@ Handlers by family:
 4. `thread.join()` the reader — direct, no UI message pump.
 5. Close the read pipe, the job (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
    kills any orphans the child spawned), and the process handle.
-6. Deinit `vt_stream`, `term_arena`, `vt.Terminal`, then `pty_ring`
+6. Deinit `TerminalSession`, then `pty_ring`
    (last — the reader thread held `&tab.pty_ring` until join).
 7. If the window has no tabs left, `PostMessage(WM_QUIT)`; else
    `onActiveChanged`.
@@ -405,24 +409,24 @@ a full ring. Retry-until-stop, with `Sleep(1 ms)` between attempts, is
 the only safe option: (a) clears within a frame once the UI drains; (b)
 is paired with `reader_stop` being set by `destroyTab`.
 
-### 5.3 `vt.TerminalStream` and effects (`tab_mgmt.zig`)
+### 5.3 Terminal session and effects (`terminal/Session.zig`, `tab_mgmt.zig`)
 
-Each `Tab` directly owns an upstream `vt.TerminalStream`. Wide-character
-overwrite consistency is handled by `libghostty-vt`; Mostty does not wrap or
-pre-process print actions.
+Each `Tab` owns a platform-neutral `TerminalSession`, which owns the upstream
+`vt.Terminal`, its arena, and the persistent `vt.TerminalStream`. Wide-character
+overwrite consistency is handled by `libghostty-vt`; Mostty does not pre-process
+print actions.
 
-Everything else the parser would normally side-effect on (title changes,
-PTY writeback, device attributes / xtversion / size reports) is supplied as
-free functions in `tab_mgmt.zig`, packed into a
-`vt.TerminalStream.Handler.Effects` struct at tab creation:
+The shared session owns device-attribute and xtversion responses and routes
+platform effects through context callbacks. Windows supplies title changes,
+PTY writeback, and size reports from `tab_mgmt.zig`:
 
-- **`onTitleChanged`** (`tab_mgmt.zig:33`): walks back via `@fieldParentPtr`
-  to the owning `Tab`, copies into `title_buf`, refreshes the tooltip if it
-  is already showing, and requests render.
+- **`onTitleChanged`**: receives the owning `Tab` as callback context, copies
+  into `title_buf`, refreshes the tooltip if it is already showing, and
+  requests render.
 - **`onWritePty`** (`tab_mgmt.zig:53`): sends parser replies (Device
   Attributes, `CSI 18 t` size reports, `xtversion`, DECRQM) straight to
   `ChildProcess.writeFlushAll`.
-- **`onDeviceAttributes`**, **`onXtVersion`**, **`onSize`**: compose the
+- **Shared device attributes / xtversion and Windows `onSize`**: compose the
   reply payloads.
 
 The flow per chunk of PTY bytes is:
@@ -435,7 +439,7 @@ ReadFile bytes
   → PtyRing.drainMax(256 B) loop, capped at ~2 ms for initial wake-ups
     or ~8 ms for TIMER_PTY_DRAIN backlog continuations
     → up to two contiguous slices passed to
-       Tab.vt_stream.nextSlice
+       Tab.session.feed
        → vt.TerminalStream parser dispatches: print, control, CSI, OSC, DCS, ...
          → Handler effects mutate Tab.term (screen state)
          → write-PTY replies (CSI 18 t etc.) go back via ChildProcess
@@ -452,14 +456,14 @@ ReadFile bytes
 
 ### 5.4 Kitty graphics
 
-Kitty graphics support is wired through `Tab.vt_stream` and
+Kitty graphics support is wired through `Tab.session` and
 `libghostty-vt`'s Kitty image storage:
 
 1. The child app writes APC sequences into ConPTY. Kitty sequences start
    with `ESC _ G` and terminate with ST (`ESC` followed by `\`). The
    bundled Microsoft Terminal ConPTY is used when available because the
    Windows inbox ConPTY can discard APC payloads before Mostty sees them.
-2. The UI thread drains PTY bytes into `Tab.vt_stream.nextSlice`. The handler
+2. The UI thread drains PTY bytes into `Tab.session.feed`. The handler
    lets `libghostty-vt` parse Kitty graphics, including direct RGB/gray
    payloads, PNG payloads decoded by `png_decode.zig`, placements, deletes,
    and ACK responses.
@@ -868,7 +872,7 @@ shell stdout
       → edge-triggered PostMessage(WM_APP_CHILD_PROCESS_DATA, tab_id)
 [UI thread, asynchronously]
   → onAppChildProcessData
-      → drainMax(256 B) loop → vt_stream.nextSlice (up to two contiguous slices)
+      → drainMax(256 B) loop → TerminalSession.feed (up to two contiguous slices)
       → SetEvent(pty_ring.wake_event)
       → notePtyBytes / requestRender (only if bytes > 0)
       → arm TIMER_PTY_DRAIN or clear/re-check pty_ring.posted
@@ -900,7 +904,7 @@ newTab:
                     &tab.pty_ring → CreatePseudoConsole → CreateProcessW →
                     ResumeThread). Startup-error cleanup wakes the reader
                     (reader_stop + SetEvent + CancelIoEx) before join.
-  alloc vt.Terminal → wrap in vt_stream.Handler with tab_mgmt effects
+  init TerminalSession in place → apply tab_mgmt platform effects
   append, set active, onActiveChanged, requestRender
 
 destroyTab:
@@ -915,7 +919,7 @@ destroyTab:
                                           and ReadFile when CancelIoEx fired)
   thread.join()                          (direct — no UI message pump)
   close read pipe, job, process handle
-  deinit vt_stream, Terminal, arenas
+  deinit TerminalSession
   deinit pty_ring                        (AFTER join — reader owned &pty_ring)
   if tabs.len == 0: PostMessage(WM_QUIT)
 ```

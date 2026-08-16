@@ -3,6 +3,7 @@ const win32 = @import("win32").everything;
 const vt = @import("vt");
 
 const Config = @import("../Config.zig");
+const TerminalSession = @import("../terminal/Session.zig");
 const cp_mod = @import("child_process.zig");
 const err_mod = @import("error.zig");
 const global_mod = @import("global.zig");
@@ -20,22 +21,16 @@ const TabId = types.TabId;
 const Window = state.Window;
 const global = global_mod.global;
 
-fn tabFromEffectHandler(handler: *vt.TerminalStream.Handler) *Tab {
-    const stream: *vt.TerminalStream = @fieldParentPtr("handler", handler);
-    return @fieldParentPtr("vt_stream", stream);
-}
-
 // Effects callback fired when the terminal title changes (OSC 0/2). The
-// stream_terminal Handler has no user context, so walk back through the
-// Stream's `handler` field to the owning Tab via @fieldParentPtr. The
-// Window comes from the singleton `global.window` (set once in WM_CREATE).
+// shared session supplies the owning Tab as callback context. The Window
+// comes from the singleton `global.window` (set once in WM_CREATE).
 // Only the per-tab title (shown in the tab bar) is updated; the main
 // window title bar is kept fixed at "Mostty" (set at window creation).
-fn onTitleChanged(handler: *vt.TerminalStream.Handler) void {
+fn onTitleChanged(context: *anyopaque, term: *vt.Terminal) void {
     if (global.window == null) return;
     const window: *Window = &global.window.?;
-    const tab = tabFromEffectHandler(handler);
-    const title = handler.terminal.getTitle() orelse return;
+    const tab: *Tab = @ptrCast(@alignCast(context));
+    const title = term.getTitle() orelse return;
     const n = @min(title.len, tab.title_buf.len);
     @memcpy(tab.title_buf[0..n], title[0..n]);
     tab.title_len = n;
@@ -46,11 +41,11 @@ fn onTitleChanged(handler: *vt.TerminalStream.Handler) void {
 // Write a query response (CSI c, DECRQM, DSR, XTVERSION, kitty keyboard
 // query, size report, kitty graphics ACK, ...) back to the PTY. Without
 // this, tools like nvim/fzf/less hang waiting for the reply they parse off
-// stdin. Reached only via vt_stream.nextSlice on the UI thread; replies
+// stdin. Reached only via TerminalSession.feed on the UI thread; replies
 // are small (a few bytes) and go through the same path as user keystrokes
 // (see writeToActivePty), so synchronous writeAll is fine in practice.
-fn onWritePty(handler: *vt.TerminalStream.Handler, data: [:0]const u8) void {
-    const tab = tabFromEffectHandler(handler);
+fn onWritePty(context: *anyopaque, data: [:0]const u8) void {
+    const tab: *Tab = @ptrCast(@alignCast(context));
     if (tab.closing) return;
     const pty = tab.child_process.pty orelse return;
     pty.writeFlushAll(data) catch |e| std.log.err(
@@ -59,75 +54,27 @@ fn onWritePty(handler: *vt.TerminalStream.Handler, data: [:0]const u8) void {
     );
 }
 
-// Pull the return type of one of the Effects callback pointers. Lets us
-// reference types like `device_attributes.Attributes` / `size_report.Size`
-// without ghostty-vt's lib_vt.zig having to re-export them.
-fn EffectReturnType(comptime field: []const u8) type {
-    const Effects = vt.TerminalStream.Handler.Effects;
-    const opt = @typeInfo(@FieldType(Effects, field)).optional;
-    const ptr = @typeInfo(opt.child).pointer;
-    const func = @typeInfo(ptr.child).@"fn";
-    return func.return_type.?;
-}
-
-// Encode the response for CSI c / CSI > c / CSI = c. Defaults match what
-// ghostty itself reports (VT220 / ANSI color) — good enough for nvim,
-// fzf, less, etc.
-fn onDeviceAttributes(_: *vt.TerminalStream.Handler) EffectReturnType("device_attributes") {
-    return .{};
-}
-
-// XTVERSION (CSI > 0 q). Without this, the fallback inside ghostty-vt
-// answers "libghostty"; override so apps that switch on the terminal
-// identifier see "mostty".
-fn onXtVersion(_: *vt.TerminalStream.Handler) []const u8 {
-    return "mostty";
-}
-
 // Pixel-based size queries (CSI 14/16/18 t). Cell width/height come from
 // the active renderer; rows/cols from the per-tab terminal state. Returns
 // null (silently ignored) if the renderer hasn't measured a cell yet.
-fn onSize(handler: *vt.TerminalStream.Handler) EffectReturnType("size") {
+fn onSize(_: *anyopaque, term: *vt.Terminal) TerminalSession.SizeResponse {
     const cs = global.renderer.common.cell_size;
     const cell_width = std.math.cast(u32, cs.cx) orelse return null;
     const cell_height = std.math.cast(u32, cs.cy) orelse return null;
     if (cell_width == 0 or cell_height == 0) return null;
     return .{
-        .rows = handler.terminal.rows,
-        .columns = handler.terminal.cols,
+        .rows = term.rows,
+        .columns = term.cols,
         .cell_width = cell_width,
         .cell_height = cell_height,
     };
 }
 
-// Scrollback size in bytes. libghostty-vt's built-in default is only 10 KB,
-// which PageList clamps up to `min_max_size` (~2 std_capacity pages) — enough
-// for the active viewport plus a page of buffer, so long output evicts older
-// rows almost immediately. Match Ghostty upstream's `scrollback-limit` default
-// (10 MB, decimal) so scrolling up over normal long output actually returns
-// the earlier rows. See MOSTTY-16.
-pub const DEFAULT_SCROLLBACK_BYTES: usize = 10_000_000;
-
-// Sole source of the `vt.Terminal.Options` mostty uses at tab creation. The
-// tests below assert this helper wires `max_scrollback_bytes` correctly, which is
-// how we regression-guard against the field ever being dropped from the init
-// options struct.
-fn terminalInitOptions(cols: u16, rows: u16) vt.Terminal.Options {
-    return .{
-        .cols = cols,
-        .rows = rows,
-        .max_scrollback_bytes = DEFAULT_SCROLLBACK_BYTES,
-        .default_modes = .{ .grapheme_cluster = true },
-    };
-}
-
-pub fn syncTerminalPixelSize(term: *vt.Terminal) void {
+pub fn syncTerminalPixelSize(tab: *Tab) void {
     const cs = global.renderer.common.cell_size;
     const cell_w = std.math.cast(u32, cs.cx) orelse 0;
     const cell_h = std.math.cast(u32, cs.cy) orelse 0;
-    if (cell_w == 0 or cell_h == 0) return;
-    term.width_px = @as(u32, term.cols) * cell_w;
-    term.height_px = @as(u32, term.rows) * cell_h;
+    tab.session.syncPixelSize(cell_w, cell_h);
 }
 
 pub fn newTab(window: *Window) void {
@@ -150,9 +97,8 @@ pub fn newTabWithLauncher(window: *Window, launcher: ?*const Config.Launcher) vo
     tab.* = .{
         .id = window.next_tab_id,
         .child_process = undefined,
+        .session = undefined,
         .term = undefined,
-        .term_arena = .init(std.heap.page_allocator),
-        .vt_stream = undefined,
         // Seed the tab with the system default input language (MOSTTY-44): a new
         // tab starts on the default keyboard (e.g. English) and switching back to
         // it later restores that, regardless of what the previous tab was using.
@@ -207,36 +153,28 @@ pub fn newTabWithLauncher(window: *Window, launcher: ?*const Config.Launcher) vo
         if (launcher != null) {
             std.log.err("launcher '{s}' failed to start: {f}", .{ launcher.?.label, err });
             tab.pty_ring.deinit(global.gpa.allocator());
-            tab.term_arena.deinit();
             global.gpa.allocator().destroy(tab);
             return;
         }
         std.debug.panic("{f}", .{err});
     };
 
-    tab.term = std.heap.page_allocator.create(vt.Terminal) catch util.oom(error.OutOfMemory);
-    tab.term.* = vt.Terminal.init(
-        std.Io.Threaded.global_single_threaded.io(),
-        tab.term_arena.allocator(),
-        terminalInitOptions(cell_count.col, cell_count.row),
-    ) catch |e| std.debug.panic("Terminal.init: {}", .{e});
-    syncTerminalPixelSize(tab.term);
+    tab.session.init(.{
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .terminal_allocator = std.heap.page_allocator,
+        .stream_allocator = global.gpa.allocator(),
+        .cols = cell_count.col,
+        .rows = cell_count.row,
+        .hooks = .{
+            .context = tab,
+            .title_changed = onTitleChanged,
+            .write_pty = onWritePty,
+            .size = onSize,
+        },
+    }) catch |e| std.debug.panic("TerminalSession.init: {}", .{e});
+    tab.term = tab.session.term;
+    syncTerminalPixelSize(tab);
     global.config.theme.applyToNewTerminal(tab.term);
-
-    var handler = tab.term.vtHandler();
-    handler.effects = effects: {
-        var e: vt.TerminalStream.Handler.Effects = .readonly;
-        e.title_changed = onTitleChanged;
-        e.write_pty = onWritePty;
-        e.device_attributes = onDeviceAttributes;
-        e.xtversion = onXtVersion;
-        e.size = onSize;
-        break :effects e;
-    };
-    tab.vt_stream = .init(.{
-        .allocator = global.gpa.allocator(),
-        .handler = handler,
-    });
 
     window.tabs.append(global.gpa.allocator(), tab) catch util.oom(error.OutOfMemory);
     window.active_index = window.tabs.items.len - 1;
@@ -336,9 +274,7 @@ pub fn destroyTab(window: *Window, tab: *Tab) void {
     win32.closeHandle(tab.child_process.job);
     win32.closeHandle(tab.child_process.process_handle);
 
-    tab.vt_stream.deinit();
-    tab.term_arena.deinit();
-    std.heap.page_allocator.destroy(tab.term);
+    tab.session.deinit();
     // Ring deinit AFTER thread.join — reader holds &tab.pty_ring until exit.
     tab.pty_ring.deinit(global.gpa.allocator());
     global.gpa.allocator().destroy(tab);
@@ -365,54 +301,13 @@ pub fn writeToActivePty(window: *Window, bytes: []const u8) void {
     writeToPty(window.active(), bytes);
 }
 
-test "terminalInitOptions wires DEFAULT_SCROLLBACK_BYTES" {
-    // Regression guard for MOSTTY-16: dropping `.max_scrollback` from the
-    // helper fails this test. Terminal.init is the sole caller of this
-    // helper, so this is the wiring check. Constant drift (someone lowering
-    // DEFAULT_SCROLLBACK_BYTES to a value too small for real scrollback)
-    // is caught by the positive behavior test below.
-    const opts = terminalInitOptions(80, 24);
-    try std.testing.expectEqual(DEFAULT_SCROLLBACK_BYTES, opts.max_scrollback_bytes);
-}
-
-test "long output with DEFAULT_SCROLLBACK_BYTES preserves earliest line" {
-    // Business rule: mostty's default scrollback is large enough that 500
-    // wide lines of normal output do not evict the earliest line. Uses
-    // cols=215 to hit std_capacity page granularity fast (each page is
-    // 215 rows max), so the min_max_size floor is only ~2 pages and the
-    // observation would collapse to "everything fits regardless of
-    // max_scrollback" at smaller col counts.
-    const alloc = std.testing.allocator;
-    var term = try vt.Terminal.init(std.testing.io, alloc, .{
-        .cols = 215,
-        .rows = 2,
-        .max_scrollback_bytes = DEFAULT_SCROLLBACK_BYTES,
-    });
-    defer term.deinit(alloc);
-
-    var stream = term.vtStream();
-    defer stream.deinit();
-
-    var buf: [32]u8 = undefined;
-    var i: usize = 0;
-    while (i < 500) : (i += 1) {
-        const line = try std.fmt.bufPrint(&buf, "line {d:0>4}\r\n", .{i});
-        stream.nextSlice(line);
-    }
-
-    term.screens.active.scroll(.{ .top = {} });
-    const dump = try term.plainString(alloc);
-    defer alloc.free(dump);
-    try std.testing.expect(std.mem.indexOf(u8, dump, "line 0000") != null);
-}
-
 test "long output with 10 KB scrollback evicts earliest line" {
     // 10_000 bytes is the libghostty-vt built-in default and reproduces
     // MOSTTY-16's pre-fix behavior: PageList clamps it up to min_max_size
     // (~2 std_capacity pages, or ~430 rows for a 215-col terminal); 500
     // lines forces a third page → prune first page → "line 0000" evicted.
-    // This asserts the positive behavior test above can actually fail if
-    // its max_scrollback gets accidentally zeroed / minimized.
+    // This asserts the shared session's positive scrollback test can fail if
+    // its max_scrollback gets accidentally zeroed or minimized.
     const alloc = std.testing.allocator;
     var term = try vt.Terminal.init(std.testing.io, alloc, .{
         .cols = 215,

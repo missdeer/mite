@@ -1,37 +1,5 @@
 pub fn build(b: *std.Build) void {
-    const target = target: {
-        var result = b.standardTargetOptions(.{});
-        if (result.result.os.tag != .windows) {
-            std.debug.panic(
-                "Mostty is Windows-only; use -Dtarget=x86_64-windows-msvc or build on Windows without -Dtarget",
-                .{},
-            );
-        }
-        // On Windows, default to MSVC ABI. The ghostty-vt module's C++ source
-        // files (src/simd/*.cpp) are compiled with MSVC ABI because ghostty's
-        // own build.zig forces it, so the exe ABI must match or clang's
-        // intrinsics headers break under MSVC SDK include paths. Mirror the
-        // override from ghostty's src/build/Config.zig.
-        if (result.result.os.tag == .windows and
-            (result.query.os_tag == null or result.query.abi == null))
-        {
-            var query = result.query;
-            if (query.cpu_arch == null) query.cpu_arch = result.result.cpu.arch;
-            query.os_tag = .windows;
-            if (query.abi == null) query.abi = .msvc;
-            result = b.resolveTargetQuery(query);
-        }
-        // Mostty's Windows build only supports MSVC ABI today: the WinMain
-        // shim, libcmt entry point, and ghostty-vt's C++ ABI all assume it.
-        // Fail fast on explicit Windows-GNU to avoid a confusing link error.
-        if (result.result.os.tag == .windows and result.result.abi != .msvc) {
-            std.debug.panic(
-                "Mostty's Windows build requires MSVC ABI; use -Dtarget=x86_64-windows-msvc or omit -Dtarget",
-                .{},
-            );
-        }
-        break :target result;
-    };
+    const target = resolveTarget(b);
     const optimize = b.standardOptimizeOption(.{});
 
     const dep_opts = .{
@@ -39,6 +7,92 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     };
     const vt = b.dependency("ghostty", dep_opts).module("ghostty-vt");
+    const test_step = b.step("test", "Run unit tests");
+    addCoreTests(b, target, optimize, vt, test_step);
+
+    switch (target.result.os.tag) {
+        .windows => buildWindows(b, target, optimize, vt, test_step),
+        .macos => buildMacos(b, target, optimize, vt),
+        else => unreachable,
+    }
+}
+
+fn resolveTarget(b: *std.Build) std.Build.ResolvedTarget {
+    var result = b.standardTargetOptions(.{});
+    if (result.result.os.tag != .windows and result.result.os.tag != .macos) {
+        std.debug.panic("Mostty supports Windows and macOS targets", .{});
+    }
+
+    // On Windows, default to MSVC ABI. The ghostty-vt module's C++ source
+    // files use that ABI, so the executable must match.
+    if (result.result.os.tag == .windows and
+        (result.query.os_tag == null or result.query.abi == null))
+    {
+        var query = result.query;
+        if (query.cpu_arch == null) query.cpu_arch = result.result.cpu.arch;
+        query.os_tag = .windows;
+        if (query.abi == null) query.abi = .msvc;
+        result = b.resolveTargetQuery(query);
+    }
+    if (result.result.os.tag == .windows and result.result.abi != .msvc) {
+        std.debug.panic(
+            "Mostty's Windows build requires MSVC ABI; use -Dtarget=x86_64-windows-msvc or omit -Dtarget",
+            .{},
+        );
+    }
+    return result;
+}
+
+fn addCoreTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vt: *std.Build.Module,
+    test_step: *std.Build.Step,
+) void {
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/terminal/Session.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    tests.root_module.addImport("vt", vt);
+    const run_tests = b.addRunArtifact(tests);
+    b.step("check-core", "Compile platform-neutral terminal core tests").dependOn(&tests.step);
+    b.step("test-core", "Run platform-neutral terminal core tests").dependOn(&run_tests.step);
+    test_step.dependOn(&run_tests.step);
+}
+
+fn buildMacos(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vt: *std.Build.Module,
+) void {
+    const core = b.addLibrary(.{
+        .name = "MosttyCore",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mosttymacos.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    core.root_module.addImport("vt", vt);
+    b.installArtifact(core);
+}
+
+fn buildWindows(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vt: *std.Build.Module,
+    test_step: *std.Build.Step,
+) void {
+    const dep_opts = .{
+        .target = target,
+        .optimize = optimize,
+    };
     const z2d = b.dependency("z2d", dep_opts).module("z2d");
     const shader_assets = buildShaders(b);
     const vulkan_include = findVulkanInclude(b);
@@ -53,7 +107,7 @@ pub fn build(b: *std.Build) void {
         }),
         .win32_manifest = b.path("src/win32/mostty.manifest"),
     });
-    addImports(b, exe.root_module, vt, z2d, shader_assets, vulkan_include);
+    addWindowsImports(b, exe.root_module, vt, z2d, shader_assets, vulkan_include);
     exe.root_module.linkSystemLibrary("opengl32", .{});
     exe.root_module.linkSystemLibrary("gdi32", .{});
     addShaderValidationDependencies(&exe.step, shader_assets);
@@ -88,15 +142,15 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    addImports(b, tests.root_module, vt, z2d, shader_assets, vulkan_include);
+    addWindowsImports(b, tests.root_module, vt, z2d, shader_assets, vulkan_include);
     tests.root_module.linkSystemLibrary("opengl32", .{});
     tests.root_module.linkSystemLibrary("gdi32", .{});
     addShaderValidationDependencies(&tests.step, shader_assets);
     const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run unit tests").dependOn(&run_tests.step);
+    test_step.dependOn(&run_tests.step);
 }
 
-fn addImports(
+fn addWindowsImports(
     b: *std.Build,
     mod: *std.Build.Module,
     vt: *std.Build.Module,
