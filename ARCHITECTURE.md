@@ -3,8 +3,9 @@
 A reading guide to the source tree, the runtime model, and the end-to-end data flow
 of every key path. Mostty's runnable application is currently a Windows terminal
 emulator that pairs Ghostty's VT state machine (`libghostty-vt`) with a hand-rolled
-Win32 / D3D11 / DirectWrite shell. The macOS target currently builds only the
-platform-neutral terminal core; PTY, rendering, and UI integration are pending.
+Win32 / D3D11 / DirectWrite shell. The macOS target builds the platform-neutral
+terminal core plus a native PTY/session layer; rendering and UI integration are
+pending.
 
 Pinned versions: Zig `0.16.0`, Vulkan SDK `1.4.350.0` in CI. The Windows application requires the MSVC ABI, Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-cross.exe` / `glslangValidator.exe` / `spirv-val.exe`. The macOS core target does not discover or depend on those Windows tools. Build the Windows application with
 `cmd.exe /c "D:\zig-x86_64-windows-0.16.0\zig.exe build --global-cache-dir D:\zig-cache"`.
@@ -18,6 +19,7 @@ src/
   mosttywindows.zig        process entry, WinMain shim, main message loop
   mosttymacos.zig          macOS static-core library entry
   terminal/Session.zig     platform-neutral VT state, stream, and effects owner
+  macos/PtySession.zig     macOS shell process, PTY, and VT session owner
   Cmdline.zig              startup options, including the per-process renderer override
   Config.zig               1.4 kLOC — config file parser, theme resolution, arena owner
   vendor/ghostty-sprite/   vendored Ghostty sprite face (block/box/braille/...)
@@ -428,6 +430,12 @@ PTY writeback, and size reports from `tab_mgmt.zig`:
   `ChildProcess.writeFlushAll`.
 - **Shared device attributes / xtversion and Windows `onSize`**: compose the
   reply payloads.
+
+On macOS, `PtySession` owns the shell child and PTY master around the same
+`TerminalSession`. Callers write input to the PTY, pump PTY output into the VT
+state, resize both sides as one operation, and explicitly reap the child. Exec
+startup uses a close-on-exec handshake so a missing shell is reported to the
+caller and cleaned up before initialization succeeds.
 
 The flow per chunk of PTY bytes is:
 

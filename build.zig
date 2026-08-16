@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
 
     switch (target.result.os.tag) {
         .windows => buildWindows(b, target, optimize, vt, test_step),
-        .macos => buildMacos(b, target, optimize, vt),
+        .macos => buildMacos(b, target, optimize, vt, test_step),
         else => unreachable,
     }
 }
@@ -58,10 +58,15 @@ fn addCoreTests(
         }),
     });
     tests.root_module.addImport("vt", vt);
-    const run_tests = b.addRunArtifact(tests);
     b.step("check-core", "Compile platform-neutral terminal core tests").dependOn(&tests.step);
-    b.step("test-core", "Run platform-neutral terminal core tests").dependOn(&run_tests.step);
-    test_step.dependOn(&run_tests.step);
+    if (canRunTarget(b, target)) {
+        const run_tests = b.addRunArtifact(tests);
+        b.step("test-core", "Run platform-neutral terminal core tests").dependOn(&run_tests.step);
+        test_step.dependOn(&run_tests.step);
+    } else {
+        b.step("test-core", "Compile platform-neutral terminal core tests").dependOn(&tests.step);
+        test_step.dependOn(&tests.step);
+    }
 }
 
 fn buildMacos(
@@ -69,6 +74,7 @@ fn buildMacos(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     vt: *std.Build.Module,
+    test_step: *std.Build.Step,
 ) void {
     const core = b.addLibrary(.{
         .name = "MosttyCore",
@@ -79,7 +85,31 @@ fn buildMacos(
         }),
     });
     core.root_module.addImport("vt", vt);
+    core.root_module.linkSystemLibrary("c", .{});
     b.installArtifact(core);
+
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mosttymacos.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    tests.root_module.addImport("vt", vt);
+    tests.root_module.linkSystemLibrary("c", .{});
+    const install_tests = b.addInstallArtifact(tests, .{ .dest_sub_path = "MosttyMacosTests" });
+    b.step("check-macos-session", "Compile and link macOS PTY session tests").dependOn(&install_tests.step);
+    if (canRunTarget(b, target)) {
+        const run_tests = b.addRunArtifact(tests);
+        test_step.dependOn(&run_tests.step);
+    } else {
+        test_step.dependOn(&install_tests.step);
+    }
+}
+
+fn canRunTarget(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+    return target.result.os.tag == b.graph.host.result.os.tag and
+        target.result.cpu.arch == b.graph.host.result.cpu.arch;
 }
 
 fn buildWindows(
