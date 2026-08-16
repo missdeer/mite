@@ -80,3 +80,51 @@ jobs:
           name: Mostty-windows-${{ matrix.cpu }}-${{ matrix.optimize }}
           path: dist/
           if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package release archives
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Get-ChildItem -Path artifacts -Directory | ForEach-Object {
+            Compress-Archive -Path "$($_.FullName)/*" -DestinationPath "release/$($_.Name).zip" -Force
+          }
+
+      - name: Generate changelog
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $prev = git describe --tags --abbrev=0 "$tag^" 2>$null
+          if ($LASTEXITCODE -eq 0 -and $prev) {
+            $range = "$prev..$tag"
+            $header = "## Changes since $prev"
+          } else {
+            $range = $tag
+            $header = "## Changes"
+          }
+          $log = git log $range --no-merges --pretty='- %s (%h)'
+          @($header, "") + $log | Out-File -Encoding utf8 release-notes.md
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $assets = Get-ChildItem release/*.zip | ForEach-Object { $_.FullName }
+          gh release create $tag $assets --title $tag --notes-file release-notes.md
