@@ -9,11 +9,38 @@ pub fn build(b: *std.Build) void {
     const vt = b.dependency("ghostty", dep_opts).module("ghostty-vt");
     const test_step = b.step("test", "Run unit tests");
     addCoreTests(b, target, optimize, vt, test_step);
+    addMacosGridTests(b, target, optimize, vt, test_step);
 
     switch (target.result.os.tag) {
         .windows => buildWindows(b, target, optimize, vt, test_step),
         .macos => buildMacos(b, target, optimize, vt, test_step),
         else => unreachable,
+    }
+}
+
+fn addMacosGridTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    vt: *std.Build.Module,
+    test_step: *std.Build.Step,
+) void {
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/macos_grid_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    tests.root_module.addImport("vt", vt);
+    const grid_step = b.step("test-macos-grid", "Test the platform-neutral macOS grid model");
+    if (canRunTarget(b, target)) {
+        const run_tests = b.addRunArtifact(tests);
+        grid_step.dependOn(&run_tests.step);
+        test_step.dependOn(&run_tests.step);
+    } else {
+        grid_step.dependOn(&tests.step);
+        test_step.dependOn(&tests.step);
     }
 }
 
@@ -88,23 +115,47 @@ fn buildMacos(
     core.root_module.linkSystemLibrary("c", .{});
     b.installArtifact(core);
 
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/mosttymacos.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    tests.root_module.addImport("vt", vt);
-    tests.root_module.linkSystemLibrary("c", .{});
-    const install_tests = b.addInstallArtifact(tests, .{ .dest_sub_path = "MosttyMacosTests" });
-    b.step("check-macos-session", "Compile and link macOS PTY session tests").dependOn(&install_tests.step);
+    const check_step = b.step("check-macos-session", "Compile the macOS PTY session and renderer");
+    check_step.dependOn(&core.step);
     if (canRunTarget(b, target)) {
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/mosttymacos.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        tests.root_module.addImport("vt", vt);
+        addMacosFrameworks(tests.root_module);
+        tests.root_module.linkSystemLibrary("c", .{});
         const run_tests = b.addRunArtifact(tests);
+        check_step.dependOn(&tests.step);
         test_step.dependOn(&run_tests.step);
     } else {
-        test_step.dependOn(&install_tests.step);
+        // A non-macOS host has no Apple SDK framework stubs to link against.
+        // Compile an object that exercises the renderer API so cross-builds
+        // still semantically analyze the CoreText and Metal implementation.
+        const renderer_check = b.addObject(.{
+            .name = "MosttyMacosRendererCheck",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/macos_renderer_compile_check.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        renderer_check.root_module.addImport("vt", vt);
+        renderer_check.root_module.linkSystemLibrary("c", .{});
+        check_step.dependOn(&renderer_check.step);
+        test_step.dependOn(&renderer_check.step);
     }
+}
+
+fn addMacosFrameworks(module: *std.Build.Module) void {
+    module.linkFramework("CoreFoundation", .{});
+    module.linkFramework("CoreGraphics", .{});
+    module.linkFramework("CoreText", .{});
+    module.linkFramework("Foundation", .{});
+    module.linkFramework("Metal", .{});
 }
 
 fn canRunTarget(b: *std.Build, target: std.Build.ResolvedTarget) bool {

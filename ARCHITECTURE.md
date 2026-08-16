@@ -4,8 +4,8 @@ A reading guide to the source tree, the runtime model, and the end-to-end data f
 of every key path. Mostty's runnable application is currently a Windows terminal
 emulator that pairs Ghostty's VT state machine (`libghostty-vt`) with a hand-rolled
 Win32 / D3D11 / DirectWrite shell. The macOS target builds the platform-neutral
-terminal core plus a native PTY/session layer; rendering and UI integration are
-pending.
+terminal core, a native PTY/session layer, and a CoreText/Metal renderer; SwiftUI
+window and input integration are pending.
 
 Pinned versions: Zig `0.16.0`, Vulkan SDK `1.4.350.0` in CI. The Windows application requires the MSVC ABI, Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-cross.exe` / `glslangValidator.exe` / `spirv-val.exe`. The macOS core target does not discover or depend on those Windows tools. Build the Windows application with
 `cmd.exe /c "D:\zig-x86_64-windows-0.16.0\zig.exe build --global-cache-dir D:\zig-cache"`.
@@ -20,6 +20,9 @@ src/
   mosttymacos.zig          macOS static-core library entry
   terminal/Session.zig     platform-neutral VT state, stream, and effects owner
   macos/PtySession.zig     macOS shell process, PTY, and VT session owner
+  macos/GridModel.zig      VT viewport to resolved renderer-cell conversion
+  macos/CoreTextRenderer.zig CoreText rasterization and renderer resource owner
+  macos/MetalBackend.zig   Metal texture upload and render-pass submission
   Cmdline.zig              startup options, including the per-process renderer override
   Config.zig               1.4 kLOC — config file parser, theme resolution, arena owner
   vendor/ghostty-sprite/   vendored Ghostty sprite face (block/box/braille/...)
@@ -436,6 +439,14 @@ On macOS, `PtySession` owns the shell child and PTY master around the same
 state, resize both sides as one operation, and explicitly reap the child. Exec
 startup uses a close-on-exec handshake so a missing shell is reported to the
 caller and cleaned up before initialization succeeds.
+
+The macOS renderer reads the shared VT viewport through `GridModel`, which
+resolves cell geometry, wide-cell spans, colors, and text styles without Apple
+APIs. `CoreTextRenderer` selects regular, bold, italic, and fallback fonts,
+rasterizes the resolved cells into a BGRA buffer, and submits that buffer through
+`MetalBackend` to an offscreen Metal texture. Resize and backing-scale changes
+replace the font metrics, pixel buffer, and Metal textures together. The later
+SwiftUI shell owns presentation of that texture and all input/window lifecycle.
 
 The flow per chunk of PTY bytes is:
 
