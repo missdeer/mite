@@ -199,6 +199,15 @@ fn buildMacosApp(b: *std.Build, target: std.Build.ResolvedTarget) void {
     link.addDirectoryArg(b.path("src/macos/app"));
     link.addArg(b.fmt("{s}-apple-macos13.0", .{swift_arch}));
 
+    // The directory arg above supplies link-app.sh's source path but does not
+    // register the individual sources as cache inputs, so editing a .swift file
+    // would not invalidate the cached link. Track the compiled sources and the
+    // bridging header explicitly.
+    link.addFileInput(b.path("src/macos/app/Bridge.h"));
+    link.addFileInput(b.path("src/macos/app/KeyInput.swift"));
+    link.addFileInput(b.path("src/macos/app/TerminalView.swift"));
+    link.addFileInput(b.path("src/macos/app/AppShell.swift"));
+
     // The Zig core, then the terminal core's transitive C++ archives
     // (simdutf/highway), which a static library does not bundle itself.
     link.addFileArg(core.getEmittedBin());

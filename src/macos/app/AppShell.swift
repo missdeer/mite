@@ -182,6 +182,7 @@ struct MosttyApp: App {
         Window("Mostty", id: "main") {
             ContentView(model: model)
                 .frame(minWidth: 480, minHeight: 300)
+                .preferredColorScheme(.dark)
         }
         .commands {
             CommandGroup(after: .newItem) {
