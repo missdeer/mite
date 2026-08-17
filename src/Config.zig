@@ -287,13 +287,31 @@ fn runtimeIo() std.Io {
 }
 
 fn envVarOwned(gpa: std.mem.Allocator, key: []const u8) ![]u8 {
-    const environ: std.process.Environ = .{ .block = .global };
-    return environ.getAlloc(gpa, key);
+    if (builtin.os.tag == .windows) {
+        const environ: std.process.Environ = .{ .block = .global };
+        return environ.getAlloc(gpa, key);
+    }
+    var key_buf: [256]u8 = undefined;
+    if (key.len >= key_buf.len) return error.EnvironmentVariableNotFound;
+    @memcpy(key_buf[0..key.len], key);
+    key_buf[key.len] = 0;
+    const raw = std.c.getenv(key_buf[0..key.len :0].ptr) orelse return error.EnvironmentVariableNotFound;
+    return gpa.dupe(u8, std.mem.span(raw));
 }
 
-// The default config location, %LOCALAPPDATA%/Mostty/config. Returns null when
-// LOCALAPPDATA is unset. Caller owns the returned slice.
+// The default config location. On Windows that is %LOCALAPPDATA%/Mostty/config;
+// on macOS it is ~/Library/Application Support/com.dfordsoft.mostty.terminal/Config.
+// Returns null when the anchoring environment variable is unset. Caller owns the
+// returned slice.
 pub fn defaultPath(gpa: std.mem.Allocator) ?[]const u8 {
+    if (builtin.os.tag == .macos) {
+        const home = envVarOwned(gpa, "HOME") catch return null;
+        defer gpa.free(home);
+        if (home.len == 0) return null;
+        return std.fs.path.join(gpa, &.{
+            home, "Library", "Application Support", "com.dfordsoft.mostty.terminal", "Config",
+        }) catch oom();
+    }
     const localappdata = envVarOwned(gpa, "LOCALAPPDATA") catch return null;
     defer gpa.free(localappdata);
     return std.fs.path.join(gpa, &.{ localappdata, "Mostty", "config" }) catch oom();
@@ -301,7 +319,7 @@ pub fn defaultPath(gpa: std.mem.Allocator) ?[]const u8 {
 
 pub fn loadDefault(gpa: std.mem.Allocator) Config {
     const path = defaultPath(gpa) orelse {
-        std.log.info("config: LOCALAPPDATA unavailable; using defaults", .{});
+        std.log.info("config: default path unavailable; using defaults", .{});
         return parse(gpa, "", "<defaults>");
     };
     defer gpa.free(path);
@@ -1164,19 +1182,23 @@ fn resolveThemeName(value: []const u8, prefer_dark: bool) []const u8 {
 // Themes\Personalize\AppsUseLightTheme (DWORD: 1 = light, 0 = dark). Defaults to
 // dark when the value is missing/unreadable, matching mostty's dark chrome.
 fn systemPrefersDark() bool {
-    var data: u32 = 0;
-    var size: u32 = @sizeOf(u32);
-    const rc = win32.RegGetValueW(
-        win32.HKEY_CURRENT_USER,
-        win32.L("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-        win32.L("AppsUseLightTheme"),
-        win32.RRF_RT_REG_DWORD,
-        null,
-        &data,
-        &size,
-    );
-    if (@intFromEnum(rc) != 0) return true; // missing/unreadable -> assume dark
-    return data == 0;
+    if (builtin.os.tag == .windows) {
+        var data: u32 = 0;
+        var size: u32 = @sizeOf(u32);
+        const rc = win32.RegGetValueW(
+            win32.HKEY_CURRENT_USER,
+            win32.L("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            win32.L("AppsUseLightTheme"),
+            win32.RRF_RT_REG_DWORD,
+            null,
+            &data,
+            &size,
+        );
+        if (@intFromEnum(rc) != 0) return true; // missing/unreadable -> assume dark
+        return data == 0;
+    }
+    // mostty is a dark-chrome app; default to dark on non-Windows platforms.
+    return true;
 }
 
 // Searches the theme name under %LOCALAPPDATA%/Mostty/themes then <exeDir>/themes.
@@ -1203,15 +1225,20 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-// Directory containing the running executable (caller owns the slice).
+// Directory containing the running executable (caller owns the slice). Only the
+// Windows theme search consumes this; on other platforms it returns null so the
+// theme lookup simply falls through to the bundled defaults.
 fn exeDir(gpa: std.mem.Allocator) ?[]const u8 {
-    var buf: [std.os.windows.PATH_MAX_WIDE:0]u16 = undefined;
-    const len = win32.GetModuleFileNameW(null, &buf, buf.len);
-    if (len == 0 or len >= buf.len) return null;
-    const full = std.unicode.utf16LeToUtf8Alloc(gpa, buf[0..len]) catch return null;
-    defer gpa.free(full);
-    const dir = std.fs.path.dirname(full) orelse return null;
-    return gpa.dupe(u8, dir) catch oom();
+    if (builtin.os.tag == .windows) {
+        var buf: [std.os.windows.PATH_MAX_WIDE:0]u16 = undefined;
+        const len = win32.GetModuleFileNameW(null, &buf, buf.len);
+        if (len == 0 or len >= buf.len) return null;
+        const full = std.unicode.utf16LeToUtf8Alloc(gpa, buf[0..len]) catch return null;
+        defer gpa.free(full);
+        const dir = std.fs.path.dirname(full) orelse return null;
+        return gpa.dupe(u8, dir) catch oom();
+    }
+    return null;
 }
 
 fn parseLauncher(a: std.mem.Allocator, value: []const u8) ?Launcher {
@@ -1802,6 +1829,27 @@ test "font-thicken/font-shaping-break are silently ignored" {
     try std.testing.expectEqual(@as(usize, 0), cfg.font_codepoint_maps.len);
 }
 
+test "defaultPath anchors the macOS config under Application Support" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    // MOSTTY-51: the macOS config path must be exactly $HOME joined with the
+    // bundle-id Application Support location. Skip when HOME is unusable
+    // (defaultPath is HOME-anchored) rather than reporting a spurious failure.
+    const home = envVarOwned(std.testing.allocator, "HOME") catch return error.SkipZigTest;
+    defer std.testing.allocator.free(home);
+    if (home.len == 0) return error.SkipZigTest;
+    const path = defaultPath(std.testing.allocator) orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(path);
+    const expected = std.fs.path.join(std.testing.allocator, &.{
+        home, "Library", "Application Support", "com.dfordsoft.mostty.terminal", "Config",
+    }) catch return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, path);
+}
+
+const builtin = @import("builtin");
 const std = @import("std");
 const vt = @import("vt");
-const win32 = @import("win32").everything;
+// Windows-only; the macOS build never provides the `win32` module, so the
+// import must stay behind a comptime-gate and every use must live in a
+// `builtin.os.tag == .windows` branch (which is not analyzed off Windows).
+const win32 = if (builtin.os.tag == .windows) @import("win32").everything else struct {};

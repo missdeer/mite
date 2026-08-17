@@ -14,6 +14,7 @@ const vt = @import("vt");
 const PtySession = @import("PtySession.zig");
 const CoreTextRenderer = @import("CoreTextRenderer.zig");
 const GridModel = @import("GridModel.zig");
+const Config = @import("../Config.zig");
 const title_mod = @import("../terminal/title.zig");
 
 comptime {
@@ -64,15 +65,39 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, font_size: f32) !*
     const grid = tab.renderer.gridSize();
     if (grid.cols == 0 or grid.rows == 0) return error.EmptyGrid;
 
+    // MOSTTY-51: a new tab's shell starts in the configured working directory
+    // (the first launcher's, matching the Windows default-tab choice) or $HOME.
+    var config = Config.loadDefault(allocator);
+    defer config.deinit();
+    const working_directory = try initialWorkingDirectory(&config);
+    defer if (working_directory) |wd| allocator.free(wd);
+
     try tab.pty.init(.{
         .io = runtimeIo(),
         .terminal_allocator = allocator,
         .stream_allocator = allocator,
         .cols = @intCast(grid.cols),
         .rows = @intCast(grid.rows),
+        .working_directory = working_directory,
     });
     tab.exit_code = null;
     return tab;
+}
+
+// Resolves the initial CWD for a new tab: the first configured launcher's
+// working_directory when set, otherwise $HOME. Returns null (inherit the
+// process CWD) only when neither is available. Caller owns the returned slice.
+// Propagates OOM rather than swallowing it, so a new tab never silently lands
+// in the wrong directory under allocation failure.
+fn initialWorkingDirectory(config: *const Config) std.mem.Allocator.Error!?[:0]u8 {
+    if (config.launchers.len > 0) {
+        const wd = config.launchers[0].working_directory;
+        if (wd.len > 0) return try allocator.dupeZ(u8, wd);
+    }
+    const home = std.c.getenv("HOME") orelse return null;
+    const span = std.mem.span(home);
+    if (span.len == 0) return null;
+    return try allocator.dupeZ(u8, span);
 }
 
 export fn mostty_tab_destroy(tab_opt: ?*Tab) void {
@@ -555,6 +580,28 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     try std.testing.expect(mostty_tab_app_cursor_keys(tab));
     mostty_tab_feed(tab, "\x1b[?2004h", 8);
     try std.testing.expect(mostty_tab_bracketed_paste(tab));
+}
+
+test "initialWorkingDirectory uses the first launcher's directory when set" {
+    // MOSTTY-51: a configured launcher directory wins over $HOME.
+    var cfg = Config.parse(allocator, "launcher = My Shell | /bin/zsh | /usr\n", "test");
+    defer cfg.deinit();
+    const wd = try initialWorkingDirectory(&cfg) orelse return error.TestUnexpectedResult;
+    defer allocator.free(wd);
+    try std.testing.expectEqualStrings("/usr", wd);
+}
+
+test "initialWorkingDirectory falls back to $HOME without a configured directory" {
+    // No launcher, and a launcher with an empty directory, both resolve to $HOME.
+    const home = std.mem.span(std.c.getenv("HOME") orelse return error.SkipZigTest);
+    if (home.len == 0) return error.SkipZigTest;
+    for ([_][]const u8{ "", "launcher = My Shell | /bin/zsh |\n" }) |src| {
+        var cfg = Config.parse(allocator, src, "test");
+        defer cfg.deinit();
+        const wd = try initialWorkingDirectory(&cfg) orelse return error.TestUnexpectedResult;
+        defer allocator.free(wd);
+        try std.testing.expectEqualStrings(home, wd);
+    }
 }
 
 test "mostty_tab_title mirrors the Windows path-basename rule" {

@@ -41,6 +41,10 @@ pub const Options = struct {
     rows: u16,
     shell: ?[:0]const u8 = null,
     command: ?[:0]const u8 = null,
+    // Directory the child chdir's into before exec. null keeps the inherited
+    // CWD (the app-bundle process directory). The caller resolves the default
+    // ($HOME) and any configured override, so this is a plain absolute path.
+    working_directory: ?[:0]const u8 = null,
     hooks: ?Hooks = null,
 };
 
@@ -94,7 +98,7 @@ pub fn init(self: *PtySession, options: Options) !void {
 
     if (pid == 0) {
         closeFd(exec_pipe[0]);
-        execShell(shell, options.command, environment.ptr, exec_pipe[1]);
+        execShell(shell, options.command, options.working_directory, environment.ptr, exec_pipe[1]);
     }
 
     closeFd(exec_pipe[1]);
@@ -254,9 +258,14 @@ fn createExecPipe() ![2]c.fd_t {
 fn execShell(
     shell: [:0]const u8,
     command: ?[:0]const u8,
+    working_directory: ?[:0]const u8,
     environment: [*:null]const ?[*:0]const u8,
     error_fd: c.fd_t,
 ) noreturn {
+    // Best-effort: a missing/invalid configured directory must not stop the
+    // tab from opening, so on failure we fall through to the inherited CWD.
+    if (working_directory) |dir| _ = c.chdir(dir.ptr);
+
     const login_arg: [:0]const u8 = "-l";
     const command_arg: [:0]const u8 = "-lc";
     var login_argv = [_:null]?[*:0]const u8{ shell.ptr, login_arg.ptr };
@@ -376,6 +385,39 @@ test "macOS PTY resize reaches both the child and VT grid" {
     const contents = try session.terminal.term.plainString(std.testing.allocator);
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "40 100") != null);
+}
+
+test "macOS PTY starts the shell in the requested working directory" {
+    // MOSTTY-51: a configured working directory must be the child's CWD. `/usr`
+    // is a real directory (not a symlink like /tmp -> /private/tmp), so `pwd -P`
+    // reports it verbatim regardless of the test runner's own CWD.
+    var session: PtySession = undefined;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 80,
+        .rows = 24,
+        .shell = "/bin/sh",
+        .command = "pwd -P",
+        .working_directory = "/usr",
+    });
+    defer session.deinit();
+
+    try drainToEof(&session);
+    const exit = try session.wait();
+    try std.testing.expectEqual(@as(u8, 0), exit.exited);
+
+    const contents = try session.terminal.term.plainString(std.testing.allocator);
+    defer std.testing.allocator.free(contents);
+    // Match the pwd output line exactly (trailing grid padding trimmed) so a
+    // wrong CWD such as /usr/local cannot satisfy a mere substring check.
+    var found = false;
+    var it = std.mem.splitScalar(u8, contents, '\n');
+    while (it.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, line, " "), "/usr")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "macOS PTY reports an exec failure without leaving a child session" {
