@@ -4,8 +4,10 @@ A reading guide to the source tree, the runtime model, and the end-to-end data f
 of every key path. Mostty's runnable application is currently a Windows terminal
 emulator that pairs Ghostty's VT state machine (`libghostty-vt`) with a hand-rolled
 Win32 / D3D11 / DirectWrite shell. The macOS target builds the platform-neutral
-terminal core, a native PTY/session layer, and a CoreText/Metal renderer; SwiftUI
-window and input integration are pending.
+terminal core, a native PTY/session layer, and a CoreText/Metal renderer, driven
+by a SwiftUI/AppKit application (`src/macos/app/`) through a C-ABI boundary
+(`src/macos/capi.zig`); every VT-touching call runs on the main thread, and only
+the background PTY reader runs off it.
 
 Pinned versions: Zig `0.16.0`, Vulkan SDK `1.4.350.0` in CI. The Windows application requires the MSVC ABI, Windows SDK `fxc.exe`, Windows SDK `dxc.exe` with `dxil.dll` beside it (signed DXIL for D3D12; the Vulkan SDK DXC cannot sign), and Vulkan SDK `dxc.exe` / `spirv-cross.exe` / `glslangValidator.exe` / `spirv-val.exe`. The macOS core target does not discover or depend on those Windows tools. Build the Windows application with
 `cmd.exe /c "D:\zig-x86_64-windows-0.16.0\zig.exe build --global-cache-dir D:\zig-cache"`.

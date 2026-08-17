@@ -74,7 +74,10 @@ const shader_source =
     \\fragment float4 fragmentMain(VertexOut in [[stage_in]],
     \\                             texture2d<float> source [[texture(0)]],
     \\                             sampler source_sampler [[sampler(0)]]) {
-    \\    return source.sample(source_sampler, in.uv);
+    \\    // The CPU bitmap comes from a bottom-left-origin CoreGraphics context,
+    \\    // but Metal samples with a top-left origin, so flip vertically here to
+    \\    // present the terminal right-side up.
+    \\    return source.sample(source_sampler, float2(in.uv.x, 1.0 - in.uv.y));
     \\}
 ;
 

@@ -14,5 +14,5 @@ export fn mostty_macos_renderer_compile_check(raw_session: *anyopaque) void {
 
     renderer.resize(800, 600, 2) catch return;
     _ = renderer.gridSize();
-    _ = renderer.render(session) catch return;
+    _ = renderer.render(session, .{ .col = 0, .row = 0 }) catch return;
 }

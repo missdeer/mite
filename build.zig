@@ -131,6 +131,8 @@ fn buildMacos(
         const run_tests = b.addRunArtifact(tests);
         check_step.dependOn(&tests.step);
         test_step.dependOn(&run_tests.step);
+
+        buildMacosApp(b, target);
     } else {
         // A non-macOS host has no Apple SDK framework stubs to link against.
         // Compile an object that exercises the renderer API so cross-builds
@@ -148,6 +150,76 @@ fn buildMacos(
         check_step.dependOn(&renderer_check.step);
         test_step.dependOn(&renderer_check.step);
     }
+}
+
+/// Compile the SwiftUI application with `swiftc`, link it against the Zig core
+/// static library plus the terminal core's transitive C++ archives, and
+/// assemble a launchable `Mostty.app`. Only runs on a macOS host (swiftc and the
+/// Apple frameworks are required).
+fn buildMacosApp(b: *std.Build, target: std.Build.ResolvedTarget) void {
+    // Match the swiftc deployment target (macOS 13) so the Zig objects and the
+    // Swift link agree on the minimum OS version; otherwise the linker emits a
+    // version-mismatch warning on every build.
+    const app_target = b.resolveTargetQuery(.{
+        .cpu_arch = target.result.cpu.arch,
+        .os_tag = .macos,
+        .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
+    });
+
+    // The app links into a swiftc-driven executable, so build the core in
+    // ReleaseFast: Debug instruments the terminal core's C++ with UBSan, whose
+    // runtime symbols Apple's linker cannot resolve without Zig's own runtime.
+    const vt = b.dependency("ghostty", .{
+        .target = app_target,
+        .optimize = .ReleaseFast,
+    }).module("ghostty-vt");
+
+    const core = b.addLibrary(.{
+        .name = "MosttyCoreApp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mosttymacos.zig"),
+            .target = app_target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    core.root_module.addImport("vt", vt);
+    core.root_module.linkSystemLibrary("c", .{});
+
+    // Apple spells the arches differently than Zig; swiftc must target the same
+    // arch the Zig core was built for, or the link fails on Intel hosts.
+    const swift_arch = switch (app_target.result.cpu.arch) {
+        .aarch64 => "arm64",
+        .x86_64 => "x86_64",
+        else => @panic("unsupported macOS arch for the Swift app"),
+    };
+
+    const link = b.addSystemCommand(&.{"bash"});
+    link.addFileArg(b.path("src/macos/app/link-app.sh"));
+    const exe = link.addOutputFileArg("Mostty");
+    link.addDirectoryArg(b.path("src/macos/app"));
+    link.addArg(b.fmt("{s}-apple-macos13.0", .{swift_arch}));
+
+    // The Zig core, then the terminal core's transitive C++ archives
+    // (simdutf/highway), which a static library does not bundle itself.
+    link.addFileArg(core.getEmittedBin());
+    for (vt.link_objects.items) |link_object| {
+        switch (link_object) {
+            .other_step => |compile| link.addFileArg(compile.getEmittedBin()),
+            else => {},
+        }
+    }
+
+    const install_exe = b.addInstallFileWithDir(exe, .{ .custom = "Mostty.app/Contents/MacOS" }, "Mostty");
+    const install_plist = b.addInstallFileWithDir(b.path("src/macos/app/Info.plist"), .{ .custom = "Mostty.app/Contents" }, "Info.plist");
+    const install_icon = b.addInstallFileWithDir(b.path("src/mostty.icns"), .{ .custom = "Mostty.app/Contents/Resources" }, "mostty.icns");
+
+    const app_step = b.step("macos-app", "Assemble the launchable Mostty.app");
+    app_step.dependOn(&install_exe.step);
+    app_step.dependOn(&install_plist.step);
+    app_step.dependOn(&install_icon.step);
+    b.getInstallStep().dependOn(&install_exe.step);
+    b.getInstallStep().dependOn(&install_plist.step);
+    b.getInstallStep().dependOn(&install_icon.step);
 }
 
 fn addMacosFrameworks(module: *std.Build.Module) void {

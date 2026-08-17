@@ -1,0 +1,43 @@
+#ifndef MOSTTY_BRIDGE_H
+#define MOSTTY_BRIDGE_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+typedef struct MosttyTab MosttyTab;
+
+MosttyTab *mostty_tab_create(uint32_t pixel_width, uint32_t pixel_height, float scale, float font_size);
+void mostty_tab_destroy(MosttyTab *tab);
+
+void *mostty_tab_metal_device(MosttyTab *tab);
+
+intptr_t mostty_tab_read(MosttyTab *tab, uint8_t *buf, size_t cap);
+void mostty_tab_feed(MosttyTab *tab, const uint8_t *ptr, size_t len);
+void mostty_tab_write(MosttyTab *tab, const uint8_t *ptr, size_t len);
+
+bool mostty_tab_set_surface(MosttyTab *tab, uint32_t pixel_width, uint32_t pixel_height,
+                            float scale, uint32_t *out_cols, uint32_t *out_rows);
+void *mostty_tab_render(MosttyTab *tab, bool cursor_on, uint32_t *out_cols, uint32_t *out_rows);
+
+size_t mostty_tab_title(MosttyTab *tab, uint8_t *buf, size_t cap);
+bool mostty_tab_poll_exit(MosttyTab *tab, int32_t *out_code);
+
+void mostty_tab_cell_size(MosttyTab *tab, uint32_t *out_w, uint32_t *out_h);
+void mostty_tab_cursor(MosttyTab *tab, uint32_t *out_col, uint32_t *out_row);
+
+bool mostty_tab_app_cursor_keys(MosttyTab *tab);
+bool mostty_tab_app_keypad(MosttyTab *tab);
+bool mostty_tab_bracketed_paste(MosttyTab *tab);
+bool mostty_tab_cursor_visible(MosttyTab *tab);
+
+void mostty_tab_scroll(MosttyTab *tab, int32_t delta_rows);
+void mostty_tab_scroll_to_bottom(MosttyTab *tab);
+bool mostty_tab_at_bottom(MosttyTab *tab);
+
+size_t mostty_tab_selection_text(MosttyTab *tab, uint32_t start_col, uint32_t start_row,
+                                 uint32_t end_col, uint32_t end_row, uint8_t *buf, size_t cap);
+
+size_t mostty_encode_key(uint32_t key, uint32_t mods, bool app_cursor, uint8_t *buf, size_t cap);
+
+#endif

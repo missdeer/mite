@@ -31,6 +31,13 @@ pub const RenderResult = struct {
     texture: *anyopaque,
 };
 
+/// Grid position (viewport-relative) of the block cursor to draw as inverse
+/// video. Rendering the cursor here keeps it pixel-aligned with the glyphs.
+pub const Cursor = struct {
+    col: u16,
+    row: u16,
+};
+
 const FontSet = struct {
     regular: *text.Font,
     bold: *text.Font,
@@ -157,7 +164,7 @@ pub fn gridSize(self: *const CoreTextRenderer) GridModel.Size {
     return self.metrics.gridSize(self.pixel_width, self.pixel_height);
 }
 
-pub fn render(self: *CoreTextRenderer, session: *TerminalSession) !RenderResult {
+pub fn render(self: *CoreTextRenderer, session: *TerminalSession, cursor: ?Cursor) !RenderResult {
     session.syncPixelSize(self.metrics.cell_width, self.metrics.cell_height);
     var frame = try GridModel.build(
         self.allocator,
@@ -168,7 +175,7 @@ pub fn render(self: *CoreTextRenderer, session: *TerminalSession) !RenderResult 
     );
     defer frame.deinit();
 
-    try self.rasterize(&frame);
+    try self.rasterize(&frame, cursor);
     try self.metal.render(self.pixels);
     return .{
         .cols = frame.cols,
@@ -177,7 +184,7 @@ pub fn render(self: *CoreTextRenderer, session: *TerminalSession) !RenderResult 
     };
 }
 
-fn rasterize(self: *CoreTextRenderer, frame: *const GridModel.Frame) !void {
+fn rasterize(self: *CoreTextRenderer, frame: *const GridModel.Frame, cursor: ?Cursor) !void {
     const color_space = try graphics.ColorSpace.createDeviceRGB();
     defer color_space.release();
     const bitmap_info = @intFromEnum(graphics.BitmapInfo.byte_order_32_little) |
@@ -203,16 +210,26 @@ fn rasterize(self: *CoreTextRenderer, frame: *const GridModel.Frame) !void {
     ctx.fillRect(context, graphics.Rect.init(0, 0, self.pixel_width, self.pixel_height));
 
     for (frame.cells) |cell| {
-        const x = @as(f64, @floatFromInt(@as(u32, cell.col) * self.metrics.cell_width));
-        const y = @as(f64, @floatFromInt(self.pixel_height - (@as(u32, cell.row) + 1) * self.metrics.cell_height));
-        const width = @as(f64, @floatFromInt(@as(u32, cell.width) * self.metrics.cell_width));
-        const height = @as(f64, @floatFromInt(self.metrics.cell_height));
-        setFill(context, cell.style.background);
-        ctx.fillRect(context, graphics.Rect.init(x, y, width, height));
-        if (cell.style.invisible) continue;
+        var draw_cell = cell;
+        // The cursor cell is drawn as inverse video (swapped fg/bg), which keeps
+        // the block perfectly aligned with the glyph grid.
+        if (cursor) |cur| {
+            if (cell.col == cur.col and cell.row == cur.row) {
+                draw_cell.style.foreground = cell.style.background;
+                draw_cell.style.background = cell.style.foreground;
+            }
+        }
 
-        const font = self.fonts.select(cell.style);
-        try drawCellText(context, font, cell, x, y, width, self.metrics.cell_height);
+        const x = @as(f64, @floatFromInt(@as(u32, draw_cell.col) * self.metrics.cell_width));
+        const y = @as(f64, @floatFromInt(self.pixel_height - (@as(u32, draw_cell.row) + 1) * self.metrics.cell_height));
+        const width = @as(f64, @floatFromInt(@as(u32, draw_cell.width) * self.metrics.cell_width));
+        const height = @as(f64, @floatFromInt(self.metrics.cell_height));
+        setFill(context, draw_cell.style.background);
+        ctx.fillRect(context, graphics.Rect.init(x, y, width, height));
+        if (draw_cell.style.invisible) continue;
+
+        const font = self.fonts.select(draw_cell.style);
+        try drawCellText(context, font, draw_cell, x, y, width, self.metrics.cell_height);
     }
 }
 
@@ -256,7 +273,10 @@ fn drawCellText(
     const ascent = font.getAscent();
     const descent = font.getDescent();
     const content_height = ascent + descent;
-    const baseline = y + ascent + @max(0, (@as(f64, @floatFromInt(cell_height)) - content_height) / 2);
+    // `y` is the cell's bottom edge in the bottom-left-origin CoreGraphics
+    // context, so the baseline sits `descent` above it (plus half the leading to
+    // center). Using ascent here would push glyphs up out of their cell.
+    const baseline = y + descent + @max(0, (@as(f64, @floatFromInt(cell_height)) - content_height) / 2);
     var pen_x = x + @max(0, (cell_width - total_advance) / 2);
     var positions: [32]graphics.Point = undefined;
     for (positions[0..character_len], advances[0..character_len]) |*position, advance| {
@@ -380,7 +400,7 @@ test "CoreText and Metal render a resized styled terminal frame" {
     });
     defer renderer.deinit();
     try renderer.resize(360, 108, 1);
-    const result = try renderer.render(&session);
+    const result = try renderer.render(&session, .{ .col = 0, .row = 0 });
     try std.testing.expect(result.cols > 0);
     try std.testing.expect(result.rows > 0);
     try std.testing.expect(@intFromPtr(result.texture) != 0);
