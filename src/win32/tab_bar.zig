@@ -76,20 +76,10 @@ pub fn hitTestTabBar(window: *Window, total_cols: usize, mouse_x: i32, cs_x: i32
     return .none;
 }
 
-/// When a title looks like a file/path (contains `\` or `/`), strip
-/// everything up to and including the last separator so only the
-/// basename is shown. Titles without separators (e.g. "cmd", "node")
-/// are returned unchanged.
-pub fn displayTitle(title: []const u8) []const u8 {
-    var i: usize = title.len;
-    while (i > 0) {
-        i -= 1;
-        if (title[i] == '\\' or title[i] == '/') {
-            return title[i + 1 ..];
-        }
-    }
-    return title;
-}
+/// Shared, platform-neutral presentation rule: a path-shaped title is reduced to
+/// its final component for the tab bar; separator-free titles pass through. Kept
+/// in the terminal core so Windows and macOS stay in sync (see `../terminal/title.zig`).
+pub const displayTitle = @import("../terminal/title.zig").displayTitle;
 
 // Builds the per-tab drawing list consumed by the proportional D2D painter.
 // Column ranges come straight from `layoutTabBar` (tab widths/buttons stay

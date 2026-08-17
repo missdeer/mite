@@ -14,6 +14,7 @@ const vt = @import("vt");
 const PtySession = @import("PtySession.zig");
 const CoreTextRenderer = @import("CoreTextRenderer.zig");
 const GridModel = @import("GridModel.zig");
+const title_mod = @import("../terminal/title.zig");
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("capi is macOS-only");
@@ -180,13 +181,19 @@ export fn mostty_tab_render(tab_opt: ?*Tab, cursor_on: bool, out_cols: *u32, out
     return result.texture;
 }
 
-/// Copy the current terminal title as UTF-8 into `buf`. Returns the byte count
-/// written (never exceeding `cap`), or 0 when there is no title.
+/// Copy the tab's display title as UTF-8 into `buf`. The shell-provided title is
+/// reduced to its final path component when it looks like a path (mirroring the
+/// Windows tab bar); the full title stays canonical in the terminal. Returns the
+/// byte count written (never exceeding `cap`), or 0 when there is no title or the
+/// reduction is empty (root / trailing separator) — the caller then keeps the
+/// previous label rather than blanking the tab.
 export fn mostty_tab_title(tab_opt: ?*Tab, buf: [*]u8, cap: usize) usize {
     const tab = tab_opt orelse return 0;
     const title = tab.pty.terminal.term.getTitle() orelse return 0;
-    const n = @min(title.len, cap);
-    @memcpy(buf[0..n], title[0..n]);
+    const shown = title_mod.displayTitle(title);
+    if (shown.len == 0) return 0;
+    const n = @min(shown.len, cap);
+    @memcpy(buf[0..n], shown[0..n]);
     return n;
 }
 
@@ -548,4 +555,29 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     try std.testing.expect(mostty_tab_app_cursor_keys(tab));
     mostty_tab_feed(tab, "\x1b[?2004h", 8);
     try std.testing.expect(mostty_tab_bracketed_paste(tab));
+}
+
+test "mostty_tab_title mirrors the Windows path-basename rule" {
+    // The tab must read as the current directory name, not the whole path: an
+    // OSC-2 path title is reduced to its final component (Windows parity), a
+    // non-path title passes through, and a filesystem root reduces to empty so
+    // the caller keeps the previous label instead of blanking the tab.
+    const tab = mostty_tab_create(320, 96, 1, 14) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+
+    var buf: [256]u8 = undefined;
+
+    const path_title = "\x1b]2;/Users/foo/Development/mostty\x07";
+    mostty_tab_feed(tab, path_title.ptr, path_title.len);
+    const n_path = mostty_tab_title(tab, &buf, buf.len);
+    try std.testing.expectEqualStrings("mostty", buf[0..n_path]);
+
+    const prog_title = "\x1b]2;node\x07";
+    mostty_tab_feed(tab, prog_title.ptr, prog_title.len);
+    const n_prog = mostty_tab_title(tab, &buf, buf.len);
+    try std.testing.expectEqualStrings("node", buf[0..n_prog]);
+
+    const root_title = "\x1b]2;/\x07";
+    mostty_tab_feed(tab, root_title.ptr, root_title.len);
+    try std.testing.expectEqual(@as(usize, 0), mostty_tab_title(tab, &buf, buf.len));
 }
