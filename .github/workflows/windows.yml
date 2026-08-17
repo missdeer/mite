@@ -125,6 +125,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          # gh release create exits non-zero when the macOS workflow already
+          # created the release for this tag; keep that from aborting the step
+          # (pwsh 7.4 turns native non-zero exits into terminating errors under
+          # the Actions default $ErrorActionPreference = 'Stop').
+          $PSNativeCommandUseErrorActionPreference = $false
           $tag = "${{ github.ref_name }}"
           $assets = Get-ChildItem release/*.zip | ForEach-Object { $_.FullName }
-          gh release create $tag $assets --title $tag --notes-file release-notes.md
+          gh release create $tag --title $tag --notes-file release-notes.md
+          if ($LASTEXITCODE -ne 0) { Write-Host "Release $tag already exists; uploading assets" }
+          gh release upload $tag $assets --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Failed to upload release assets" }

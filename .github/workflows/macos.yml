@@ -1,0 +1,91 @@
+name: macOS build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+      - name: Package app bundle
+        run: |
+          mkdir -p dist stage
+          cp -R zig-out/Mostty.app stage/
+          ln -s /Applications stage/Applications
+          hdiutil create -volname Mostty -srcfolder stage -ov -format UDZO \
+            dist/Mostty-macos-arm64.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mostty-macos-arm64
+          path: dist/Mostty-macos-arm64.dmg
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release archives
+        run: |
+          mkdir -p release
+          cp artifacts/*/*.dmg release/
+
+      - name: Generate changelog
+        run: |
+          tag="${{ github.ref_name }}"
+          prev="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
+          if [ -n "$prev" ]; then
+            range="${prev}..${tag}"
+            header="## Changes since ${prev}"
+          else
+            range="$tag"
+            header="## Changes"
+          fi
+          {
+            printf '%s\n\n' "$header"
+            git log "$range" --no-merges --pretty='- %s (%h)'
+          } > release-notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release create "$tag" --title "$tag" --notes-file release-notes.md || true
+          gh release upload "$tag" release/*.dmg --clobber
