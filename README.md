@@ -5,11 +5,11 @@
 </p>
 </h1>
 
-A fast, lightweight native terminal emulator with libghostty at its core. Currently designed and implemented for Windows 10/11 only.
+A fast, lightweight native terminal emulator with libghostty at its core. Runs natively on Windows 10/11 and macOS 13+.
 
 > Inspired by [marler8997/mite](https://github.com/marler8997/mite).
 >
-> Windows only. If you need a macOS or Linux build, use [ghostty](https://github.com/ghostty-org/ghostty) directly.
+> Windows and macOS. If you need a Linux build, use [ghostty](https://github.com/ghostty-org/ghostty) directly.
 
 
 ### Windows
@@ -94,3 +94,21 @@ CI downloads `Microsoft.Windows.Console.ConPTY.1.23.251216003.nupkg` from the Mi
 - The glyph atlas and D2D staging surface are now `BGRA8` with `D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE`; the shader treats the stored RGB as a 3-component subpixel coverage mask. Atlas dimension is capped at 4096 (~64 MiB) with a min-2 guard so the LRU's head/tail invariant survives extreme cell sizes.
 - The render target view is created as `B8G8R8A8_UNORM_SRGB` and shader inputs (fg/bg/gradient/atlas) use a pow-free decode approximation close to gamma 2.2, so blending happens in linear space while avoiding the old per-pixel `pow` hotspot. A custom `IDWriteRenderingParams` (gamma 2.2, contrast 0, ClearType, RGB stripe, `NATURAL_SYMMETRIC`) is built once and applied per glyph so the atlas is reproducible across machines.
 - The per-glyph horizontal `SetTransform` that scaled fallback glyphs to the cell advance is gone — it was destroying hinting on every non-ASCII glyph. Fallback glyphs now render at their natural advance and over/underflow is clipped or padded by the cell.
+
+### macOS
+
+A native SwiftUI/AppKit application built on the same platform-neutral terminal core. The Zig core owns the PTY, the `libghostty-vt` state machine, and the grid model behind a C-ABI boundary (`src/macos/capi.zig`); text is shaped and rasterized with CoreText and presented through a Metal (`CAMetalLayer`) surface, so terminal behavior stays consistent with the Windows build. Requires macOS 13 or newer. `zig build` on a macOS host assembles a launchable `Mostty.app` into `zig-out/`, and CI publishes an arm64 `.dmg` on tagged releases.
+
+#### macOS features
+
+- Multiple tabs in one window, each with its own PTY-backed shell process, VT state, and title. The tab title tracks the running program / current path.
+- Mouse selection with copy to the clipboard, mouse-wheel scrollback, and paste with a bracketed-paste guard that strips embedded paste-end markers (mirrors the Windows behavior).
+- IME composition for CJK and other input methods.
+- Window chrome pinned to dark mode.
+
+Keyboard shortcuts:
+
+- `Cmd+T` — new tab
+- `Cmd+W` — close the active tab
+- `Cmd+C` / `Cmd+V` — copy / paste
+- Click a tab to activate, its `×` to close, the `+` to open a new one

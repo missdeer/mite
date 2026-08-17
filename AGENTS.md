@@ -39,12 +39,14 @@ Define success criteria up front, then iterate until verified. Don't follow a fi
 
 # Build & run
 
-Requires Zig `0.16.0`, the Windows SDK shader compilers (`fxc.exe` for SM5/DXBC and `dxc.exe` with `dxil.dll` beside it for signed SM6/DXIL), and the LunarG Vulkan SDK (`dxc.exe`, `spirv-cross.exe`, `glslangValidator.exe`, and `spirv-val.exe` for SPIR-V). The two DXC installs are not interchangeable: the Vulkan SDK one emits SPIR-V but ships no `dxil.dll`, and D3D12 rejects unsigned DXIL. Windows-only. Dependencies are declared in `build.zig.zon`; `win32` is marked `lazy = true`. The build discovers the newest installed SDK versions from their standard locations or the `WindowsSdkVerBinPath` / `VULKAN_SDK` environment variables; use `-Dfxc-path=<path>`, `-Ddxil-dxc-path=<path>`, `-Ddxc-path=<path>`, `-Dspirv-cross-path=<path>`, `-Dglslang-validator-path=<path>`, or `-Dspirv-val-path=<path>` to override discovery.
+Requires Zig `0.16.0`, the Windows SDK shader compilers (`fxc.exe` for SM5/DXBC and `dxc.exe` with `dxil.dll` beside it for signed SM6/DXIL), and the LunarG Vulkan SDK (`dxc.exe`, `spirv-cross.exe`, `glslangValidator.exe`, and `spirv-val.exe` for SPIR-V). The two DXC installs are not interchangeable: the Vulkan SDK one emits SPIR-V but ships no `dxil.dll`, and D3D12 rejects unsigned DXIL. Those shader/SDK tools are required only for the Windows build; the macOS target links Apple frameworks instead and does not discover or depend on them. Dependencies are declared in `build.zig.zon`; `win32` is marked `lazy = true`. The build discovers the newest installed SDK versions from their standard locations or the `WindowsSdkVerBinPath` / `VULKAN_SDK` environment variables; use `-Dfxc-path=<path>`, `-Ddxil-dxc-path=<path>`, `-Ddxc-path=<path>`, `-Dspirv-cross-path=<path>`, `-Dglslang-validator-path=<path>`, or `-Dspirv-val-path=<path>` to override discovery.
 
 - `zig build` — build the `Mostty` executable into `zig-out/bin/`.
 - `zig build run -- [args]` — build and run; everything after `--` is forwarded as cmdline args (see `src/Cmdline.zig`: `--ttf <path>`, `--font-size <float>`).
 - `zig build test` — run the unit test step (compiles the same root file as the exe; there are very few tests today).
 - `zig build -Doptimize=ReleaseSmall` — what the README's "less than 2 MB" Windows binary refers to.
+
+On a macOS host, `zig build` assembles a launchable `Mostty.app` into `zig-out/` (requires `swiftc` and the Apple SDK); `zig build macos-app` targets just the bundle, `zig build check-macos-session` compiles the PTY session and renderer, and `zig build test-macos-grid` runs the platform-neutral grid tests.
 
 There is no separate lint step. The Windows build requires the MSVC ABI (`build.zig` defaults to it and fails fast on Windows-GNU).
 
@@ -56,11 +58,12 @@ There is no separate lint step. The Windows build requires the MSVC ABI (`build.
 
 # Architecture
 
-Mostty is a Windows-only terminal emulator that wraps `libghostty-vt` (the VT parser/state machine from Ghostty, imported as the `vt` module) and provides its own windowing + rendering layer:
+Mostty is a terminal emulator that wraps `libghostty-vt` (the VT parser/state machine from Ghostty, imported as the `vt` module) and provides its own windowing + rendering layer. It targets Windows (the primary, fully-featured application) and macOS:
 
 | Target  | Entry point             | Window/IO                           | Rendering                                     |
 | ------- | ----------------------- | ----------------------------------- | --------------------------------------------- |
 | Windows | `src/mosttywindows.zig` | Win32 message loop + ConPTY per tab | D3D11 (default), D3D12, OpenGL 4.6, or Vulkan |
+| macOS   | `src/mosttymacos.zig`   | SwiftUI/AppKit app + PTY per tab over a C-ABI boundary | CoreText rasterization + Metal presentation   |
 
 The backend is picked per process by `--renderer` or `renderer =` in the config; the accepted values are `d3d11`, `d3d12`, `opengl`, `pure-opengl`, `vulkan`, and `native-vulkan` (`Config.RendererBackend`). Everything except D3D11 is an explicit research variant. All of them share one process-lifetime `FontService` (DirectWrite + Direct2D), so text layout and glyph rasterization are backend-independent, and `terminal.hlsl` is the single shader source compiled to DXBC / signed DXIL / SPIR-V.
 
