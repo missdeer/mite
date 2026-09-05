@@ -356,8 +356,10 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         let cwPts = Double(cellWidthPx) / scale
         let chPts = Double(cellHeightPx) / scale
         let col = cwPts > 0 ? Int(Double(p.x) / cwPts) : 0
-        let rowFromBottom = chPts > 0 ? Int(Double(p.y) / chPts) : 0
-        let rowFromTop = Int(rows) - 1 - rowFromBottom
+        // Rows are laid out downward from the top edge, and the renderer keeps a
+        // gutter at the bottom, so the row must be measured from the top rather
+        // than inferred from the row count.
+        let rowFromTop = chPts > 0 ? Int((Double(bounds.height) - Double(p.y)) / chPts) : 0
         let clampedCol = min(max(0, col), max(0, Int(cols) - 1))
         let clampedRow = min(max(0, rowFromTop), max(0, Int(rows) - 1))
         return (clampedCol, clampedRow)

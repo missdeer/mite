@@ -160,8 +160,16 @@ pub fn resize(self: *CoreTextRenderer, pixel_width: u32, pixel_height: u32, scal
     self.pixel_height = pixel_height;
 }
 
+/// Drawable height minus the reserved bottom gutter. Rows are laid out from the
+/// top of the drawable, so holding back one cell row keeps the last text row
+/// clear of the window's rounded bottom corners, which otherwise clip the
+/// leading glyph of that row.
+pub fn contentHeight(self: *const CoreTextRenderer) u32 {
+    return self.pixel_height -| self.metrics.cell_height;
+}
+
 pub fn gridSize(self: *const CoreTextRenderer) GridModel.Size {
-    return self.metrics.gridSize(self.pixel_width, self.pixel_height);
+    return self.metrics.gridSize(self.pixel_width, self.contentHeight());
 }
 
 pub fn render(self: *CoreTextRenderer, session: *TerminalSession, cursor: ?Cursor) !RenderResult {
@@ -171,7 +179,7 @@ pub fn render(self: *CoreTextRenderer, session: *TerminalSession, cursor: ?Curso
         session.term,
         self.metrics,
         self.pixel_width,
-        self.pixel_height,
+        self.contentHeight(),
     );
     defer frame.deinit();
 
@@ -400,6 +408,15 @@ test "CoreText and Metal render a resized styled terminal frame" {
     });
     defer renderer.deinit();
     try renderer.resize(360, 108, 1);
+
+    // The grid must stop a full cell short of the drawable's bottom edge, so the
+    // window's rounded corners never clip the last row's leading glyph.
+    const grid = renderer.gridSize();
+    try std.testing.expect(grid.rows > 0);
+    try std.testing.expect(
+        renderer.pixel_height - grid.rows * renderer.metrics.cell_height >= renderer.metrics.cell_height,
+    );
+
     const result = try renderer.render(&session, .{ .col = 0, .row = 0 });
     try std.testing.expect(result.cols > 0);
     try std.testing.expect(result.rows > 0);

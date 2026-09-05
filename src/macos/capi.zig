@@ -340,7 +340,7 @@ export fn mostty_tab_selection_text(
         tab.pty.terminal.term,
         tab.renderer.metrics,
         tab.renderer.pixel_width,
-        tab.renderer.pixel_height,
+        tab.renderer.contentHeight(),
     ) catch return 0;
     defer frame.deinit();
 
