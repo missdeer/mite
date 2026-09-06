@@ -8,6 +8,9 @@
 // Replace only the C bridge: the tests run the production AppKit handlers.
 static uint8_t written[4096];
 static size_t written_count;
+static uint8_t tabs[8];
+static size_t tab_count;
+static MosttyTab *write_tab;
 static bool bracketed_paste;
 static bool selection_active;
 static uint32_t selection_end;
@@ -51,7 +54,12 @@ size_t clipboard_test_written(uint8_t *buf, size_t cap) {
     return written_count;
 }
 
-MosttyTab *mostty_tab_create(uint32_t w, uint32_t h, float scale) { return (MosttyTab *)&written_count; }
+MosttyTab *mostty_tab_create(uint32_t w, uint32_t h, float scale) {
+    assert(tab_count < sizeof(tabs));
+    return (MosttyTab *)&tabs[tab_count++];
+}
+MosttyTab *clipboard_test_created_tab(void) { return tab_count ? (MosttyTab *)&tabs[tab_count - 1] : NULL; }
+MosttyTab *clipboard_test_write_tab(void) { return write_tab; }
 void mostty_tab_destroy(MosttyTab *tab) {}
 float mostty_config_background_opacity(void) { return 1; }
 uint32_t mostty_config_render_interval_ms(void) { return 16; }
@@ -63,6 +71,7 @@ void *mostty_tab_metal_device(MosttyTab *tab) {
 intptr_t mostty_tab_read(MosttyTab *tab, uint8_t *buf, size_t cap) { return 0; }
 void mostty_tab_feed(MosttyTab *tab, const uint8_t *ptr, size_t len) {}
 void mostty_tab_write(MosttyTab *tab, const uint8_t *ptr, size_t len) {
+    write_tab = tab;
     assert(len <= sizeof(written) - written_count);
     memcpy(written + written_count, ptr, len);
     written_count += len;
@@ -108,3 +117,35 @@ size_t mostty_tab_selection_text(MosttyTab *tab, uint8_t *buf, size_t cap) {
     return len;
 }
 size_t mostty_encode_key(uint32_t key, uint32_t mods, bool app_cursor, uint8_t *buf, size_t cap) { return 0; }
+
+@interface ClipboardDragInfo : NSObject <NSDraggingInfo>
+@property(strong) NSPasteboard *draggingPasteboard;
+@property NSDragOperation draggingSourceOperationMask;
+@property NSDraggingFormation draggingFormation;
+@property BOOL animatesToDestination;
+@property NSInteger numberOfValidItemsForDrop;
+@end
+
+@implementation ClipboardDragInfo
+- (NSWindow *)draggingDestinationWindow { return nil; }
+- (NSPoint)draggingLocation { return NSZeroPoint; }
+- (NSPoint)draggedImageLocation { return NSZeroPoint; }
+- (NSImage *)draggedImage { return nil; }
+- (id)draggingSource { return nil; }
+- (NSInteger)draggingSequenceNumber { return 0; }
+- (NSSpringLoadingHighlight)springLoadingHighlight { return NSSpringLoadingHighlightNone; }
+- (void)resetSpringLoading {}
+- (void)slideDraggedImageTo:(NSPoint)point {}
+- (NSArray<NSString *> *)namesOfPromisedFilesDroppedAtDestination:(NSURL *)destination { return nil; }
+- (void)enumerateDraggingItemsWithOptions:(NSDraggingItemEnumerationOptions)options
+                                forView:(NSView *)view classes:(NSArray<Class> *)classes
+                          searchOptions:(NSDictionary<NSPasteboardReadingOptionKey, id> *)searchOptions
+                             usingBlock:(void (^)(NSDraggingItem *, NSInteger, BOOL *))block {}
+@end
+
+id<NSDraggingInfo> clipboard_test_drag(NSPasteboard *pasteboard, NSDragOperation operation) {
+    ClipboardDragInfo *info = [ClipboardDragInfo new];
+    info.draggingPasteboard = pasteboard;
+    info.draggingSourceOperationMask = operation;
+    return info;
+}

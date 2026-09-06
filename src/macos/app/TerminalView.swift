@@ -67,6 +67,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         ov.autoresizingMask = [.width, .height]
         addSubview(ov)
         overlay = ov
+        registerForDraggedTypes([.fileURL])
     }
 
     required init?(coder: NSCoder) { fatalError("unsupported") }
@@ -561,11 +562,16 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 
     @objc func paste(_ sender: Any?) {
-        guard let t = tab, let s = NSPasteboard.general.string(forType: .string) else { return }
+        guard let s = NSPasteboard.general.string(forType: .string) else { return }
         // Terminals expect Enter as CR, including inside bracketed paste.
         let normalized = s.replacingOccurrences(of: "\r\n", with: "\r")
                           .replacingOccurrences(of: "\n", with: "\r")
-        var bytes = Array(normalized.utf8)
+        pasteBytes(Array(normalized.utf8))
+    }
+
+    private func pasteBytes(_ content: [UInt8]) {
+        guard let t = tab, !terminated else { return }
+        var bytes = content
         if mostty_tab_bracketed_paste(t) {
             // Strip any embedded paste-end marker so clipboard content can't
             // terminate bracketed paste early and inject the trailing bytes as
@@ -575,6 +581,40 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         }
         writeBytes(bytes)
         scrollToBottomOnInput()
+    }
+
+    // MARK: File drops
+
+    private func droppedFileURLs(_ sender: NSDraggingInfo) -> [URL]? {
+        guard alive, !terminated, window != nil, sender.draggingSourceOperationMask.contains(.copy),
+              let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                            options: [.urlReadingFileURLsOnly: true]) as? [URL],
+              !urls.isEmpty else { return nil }
+        return urls
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        droppedFileURLs(sender) == nil ? [] : .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        draggingEntered(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let urls = droppedFileURLs(sender) else { return false }
+        let paths = urls.map { url in
+            // Escape double-quote metacharacters and isolate ! from interactive history expansion.
+            let escaped = url.path.replacingOccurrences(of: "\\", with: "\\\\")
+                                  .replacingOccurrences(of: "\"", with: "\\\"")
+                                  .replacingOccurrences(of: "$", with: "\\$")
+                                  .replacingOccurrences(of: "`", with: "\\`")
+                                  .replacingOccurrences(of: "!", with: "\"'!'\"")
+            return "\"" + escaped + "\""
+        }
+        pasteBytes(Array((paths.joined(separator: " ") + " ").utf8))
+        window?.makeFirstResponder(self)
+        return true
     }
 
     // MARK: NSTextInputClient

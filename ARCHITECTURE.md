@@ -456,6 +456,8 @@ and CJK-aware expansion.
 URL hover uses the shared viewport detector. The macOS host refreshes the hit
 before rendering, paints its underline through `GridModel`, and re-detects the
 target on double-click before passing it to `NSWorkspace` for browser opening.
+Native file drops read file URLs from the drag pasteboard and send individually
+quoted paths through the same bracketed-paste framing as clipboard input.
 
 The flow per chunk of PTY bytes is:
 
