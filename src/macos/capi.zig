@@ -71,18 +71,8 @@ fn paintOptions(cfg: *const Config) CoreTextRenderer.Paint {
     };
 }
 
-fn alphaFromOpacity(opacity: f32) u8 {
-    return @intFromFloat(@round(std.math.clamp(opacity, 0, 1) * 255));
-}
-
-fn optionalRgba(value: ?u24) ?GridModel.Rgba {
-    const packed_rgb = value orelse return null;
-    return GridModel.Rgba.fromRgb(
-        @intCast((packed_rgb >> 16) & 0xff),
-        @intCast((packed_rgb >> 8) & 0xff),
-        @intCast(packed_rgb & 0xff),
-    );
-}
+const alphaFromOpacity = GridModel.alphaFromOpacity;
+const optionalRgba = GridModel.optionalRgba;
 
 /// Create a terminal tab sized to fit `pixel_width` x `pixel_height` at
 /// `scale`. Font, colors, launcher command, and environment all come from the
@@ -749,10 +739,12 @@ test "config colors decide the rendered defaults and palette entries" {
     });
     defer frame.deinit();
 
-    try std.testing.expectEqual(GridModel.Rgba.fromRgb(0x10, 0x20, 0x40), frame.background);
+    var background = GridModel.Rgba.fromRgb(0x10, 0x20, 0x40);
+    background.a = alphaFromOpacity(cfg.background_opacity);
+    try std.testing.expectEqual(background, frame.background);
     const plain = frameCell(frame, 0, 0);
     try std.testing.expectEqual(GridModel.Rgba.fromRgb(0xe0, 0xd0, 0xa0), plain.style.foreground);
-    try std.testing.expectEqual(GridModel.Rgba.fromRgb(0x10, 0x20, 0x40), plain.style.background);
+    try std.testing.expectEqual(background, plain.style.background);
     // SGR 31 is palette slot 1, so it must resolve through the configured value.
     try std.testing.expectEqual(
         GridModel.Rgba.fromRgb(0xff, 0x88, 0x00),
@@ -765,6 +757,34 @@ fn frameCell(frame: GridModel.Frame, col: u16, row: u16) GridModel.Cell {
         if (cell.col == col and cell.row == row) return cell;
     }
     unreachable;
+}
+
+test "omitted macOS settings reach the renderer and host from Config defaults" {
+    const defaults: Config = .{};
+    for ([_][]const u8{ "", "font-family =\nfont-size = invalid\nbackground-opacity = invalid\n" }) |source| {
+        var cfg = Config.parse(allocator, source, "test");
+        defer cfg.deinit();
+        const font = fontOptions(&cfg);
+        try std.testing.expectEqual(defaults.font_size_pt, @as(?f32, font.size));
+        try std.testing.expectEqualStrings(defaults.font_families[0], font.family);
+        try std.testing.expectEqualStrings(defaults.font_family_bold, font.family_bold);
+        try std.testing.expectEqualStrings(defaults.font_family_italic, font.family_italic);
+        try std.testing.expectEqualStrings(defaults.font_family_bold_italic, font.family_bold_italic);
+        const paint = paintOptions(&cfg);
+        try std.testing.expectEqual(alphaFromOpacity(defaults.background_opacity), paint.background_alpha);
+        try std.testing.expectEqual(optionalRgba(cfg.theme.selection_background), paint.selection_background);
+        try std.testing.expectEqual(optionalRgba(cfg.theme.selection_foreground), paint.selection_foreground);
+        try std.testing.expectEqual(optionalRgba(cfg.theme.cursor_text), paint.cursor_text);
+
+        const previous = loaded_config;
+        loaded_config = cfg;
+        defer loaded_config = previous;
+        try std.testing.expectEqual(defaults.background_opacity, mostty_config_background_opacity());
+        try std.testing.expectEqual(defaults.background_blur, mostty_config_background_blur());
+        try std.testing.expectEqual(defaults.maximize, mostty_config_maximize());
+        try std.testing.expectEqual(defaults.fullscreen, mostty_config_fullscreen());
+        try std.testing.expectEqual(defaults.render_interval_local_ms, mostty_config_render_interval_ms());
+    }
 }
 
 test "font keys reach the renderer, and their absence falls back to the platform default" {
@@ -788,8 +808,28 @@ test "font keys reach the renderer, and their absence falls back to the platform
     var empty = Config.parse(allocator, "", "test");
     defer empty.deinit();
     const defaults = fontOptions(&empty);
-    try std.testing.expectEqualStrings(CoreTextRenderer.default_family, defaults.family);
-    try std.testing.expectEqual(CoreTextRenderer.default_font_size, defaults.size);
+    try std.testing.expectEqualStrings((Config{}).font_families[0], defaults.family);
+    try std.testing.expectEqual((Config{}).font_size_pt.?, defaults.size);
+}
+
+test "default config reaches a real renderer's font and pixel alpha" {
+    var cfg = Config.parse(allocator, "", "test");
+    defer cfg.deinit();
+    const previous = loaded_config;
+    loaded_config = cfg;
+    defer loaded_config = previous;
+    const tab = try createTab(320, 96, 1);
+    defer mostty_tab_destroy(tab);
+    try std.testing.expectEqual((Config{}).font_size_pt.?, tab.renderer.font_size);
+    try std.testing.expectEqualStrings((Config{}).font_families[0], tab.renderer.families.names[0]);
+    _ = try tab.renderer.render(&tab.pty.terminal, null);
+    // A blank terminal has no foreground ink, so every pixel carries the
+    // configured background alpha, including the reserved bottom gutter.
+    const alpha = alphaFromOpacity((Config{}).background_opacity);
+    var index: usize = 3;
+    while (index < tab.renderer.pixels.len) : (index += 4) {
+        try std.testing.expectEqual(alpha, tab.renderer.pixels[index]);
+    }
 }
 
 test "background-opacity and selection colors reach the renderer's paint options" {

@@ -7,6 +7,7 @@
 //! computes the effective style mapping.
 
 const std = @import("std");
+const Config = @import("../../Config.zig");
 const win32 = @import("win32").everything;
 const com = @import("com.zig");
 const GlyphIndexCache = @import("../GlyphIndexCache.zig");
@@ -85,8 +86,8 @@ pub const FontConfig = struct {
 // Font configuration (mirrors WezTerm config). Primary family, then ordered
 // user fallbacks, then system fallback. Color emoji are routed explicitly by
 // emoji.zig when `emoji-font-family` is configured.
-pub const default_primary_font_family: [*:0]const u16 = win32.L("Consolas");
-pub const default_font_size_pt: f32 = 13.0;
+pub const default_primary_font_family: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral((Config{}).font_families[0]);
+pub const default_font_size_pt: f32 = (Config{}).font_size_pt.?;
 
 pub const emoji_font_family: [*:0]const u16 = win32.L("Segoe UI Emoji");
 const font_fallback_families = [_][*:0]const u16{};

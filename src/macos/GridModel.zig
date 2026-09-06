@@ -8,6 +8,7 @@
 const std = @import("std");
 const vt = @import("vt");
 const TerminalSession = @import("../terminal/Session.zig");
+const Config = @import("../Config.zig");
 
 pub const Rgba = packed struct(u32) {
     r: u8,
@@ -117,10 +118,10 @@ pub const Options = struct {
     /// translucent window composite what is behind it. Cells with an explicit
     /// background stay opaque so highlighted regions remain readable, matching
     /// the Windows renderer.
-    background_alpha: u8 = 255,
+    background_alpha: u8 = alphaFromOpacity((Config{}).background_opacity),
     selection: ?Selection = null,
-    selection_foreground: ?Rgba = null,
-    selection_background: ?Rgba = null,
+    selection_foreground: ?Rgba = optionalRgba((Config{}).theme.selection_foreground),
+    selection_background: ?Rgba = optionalRgba((Config{}).theme.selection_background),
 };
 
 pub const Frame = struct {
@@ -138,8 +139,16 @@ pub const Frame = struct {
     }
 };
 
-pub const DEFAULT_FOREGROUND = Rgba.fromRgb(0xc8, 0xc4, 0xd0);
-pub const DEFAULT_BACKGROUND = Rgba.fromRgb(0x2a, 0x2a, 0x2a);
+pub const DEFAULT_FOREGROUND = fromRgb(Config.u24ToRgb((Config{}).theme.foreground));
+pub const DEFAULT_BACKGROUND = fromRgb(Config.u24ToRgb((Config{}).theme.background));
+
+pub fn alphaFromOpacity(opacity: f32) u8 {
+    return @intFromFloat(@round(std.math.clamp(opacity, 0, 1) * 255));
+}
+
+pub fn optionalRgba(value: ?u24) ?Rgba {
+    return fromRgb(Config.u24ToRgb(value orelse return null));
+}
 
 pub fn build(
     allocator: std.mem.Allocator,
@@ -360,6 +369,27 @@ test "grid model preserves ordinary, wide, and styled VT cells" {
     try std.testing.expect(found_styled);
 }
 
+test "unset terminal colors use Config defaults in the rendered grid" {
+    const defaults: Config = .{};
+    var session: TerminalSession = undefined;
+    var context: u8 = 0;
+    try testSession(&session, &context, 4, 2);
+    defer session.deinit();
+    session.term.colors.foreground = .unset;
+    session.term.colors.background = .unset;
+    var frame = try build(std.testing.allocator, session.term, .{
+        .metrics = .{ .cell_width = 9, .cell_height = 18 },
+        .pixel_width = 36,
+        .pixel_height = 36,
+    });
+    defer frame.deinit();
+    var background = fromRgb(Config.u24ToRgb(defaults.theme.background));
+    background.a = alphaFromOpacity(defaults.background_opacity);
+    try std.testing.expectEqual(background, frame.background);
+    try std.testing.expectEqual(background, frame.cells[0].style.background);
+    try std.testing.expectEqual(fromRgb(Config.u24ToRgb(defaults.theme.foreground)), frame.cells[0].style.foreground);
+}
+
 test "grid model recomputes visible grid after a pixel resize" {
     var session: TerminalSession = undefined;
     var context: u8 = 0;
@@ -433,7 +463,9 @@ test "selection recolors the selected span and degrades to inverse video" {
     // Outside the range the cell is untouched: unwritten trailing cells keep the
     // terminal default background rather than the active SGR one.
     const untouched = findCell(inverse, 2, 0);
-    try std.testing.expectEqual(DEFAULT_BACKGROUND, untouched.style.background);
+    var background = DEFAULT_BACKGROUND;
+    background.a = geometry.background_alpha;
+    try std.testing.expectEqual(background, untouched.style.background);
 
     var themed = try build(std.testing.allocator, session.term, .{
         .metrics = geometry.metrics,

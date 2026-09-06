@@ -7,6 +7,7 @@ const macos = @import("Apple.zig");
 const GridModel = @import("GridModel.zig");
 const MetalBackend = @import("MetalBackend.zig");
 const TerminalSession = @import("../terminal/Session.zig");
+const Config = @import("../Config.zig");
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("CoreTextRenderer is macOS-only");
@@ -16,19 +17,16 @@ const graphics = macos.graphics;
 const text = macos.text;
 const foundation = macos.foundation;
 
-/// Fallbacks used when the config leaves a key unset. macOS ships Menlo as its
-/// monospace terminal face; the size matches the `font-size` default resolution
-/// in `Config`.
-pub const default_family = "Menlo";
-pub const default_font_size: f32 = 14;
+pub const default_family = (Config{}).font_families[0];
+pub const default_font_size = (Config{}).font_size_pt.?;
 
 /// Font selection resolved from the config. An empty per-style family means
 /// "synthesize this style from the regular face's symbolic traits".
 pub const FontOptions = struct {
     family: []const u8 = default_family,
-    family_bold: []const u8 = &.{},
-    family_italic: []const u8 = &.{},
-    family_bold_italic: []const u8 = &.{},
+    family_bold: []const u8 = (Config{}).font_family_bold,
+    family_italic: []const u8 = (Config{}).font_family_italic,
+    family_bold_italic: []const u8 = (Config{}).font_family_bold_italic,
     size: f32 = default_font_size,
 };
 
@@ -36,13 +34,13 @@ pub const FontOptions = struct {
 /// mouse-driven selection). A null color means "invert the cell", which is what
 /// the corresponding config key degrades to when unset.
 pub const Paint = struct {
-    background_alpha: u8 = 255,
-    selection_foreground: ?GridModel.Rgba = null,
-    selection_background: ?GridModel.Rgba = null,
+    background_alpha: u8 = GridModel.alphaFromOpacity((Config{}).background_opacity),
+    selection_foreground: ?GridModel.Rgba = GridModel.optionalRgba((Config{}).theme.selection_foreground),
+    selection_background: ?GridModel.Rgba = GridModel.optionalRgba((Config{}).theme.selection_background),
     // `cursor-color` is not here: it is seeded into the terminal's dynamic
     // colors so a running app can override it with OSC 12, and is read from
     // there at draw time. `cursor-text` has no such VT counterpart.
-    cursor_text: ?GridModel.Rgba = null,
+    cursor_text: ?GridModel.Rgba = GridModel.optionalRgba((Config{}).theme.cursor_text),
 };
 
 pub const Options = struct {

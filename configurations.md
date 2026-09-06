@@ -91,7 +91,8 @@ accumulate into a fallback chain (first match wins per glyph).
 font-family = JetBrains Mono, Consolas
 ```
 
-Default: `Consolas`.
+Default: `Consolas` on Windows and `Menlo` on macOS, using each platform's
+system monospace font. Both defaults are defined in the shared configuration.
 
 ### `emoji-font-family`
 
@@ -115,7 +116,7 @@ Font size in points. Must be a positive number.
 font-size = 13.5
 ```
 
-Default: `13.0`.
+Default: `13.0` on both Windows and macOS, including when no config file exists.
 
 ### `font-ligatures`
 

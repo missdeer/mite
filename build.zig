@@ -33,6 +33,12 @@ fn addMacosGridTests(
         }),
     });
     tests.root_module.addImport("vt", vt);
+    // Grid defaults now use Config, whose parser tests need the Windows API.
+    if (target.result.os.tag == .windows) {
+        if (b.lazyDependency("win32", .{})) |win32_dep| {
+            tests.root_module.addImport("win32", win32_dep.module("win32"));
+        }
+    }
     const grid_step = b.step("test-macos-grid", "Test the platform-neutral macOS grid model");
     if (canRunTarget(b, target)) {
         const run_tests = b.addRunArtifact(tests);

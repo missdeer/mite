@@ -188,7 +188,8 @@ fn rebaseDynamicRGB(c: *vt.color.DynamicRGB, new_default: ?vt.color.RGB) void {
     if (unmodified) c.override = null;
 }
 
-font_families: []const []const u8 = &.{},
+// Both platforms use an installed system monospace face by default.
+font_families: []const []const u8 = if (builtin.os.tag == .macos) &.{"Menlo"} else &.{"Consolas"},
 // Emoji/color-symbol fallback families. Empty -> renderer default.
 emoji_font_families: []const []const u8 = &.{},
 // Per-style primary family overrides. Empty -> inherit the regular family
@@ -202,7 +203,7 @@ font_style: FontStyle = .default,
 font_style_bold: FontStyle = .default,
 font_style_italic: FontStyle = .default,
 font_style_bold_italic: FontStyle = .default,
-font_size_pt: ?f32 = null,
+font_size_pt: ?f32 = 13.0,
 // Shape common programming-symbol ligatures through DirectWrite. Enabled by
 // default for MOSTTY-1; users on non-ligature fonts can disable the extra run
 // atlas entries with `font-ligatures = false`.
@@ -366,40 +367,41 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
     var arena = std.heap.ArenaAllocator.init(gpa);
     const a = arena.allocator();
 
+    const defaults: Config = .{};
     var families: std.ArrayListUnmanaged([]const u8) = .empty;
     var emoji_families: std.ArrayListUnmanaged([]const u8) = .empty;
-    var family_bold: []const u8 = &.{};
-    var family_italic: []const u8 = &.{};
-    var family_bold_italic: []const u8 = &.{};
-    var synthetic: SyntheticStyle = .{};
-    var style_regular: FontStyle = .default;
-    var style_bold: FontStyle = .default;
-    var style_italic: FontStyle = .default;
-    var style_bold_italic: FontStyle = .default;
-    var font_size_pt: ?f32 = null;
-    var font_ligatures: bool = true;
+    var family_bold = defaults.font_family_bold;
+    var family_italic = defaults.font_family_italic;
+    var family_bold_italic = defaults.font_family_bold_italic;
+    var synthetic = defaults.font_synthetic_style;
+    var style_regular = defaults.font_style;
+    var style_bold = defaults.font_style_bold;
+    var style_italic = defaults.font_style_italic;
+    var style_bold_italic = defaults.font_style_bold_italic;
+    var font_size_pt = defaults.font_size_pt;
+    var font_ligatures = defaults.font_ligatures;
     var font_features: std.ArrayListUnmanaged(FontFeature) = .empty;
-    var tabbar_font_family: []const u8 = &.{};
-    var tabbar_font_size_pt: ?f32 = null;
-    var background_opacity: f32 = 0.94;
-    var background_blur: bool = true;
-    var background_image: []const u8 = &.{};
-    var background_image_opacity: f32 = 1.0;
-    var background_image_position: BackgroundImagePosition = .center;
-    var background_image_fit: BackgroundImageFit = .contain;
-    var background_image_repeat: bool = false;
-    var maximize: bool = false;
-    var fullscreen: bool = false;
-    var render_interval_local_ms: u32 = 16;
-    var render_interval_remote_ms: u32 = 50;
-    var gpu: ?[]const u8 = null;
-    var renderer: RendererBackend = .d3d11;
+    var tabbar_font_family = defaults.tabbar_font_family;
+    var tabbar_font_size_pt = defaults.tabbar_font_size_pt;
+    var background_opacity = defaults.background_opacity;
+    var background_blur = defaults.background_blur;
+    var background_image = defaults.background_image;
+    var background_image_opacity = defaults.background_image_opacity;
+    var background_image_position = defaults.background_image_position;
+    var background_image_fit = defaults.background_image_fit;
+    var background_image_repeat = defaults.background_image_repeat;
+    var maximize = defaults.maximize;
+    var fullscreen = defaults.fullscreen;
+    var render_interval_local_ms = defaults.render_interval_local_ms;
+    var render_interval_remote_ms = defaults.render_interval_remote_ms;
+    var gpu = defaults.gpu;
+    var renderer = defaults.renderer;
     var codepoint_maps: std.ArrayListUnmanaged(CodepointMap) = .empty;
     var launchers: std.ArrayListUnmanaged(Launcher) = .empty;
     var envs: std.ArrayListUnmanaged(EnvEntry) = .empty;
-    var theme: ThemeColors = .{};
-    var overrides: ColorOverrides = .{};
-    var theme_name: ?[]const u8 = null;
+    var theme = defaults.theme;
+    var overrides = defaults.color_overrides;
+    var theme_name = defaults.theme_name;
 
     // Strip UTF-8 BOM if present (Notepad and other Windows editors add one).
     const input = if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) source[3..] else source;
@@ -622,6 +624,11 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
         }
     }
 
+    if (families.items.len == 0) {
+        for (defaults.font_families) |family| {
+            families.append(a, a.dupe(u8, family) catch oom()) catch oom();
+        }
+    }
     const families_slice = families.toOwnedSlice(a) catch oom();
     const emoji_families_slice = emoji_families.toOwnedSlice(a) catch oom();
     const font_features_slice = font_features.toOwnedSlice(a) catch oom();
@@ -950,7 +957,7 @@ fn parseHex(value: []const u8) ?u24 {
     return std.fmt.parseInt(u24, v, 16) catch null;
 }
 
-fn u24ToRgb(c: u24) vt.color.RGB {
+pub fn u24ToRgb(c: u24) vt.color.RGB {
     return .{
         .r = @intCast((c >> 16) & 0xFF),
         .g = @intCast((c >> 8) & 0xFF),
@@ -1327,6 +1334,29 @@ pub fn deinit(self: *Config) void {
 
 fn oom() noreturn {
     @panic("OOM in config loader");
+}
+
+test "omitted settings and a missing config file retain field defaults" {
+    const defaults: Config = .{};
+    // Verify absence so this cannot silently exercise the existing-file path.
+    const path = "tmp/MOSTTY-59-missing-config";
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+    var configs = [_]Config{
+        parse(std.testing.allocator, "", "test"),
+        parse(std.testing.allocator, "font-size = invalid\nbackground-opacity = invalid\n", "test"),
+        loadPath(std.testing.allocator, path),
+    };
+    defer for (&configs) |*cfg| cfg.deinit();
+    for (&configs) |cfg| {
+        inline for (.{
+            "font_families",            "font_family_bold",          "font_family_italic",
+            "font_family_bold_italic",  "font_size_pt",              "background_opacity",
+            "background_blur",          "maximize",                  "fullscreen",
+            "render_interval_local_ms", "render_interval_remote_ms",
+        }) |field| {
+            try std.testing.expectEqualDeep(@field(defaults, field), @field(cfg, field));
+        }
+    }
 }
 
 test "parseHex accepts #RRGGBB and RRGGBB, rejects bad length" {
