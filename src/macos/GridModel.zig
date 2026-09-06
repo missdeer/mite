@@ -58,6 +58,71 @@ pub const Cell = struct {
     style: Style,
 };
 
+/// Inclusive linear selection over viewport coordinates. Endpoints arrive in
+/// click order, so every consumer must go through `normalized` first.
+pub const Selection = struct {
+    start_col: u16,
+    start_row: u16,
+    end_col: u16,
+    end_row: u16,
+
+    pub fn normalized(self: Selection) Selection {
+        const reversed = self.end_row < self.start_row or
+            (self.end_row == self.start_row and self.end_col < self.start_col);
+        if (!reversed) return self;
+        return .{
+            .start_col = self.end_col,
+            .start_row = self.end_row,
+            .end_col = self.start_col,
+            .end_row = self.start_row,
+        };
+    }
+
+    /// Whether a cell spanning `width` columns from `col` intersects the range.
+    /// Width matters: a double-width glyph occupies two columns but is stored
+    /// under its leading one, so testing that column alone would leave a CJK
+    /// glyph unhighlighted when the drag started on its trailing half.
+    fn overlaps(self: Selection, col: u16, row: u16, width: u8) bool {
+        if (row < self.start_row or row > self.end_row) return false;
+        if (row == self.start_row and col + width - 1 < self.start_col) return false;
+        if (row == self.end_row and col > self.end_col) return false;
+        return true;
+    }
+};
+
+/// Recolors selected cells. Mirrors the Windows renderer: an unset
+/// `selection-background` / `selection-foreground` degrades to inverse video, so
+/// the highlight stays legible against any theme.
+const SelectionPaint = struct {
+    range: ?Selection,
+    foreground: ?Rgba,
+    background: ?Rgba,
+
+    fn apply(self: SelectionPaint, style: *Style, col: u16, row: u16, width: u8) void {
+        const range = self.range orelse return;
+        if (!range.overlaps(col, row, width)) return;
+        const original_background = style.background;
+        style.background = self.background orelse style.foreground;
+        style.foreground = self.foreground orelse original_background;
+        style.background.a = 255;
+        style.foreground.a = 255;
+    }
+};
+
+pub const Options = struct {
+    metrics: Metrics,
+    pixel_width: u32,
+    pixel_height: u32,
+    /// Alpha for cells that keep the terminal's default background, letting a
+    /// translucent window composite what is behind it. Cells with an explicit
+    /// background stay opaque so highlighted regions remain readable, matching
+    /// the Windows renderer.
+    background_alpha: u8 = 255,
+    selection: ?Selection = null,
+    selection_foreground: ?Rgba = null,
+    selection_background: ?Rgba = null,
+};
+
 pub const Frame = struct {
     allocator: std.mem.Allocator,
     cells: []Cell,
@@ -79,17 +144,24 @@ pub const DEFAULT_BACKGROUND = Rgba.fromRgb(0x2a, 0x2a, 0x2a);
 pub fn build(
     allocator: std.mem.Allocator,
     term: *vt.Terminal,
-    metrics: Metrics,
-    pixel_width: u32,
-    pixel_height: u32,
+    options: Options,
 ) !Frame {
+    const metrics = options.metrics;
     if (metrics.cell_width == 0 or metrics.cell_height == 0) return error.InvalidMetrics;
 
+    const pixel_width = options.pixel_width;
+    const pixel_height = options.pixel_height;
     const grid = metrics.gridSize(pixel_width, pixel_height);
     const cols = @min(grid.cols, @as(u32, @intCast(term.cols)));
     const rows = @min(grid.rows, @as(u32, @intCast(term.rows)));
     const foreground = if (term.colors.foreground.get()) |color| fromRgb(color) else DEFAULT_FOREGROUND;
-    const background = if (term.colors.background.get()) |color| fromRgb(color) else DEFAULT_BACKGROUND;
+    var background = if (term.colors.background.get()) |color| fromRgb(color) else DEFAULT_BACKGROUND;
+    background.a = options.background_alpha;
+    const selection: SelectionPaint = .{
+        .range = if (options.selection) |range| range.normalized() else null,
+        .foreground = options.selection_foreground,
+        .background = options.selection_background,
+    };
 
     var cells: std.ArrayListUnmanaged(Cell) = .empty;
     errdefer cells.deinit(allocator);
@@ -113,6 +185,8 @@ pub fn build(
             }
 
             const width: u8 = if (raw.wide == .wide and col + 1 < cols) 2 else 1;
+            var style = styleForCell(raw, page, foreground, background, term);
+            selection.apply(&style, @intCast(col), @intCast(row), width);
             try cells.append(allocator, .{
                 .col = @intCast(col),
                 .row = @intCast(row),
@@ -125,37 +199,18 @@ pub fn build(
                     (page.lookupGrapheme(&page_cells[cell_i]) orelse &.{})
                 else
                     &.{},
-                .style = styleForCell(raw, page, foreground, background, term),
+                .style = style,
             });
 
             col += width;
             cell_i += 1;
         }
-        while (col < cols) : (col += 1) {
-            try cells.append(allocator, .{
-                .col = @intCast(col),
-                .row = @intCast(row),
-                .width = 1,
-                .codepoint = ' ',
-                .grapheme = &.{},
-                .style = .{ .foreground = foreground, .background = background },
-            });
-        }
+        try appendBlanks(allocator, &cells, row, col, cols, foreground, background, selection);
         row += 1;
     }
 
     while (row < rows) : (row += 1) {
-        var col: u32 = 0;
-        while (col < cols) : (col += 1) {
-            try cells.append(allocator, .{
-                .col = @intCast(col),
-                .row = @intCast(row),
-                .width = 1,
-                .codepoint = ' ',
-                .grapheme = &.{},
-                .style = .{ .foreground = foreground, .background = background },
-            });
-        }
+        try appendBlanks(allocator, &cells, row, 0, cols, foreground, background, selection);
     }
 
     return .{
@@ -169,6 +224,31 @@ pub fn build(
     };
 }
 
+fn appendBlanks(
+    allocator: std.mem.Allocator,
+    cells: *std.ArrayListUnmanaged(Cell),
+    row: u32,
+    start_col: u32,
+    cols: u32,
+    foreground: Rgba,
+    background: Rgba,
+    selection: SelectionPaint,
+) !void {
+    var col = start_col;
+    while (col < cols) : (col += 1) {
+        var style = Style{ .foreground = foreground, .background = background };
+        selection.apply(&style, @intCast(col), @intCast(row), 1);
+        try cells.append(allocator, .{
+            .col = @intCast(col),
+            .row = @intCast(row),
+            .width = 1,
+            .codepoint = ' ',
+            .grapheme = &.{},
+            .style = style,
+        });
+    }
+}
+
 fn styleForCell(
     cell: anytype,
     page: anytype,
@@ -177,6 +257,9 @@ fn styleForCell(
     term: *vt.Terminal,
 ) Style {
     var result = Style{ .foreground = foreground, .background = background };
+    // `background` carries the window's background alpha; anything that resolves
+    // to an explicit color must be opaque instead, so track which one applies.
+    var default_background = true;
     if (cell.style_id != 0) {
         const style = page.styles.get(page.memory, cell.style_id).*;
         result.foreground = resolveColor(style.fg_color, &term.colors.palette.current, foreground);
@@ -192,12 +275,24 @@ fn styleForCell(
             const swap = result.foreground;
             result.foreground = result.background;
             result.background = swap;
+            default_background = false;
+        } else {
+            default_background = switch (style.bg_color) {
+                .none => true,
+                else => false,
+            };
         }
     }
 
     switch (cell.content_tag) {
-        .bg_color_palette => result.background = fromRgb(term.colors.palette.current[cell.content.color_palette.data]),
-        .bg_color_rgb => result.background = fromRgb(cell.content.color_rgb),
+        .bg_color_palette => {
+            result.background = fromRgb(term.colors.palette.current[cell.content.color_palette.data]);
+            default_background = false;
+        },
+        .bg_color_rgb => {
+            result.background = fromRgb(cell.content.color_rgb);
+            default_background = false;
+        },
         else => {},
     }
     if (result.faint) {
@@ -205,6 +300,8 @@ fn styleForCell(
         result.foreground.g /= 2;
         result.foreground.b /= 2;
     }
+    result.background.a = if (default_background) background.a else 255;
+    result.foreground.a = 255;
     if (result.invisible) result.foreground = result.background;
     return result;
 }
@@ -235,7 +332,11 @@ test "grid model preserves ordinary, wide, and styled VT cells" {
     defer session.deinit();
 
     session.feed("A界\x1b[1;3;4;38;2;10;20;30;48;2;40;50;60mB");
-    var frame = try build(std.testing.allocator, session.term, .{ .cell_width = 9, .cell_height = 18 }, 72, 36);
+    var frame = try build(std.testing.allocator, session.term, .{
+        .metrics = .{ .cell_width = 9, .cell_height = 18 },
+        .pixel_width = 72,
+        .pixel_height = 36,
+    });
     defer frame.deinit();
 
     var found_wide = false;
@@ -272,9 +373,134 @@ test "grid model recomputes visible grid after a pixel resize" {
     });
     defer session.deinit();
 
-    var frame = try build(std.testing.allocator, session.term, .{ .cell_width = 9, .cell_height = 18 }, 27, 36);
+    var frame = try build(std.testing.allocator, session.term, .{
+        .metrics = .{ .cell_width = 9, .cell_height = 18 },
+        .pixel_width = 27,
+        .pixel_height = 36,
+    });
     defer frame.deinit();
     try std.testing.expectEqual(@as(u32, 3), frame.cols);
     try std.testing.expectEqual(@as(u32, 2), frame.rows);
     try std.testing.expectEqual(@as(usize, 6), frame.cells.len);
+}
+
+fn testSession(session: *TerminalSession, context: *u8, cols: u16, rows: u16) !void {
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = cols,
+        .rows = rows,
+        .hooks = .{ .context = context },
+    });
+}
+
+fn findCell(frame: Frame, col: u16, row: u16) Cell {
+    for (frame.cells) |cell| {
+        if (cell.col == col and cell.row == row) return cell;
+    }
+    unreachable;
+}
+
+test "selection recolors the selected span and degrades to inverse video" {
+    // MOSTTY-58: selection highlight must follow selection-background /
+    // selection-foreground. The business rule when either key is unset is
+    // inverse video (Windows parity), not an arbitrary tint — so an unconfigured
+    // selection must land on exactly the cell's own colors, swapped.
+    var session: TerminalSession = undefined;
+    var context: u8 = 0;
+    try testSession(&session, &context, 4, 2);
+    defer session.deinit();
+    session.feed("\x1b[38;2;10;20;30;48;2;40;50;60mAB");
+
+    const geometry = Options{
+        .metrics = .{ .cell_width = 9, .cell_height = 18 },
+        .pixel_width = 36,
+        .pixel_height = 36,
+    };
+    const range = Selection{ .start_col = 0, .start_row = 0, .end_col = 1, .end_row = 0 };
+
+    var inverse = try build(std.testing.allocator, session.term, .{
+        .metrics = geometry.metrics,
+        .pixel_width = geometry.pixel_width,
+        .pixel_height = geometry.pixel_height,
+        .selection = range,
+    });
+    defer inverse.deinit();
+    const inverted = findCell(inverse, 0, 0);
+    try std.testing.expectEqual(Rgba.fromRgb(10, 20, 30), inverted.style.background);
+    try std.testing.expectEqual(Rgba.fromRgb(40, 50, 60), inverted.style.foreground);
+    // Outside the range the cell is untouched: unwritten trailing cells keep the
+    // terminal default background rather than the active SGR one.
+    const untouched = findCell(inverse, 2, 0);
+    try std.testing.expectEqual(DEFAULT_BACKGROUND, untouched.style.background);
+
+    var themed = try build(std.testing.allocator, session.term, .{
+        .metrics = geometry.metrics,
+        .pixel_width = geometry.pixel_width,
+        .pixel_height = geometry.pixel_height,
+        .selection = range,
+        .selection_foreground = Rgba.fromRgb(1, 2, 3),
+        .selection_background = Rgba.fromRgb(4, 5, 6),
+    });
+    defer themed.deinit();
+    const painted = findCell(themed, 1, 0);
+    try std.testing.expectEqual(Rgba.fromRgb(4, 5, 6), painted.style.background);
+    try std.testing.expectEqual(Rgba.fromRgb(1, 2, 3), painted.style.foreground);
+}
+
+test "selection endpoints normalize regardless of drag direction" {
+    // Endpoints arrive in click order, so a bottom-up drag must select the same
+    // cells as the equivalent top-down one.
+    const forward = Selection{ .start_col = 1, .start_row = 0, .end_col = 2, .end_row = 1 };
+    const backward = Selection{ .start_col = 2, .start_row = 1, .end_col = 1, .end_row = 0 };
+    try std.testing.expectEqual(forward, backward.normalized());
+    try std.testing.expectEqual(forward, forward.normalized());
+
+    const range = forward.normalized();
+    try std.testing.expect(!range.overlaps(0, 0, 1));
+    try std.testing.expect(range.overlaps(1, 0, 1));
+    try std.testing.expect(range.overlaps(3, 0, 1));
+    try std.testing.expect(range.overlaps(2, 1, 1));
+    try std.testing.expect(!range.overlaps(3, 1, 1));
+}
+
+test "a double-width glyph is selected from either of its two columns" {
+    // A wide glyph is stored under its leading column but occupies two. Dragging
+    // from its trailing half must still highlight it, which is what the removed
+    // column-range overlay used to do for free.
+    const range = (Selection{ .start_col = 2, .start_row = 0, .end_col = 4, .end_row = 0 }).normalized();
+    // Leading column 1, trailing column 2: the trailing half is in range.
+    try std.testing.expect(range.overlaps(1, 0, 2));
+    // The same cell as single-width would fall outside.
+    try std.testing.expect(!range.overlaps(1, 0, 1));
+    // A wide glyph starting past the end stays unselected.
+    try std.testing.expect(!range.overlaps(5, 0, 2));
+}
+
+test "background alpha applies only to default-background cells" {
+    // background-opacity must let the desktop through the terminal's own
+    // background while cells the app explicitly colored stay opaque, otherwise
+    // highlighted regions would wash out.
+    var session: TerminalSession = undefined;
+    var context: u8 = 0;
+    try testSession(&session, &context, 4, 1);
+    defer session.deinit();
+    session.feed("A\x1b[48;2;40;50;60mB");
+
+    var frame = try build(std.testing.allocator, session.term, .{
+        .metrics = .{ .cell_width = 9, .cell_height = 18 },
+        .pixel_width = 36,
+        .pixel_height = 18,
+        .background_alpha = 128,
+    });
+    defer frame.deinit();
+
+    try std.testing.expectEqual(@as(u8, 128), frame.background.a);
+    try std.testing.expectEqual(@as(u8, 128), findCell(frame, 0, 0).style.background.a);
+    try std.testing.expectEqual(@as(u8, 255), findCell(frame, 1, 0).style.background.a);
+    // Trailing blanks keep the terminal default background, so they stay translucent.
+    try std.testing.expectEqual(@as(u8, 128), findCell(frame, 3, 0).style.background.a);
+    // Glyphs must never inherit the window transparency.
+    try std.testing.expectEqual(@as(u8, 255), findCell(frame, 0, 0).style.foreground.a);
 }

@@ -3,6 +3,7 @@ const PtySession = @This();
 const builtin = @import("builtin");
 const std = @import("std");
 const vt = @import("vt");
+const Config = @import("../Config.zig");
 const TerminalSession = @import("../terminal/Session.zig");
 
 const c = std.c;
@@ -45,6 +46,9 @@ pub const Options = struct {
     // CWD (the app-bundle process directory). The caller resolves the default
     // ($HOME) and any configured override, so this is a plain absolute path.
     working_directory: ?[:0]const u8 = null,
+    // Config `env = NAME=VALUE` entries. Each one replaces the inherited
+    // variable of the same name, matching the Windows ConPTY child.
+    env: []const Config.EnvEntry = &.{},
     hooks: ?Hooks = null,
 };
 
@@ -79,8 +83,12 @@ pub fn init(self: *PtySession, options: Options) !void {
     errdefer self.terminal.deinit();
 
     const shell = options.shell orelse defaultShell();
-    const environment = try childEnvironment(options.terminal_allocator);
-    defer options.terminal_allocator.free(environment);
+    // The child reads these pointers after fork, so they only need to outlive
+    // the exec handshake below; the arena covers both the entry array and the
+    // NAME=VALUE strings built for config overrides.
+    var environment_arena = std.heap.ArenaAllocator.init(options.terminal_allocator);
+    defer environment_arena.deinit();
+    const environment = try childEnvironment(environment_arena.allocator(), options.env);
 
     var exec_pipe = try createExecPipe();
     errdefer closeFd(exec_pipe[0]);
@@ -221,26 +229,58 @@ fn defaultShell() [:0]const u8 {
     return if (shell.len == 0) "/bin/zsh" else shell;
 }
 
-fn childEnvironment(allocator: std.mem.Allocator) ![:null]?[*:0]const u8 {
-    var count: usize = 0;
+// TERM must describe what the VT actually implements, not whatever the launching
+// process happened to inherit, so it is forced unless the config names it.
+const default_term = "TERM=xterm-256color";
+
+fn childEnvironment(
+    allocator: std.mem.Allocator,
+    overrides: []const Config.EnvEntry,
+) ![:null]?[*:0]const u8 {
+    var entries: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
     var has_term = false;
-    while (c.environ[count]) |entry| : (count += 1) {
-        if (std.mem.startsWith(u8, std.mem.span(entry), "TERM=")) has_term = true;
+
+    var index: usize = 0;
+    while (c.environ[index]) |entry| : (index += 1) {
+        const name = entryName(std.mem.span(entry));
+        if (hasOverride(overrides, name)) continue;
+        if (std.mem.eql(u8, name, "TERM")) {
+            try entries.append(allocator, default_term);
+            has_term = true;
+            continue;
+        }
+        try entries.append(allocator, entry);
     }
 
-    const environment_len = count + @intFromBool(!has_term);
-    var environment = try allocator.allocSentinel(?[*:0]const u8, environment_len, null);
-    var output_index: usize = 0;
-    for (c.environ[0..count]) |entry| {
-        const value = entry.?;
-        environment[output_index] = if (std.mem.startsWith(u8, std.mem.span(value), "TERM="))
-            "TERM=xterm-256color"
-        else
-            value;
-        output_index += 1;
+    for (overrides, 0..) |override, position| {
+        // Config keeps duplicate `env` names in declaration order, so drop all
+        // but the last: emitting both would leave the winner up to the child's
+        // libc, where Windows already defines it as last-one-wins.
+        if (hasOverride(overrides[position + 1 ..], override.name)) continue;
+        const joined = try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}={s}",
+            .{ override.name, override.value },
+            0,
+        );
+        try entries.append(allocator, joined.ptr);
+        if (std.mem.eql(u8, override.name, "TERM")) has_term = true;
     }
-    if (!has_term) environment[output_index] = "TERM=xterm-256color";
-    return environment;
+
+    if (!has_term) try entries.append(allocator, default_term);
+    return entries.toOwnedSliceSentinel(allocator, null);
+}
+
+fn entryName(entry: []const u8) []const u8 {
+    const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return entry;
+    return entry[0..eq];
+}
+
+fn hasOverride(overrides: []const Config.EnvEntry, name: []const u8) bool {
+    for (overrides) |override| {
+        if (std.mem.eql(u8, override.name, name)) return true;
+    }
+    return false;
 }
 
 fn createExecPipe() ![2]c.fd_t {
@@ -418,6 +458,111 @@ test "macOS PTY starts the shell in the requested working directory" {
         if (std.mem.eql(u8, std.mem.trimEnd(u8, line, " "), "/usr")) found = true;
     }
     try std.testing.expect(found);
+}
+
+fn expectChildOutputLine(session: *PtySession, expected: []const u8) !void {
+    const contents = try session.terminal.term.plainString(std.testing.allocator);
+    defer std.testing.allocator.free(contents);
+    var it = std.mem.splitScalar(u8, contents, '\n');
+    while (it.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, line, " "), expected)) return;
+    }
+    std.debug.print("child output did not contain '{s}':\n{s}\n", .{ expected, contents });
+    return error.TestExpectedEqual;
+}
+
+test "macOS PTY injects configured env entries into the child" {
+    // MOSTTY-58: a `env = NAME=VALUE` line must be visible to the child process.
+    var session: PtySession = undefined;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 80,
+        .rows = 24,
+        .shell = "/bin/sh",
+        .command = "printf '%s\\n' \"$MOSTTY_TEST_ENV\"",
+        .env = &.{.{ .name = "MOSTTY_TEST_ENV", .value = "from-config" }},
+    });
+    defer session.deinit();
+
+    try drainToEof(&session);
+    const exit = try session.wait();
+    try std.testing.expectEqual(@as(u8, 0), exit.exited);
+    try expectChildOutputLine(&session, "from-config");
+}
+
+test "a configured env entry overrides the inherited variable of the same name" {
+    // The config is the more specific source, so it must win over whatever the
+    // launching process exported — otherwise the key would silently do nothing
+    // for the variables users most want to change (PATH, LANG, TERM).
+    var session: PtySession = undefined;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 80,
+        .rows = 24,
+        .shell = "/bin/sh",
+        // HOME is always inherited, so it proves the replacement rather than an
+        // append; TERM additionally proves the forced default is overridable.
+        .command = "printf '%s %s\\n' \"$HOME\" \"$TERM\"",
+        .env = &.{
+            .{ .name = "HOME", .value = "/config-home" },
+            .{ .name = "TERM", .value = "dumb" },
+        },
+    });
+    defer session.deinit();
+
+    try drainToEof(&session);
+    _ = try session.wait();
+    try expectChildOutputLine(&session, "/config-home dumb");
+}
+
+test "a duplicated env name resolves to the last entry, as on Windows" {
+    // Config keeps duplicate `env` lines in declaration order. Emitting both
+    // would leave the winner up to the child's libc; the config format's rule
+    // everywhere else is that the later line wins, and Windows implements that
+    // explicitly, so macOS must not diverge.
+    var session: PtySession = undefined;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 80,
+        .rows = 24,
+        .shell = "/bin/sh",
+        .command = "printf '%s %s\\n' \"$MOSTTY_DUP\" \"$(env | grep -c '^MOSTTY_DUP=')\"",
+        .env = &.{
+            .{ .name = "MOSTTY_DUP", .value = "first" },
+            .{ .name = "MOSTTY_DUP", .value = "last" },
+        },
+    });
+    defer session.deinit();
+
+    try drainToEof(&session);
+    _ = try session.wait();
+    try expectChildOutputLine(&session, "last 1");
+}
+
+test "macOS PTY forces TERM when the config leaves it alone" {
+    // Without a config entry the VT's own capabilities decide TERM, so an
+    // inherited value must not leak through to the child.
+    var session: PtySession = undefined;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 80,
+        .rows = 24,
+        .shell = "/bin/sh",
+        .command = "printf '%s\\n' \"$TERM\"",
+    });
+    defer session.deinit();
+
+    try drainToEof(&session);
+    _ = try session.wait();
+    try expectChildOutputLine(&session, "xterm-256color");
 }
 
 test "macOS PTY reports an exec failure without leaving a child session" {

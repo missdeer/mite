@@ -88,6 +88,7 @@ extern "c" fn CGContextSetTextDrawingMode(context: CGContextRef, mode: c_int) vo
 extern "c" fn CGContextSetTextMatrix(context: CGContextRef, transform: AffineTransform) void;
 extern "c" fn CGContextSetRGBFillColor(context: CGContextRef, red: f64, green: f64, blue: f64, alpha: f64) void;
 extern "c" fn CGContextFillRect(context: CGContextRef, rect: Rect) void;
+extern "c" fn CGContextClearRect(context: CGContextRef, rect: Rect) void;
 
 pub const foundation = struct {
     pub const StringEncoding = enum(u32) {
@@ -210,6 +211,13 @@ pub const graphics = struct {
 
         pub fn fillRect(value: *BitmapContext, rect: Apple.Rect) void {
             CGContextFillRect(@ptrCast(value), rect);
+        }
+
+        /// Resets the region to transparent black. Required before painting a
+        /// translucent background, which would otherwise blend with the previous
+        /// frame still sitting in the reused pixel buffer.
+        pub fn clearRect(value: *BitmapContext, rect: Apple.Rect) void {
+            CGContextClearRect(@ptrCast(value), rect);
         }
     };
 

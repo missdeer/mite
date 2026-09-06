@@ -221,14 +221,24 @@ fn buildMacosApp(b: *std.Build, target: std.Build.ResolvedTarget) void {
     const install_exe = b.addInstallFileWithDir(exe, .{ .custom = "Mostty.app/Contents/MacOS" }, "Mostty");
     const install_plist = b.addInstallFileWithDir(b.path("src/macos/app/Info.plist"), .{ .custom = "Mostty.app/Contents" }, "Info.plist");
     const install_icon = b.addInstallFileWithDir(b.path("src/mostty.icns"), .{ .custom = "Mostty.app/Contents/Resources" }, "mostty.icns");
+    // Ship the bundled themes so a config's `theme = <name>` resolves through the
+    // Contents/Resources/themes lookup, mirroring <exeDir>/themes on Windows.
+    const install_themes = b.addInstallDirectory(.{
+        .source_dir = b.path("themes"),
+        .install_dir = .{ .custom = "Mostty.app/Contents/Resources" },
+        .install_subdir = "themes",
+    });
 
     const app_step = b.step("macos-app", "Assemble the launchable Mostty.app");
-    app_step.dependOn(&install_exe.step);
-    app_step.dependOn(&install_plist.step);
-    app_step.dependOn(&install_icon.step);
-    b.getInstallStep().dependOn(&install_exe.step);
-    b.getInstallStep().dependOn(&install_plist.step);
-    b.getInstallStep().dependOn(&install_icon.step);
+    for ([_]*std.Build.Step{
+        &install_exe.step,
+        &install_plist.step,
+        &install_icon.step,
+        &install_themes.step,
+    }) |step| {
+        app_step.dependOn(step);
+        b.getInstallStep().dependOn(step);
+    }
 }
 
 fn addMacosFrameworks(module: *std.Build.Module) void {

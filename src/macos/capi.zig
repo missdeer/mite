@@ -33,29 +33,79 @@ const Tab = struct {
     exit_code: ?i32 = null,
 };
 
+// Process-wide configuration, loaded lazily and replaced by
+// `mostty_config_reload`. Every reader runs on the main thread (tab creation and
+// the host's reload path), so no lock is needed. A reload frees the arena the
+// config's strings live in, so callers copy values out instead of borrowing.
+var loaded_config: ?Config = null;
+
+fn config() *const Config {
+    if (loaded_config == null) loaded_config = Config.loadDefault(allocator);
+    return &loaded_config.?;
+}
+
+fn fontOptions(cfg: *const Config) CoreTextRenderer.FontOptions {
+    return .{
+        // The CoreText renderer resolves missing glyphs through the system
+        // fallback chain, so only the primary `font-family` entry is used.
+        .family = if (cfg.font_families.len > 0)
+            cfg.font_families[0]
+        else
+            CoreTextRenderer.default_family,
+        .family_bold = cfg.font_family_bold,
+        .family_italic = cfg.font_family_italic,
+        .family_bold_italic = cfg.font_family_bold_italic,
+        .size = cfg.font_size_pt orelse CoreTextRenderer.default_font_size,
+    };
+}
+
+fn paintOptions(cfg: *const Config) CoreTextRenderer.Paint {
+    return .{
+        .background_alpha = alphaFromOpacity(cfg.background_opacity),
+        .selection_foreground = optionalRgba(cfg.theme.selection_foreground),
+        .selection_background = optionalRgba(cfg.theme.selection_background),
+        // `cursor-color` travels through the terminal's dynamic colors instead
+        // (see ThemeColors.applyToNewTerminal), so an app's OSC 12 override
+        // survives a config reload.
+        .cursor_text = optionalRgba(cfg.theme.cursor_text),
+    };
+}
+
+fn alphaFromOpacity(opacity: f32) u8 {
+    return @intFromFloat(@round(std.math.clamp(opacity, 0, 1) * 255));
+}
+
+fn optionalRgba(value: ?u24) ?GridModel.Rgba {
+    const packed_rgb = value orelse return null;
+    return GridModel.Rgba.fromRgb(
+        @intCast((packed_rgb >> 16) & 0xff),
+        @intCast((packed_rgb >> 8) & 0xff),
+        @intCast(packed_rgb & 0xff),
+    );
+}
+
 /// Create a terminal tab sized to fit `pixel_width` x `pixel_height` at
-/// `scale`. The initial grid is derived from the renderer's cell metrics so the
+/// `scale`. Font, colors, launcher command, and environment all come from the
+/// config. The initial grid is derived from the renderer's cell metrics so the
 /// PTY, VT, and renderer agree on dimensions from the first frame. Returns null
 /// on any failure (renderer, Metal, or shell spawn).
-export fn mostty_tab_create(
-    pixel_width: u32,
-    pixel_height: u32,
-    scale: f32,
-    font_size: f32,
-) ?*Tab {
-    return createTab(pixel_width, pixel_height, scale, font_size) catch null;
+export fn mostty_tab_create(pixel_width: u32, pixel_height: u32, scale: f32) ?*Tab {
+    return createTab(pixel_width, pixel_height, scale) catch null;
 }
 
 // Split out so `errdefer` runs on failure: the exported wrapper returns an
 // optional, and `return null` is a normal (not error) return, which would skip
 // any errdefer cleanup and leak the Tab plus its renderer resources.
-fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, font_size: f32) !*Tab {
+fn createTab(pixel_width: u32, pixel_height: u32, scale: f32) !*Tab {
+    const cfg = config();
+
     const tab = try allocator.create(Tab);
     errdefer allocator.destroy(tab);
 
     tab.renderer = try CoreTextRenderer.init(.{
         .allocator = allocator,
-        .font_size = if (font_size > 0) font_size else 14,
+        .font = fontOptions(cfg),
+        .paint = paintOptions(cfg),
         .scale = if (scale > 0) scale else 1,
         .pixel_width = pixel_width,
         .pixel_height = pixel_height,
@@ -67,10 +117,10 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, font_size: f32) !*
 
     // MOSTTY-51: a new tab's shell starts in the configured working directory
     // (the first launcher's, matching the Windows default-tab choice) or $HOME.
-    var config = Config.loadDefault(allocator);
-    defer config.deinit();
-    const working_directory = try initialWorkingDirectory(&config);
+    const working_directory = try initialWorkingDirectory(cfg);
     defer if (working_directory) |wd| allocator.free(wd);
+    const command = try launcherCommand(cfg);
+    defer if (command) |value| allocator.free(value);
 
     try tab.pty.init(.{
         .io = runtimeIo(),
@@ -79,7 +129,10 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, font_size: f32) !*
         .cols = @intCast(grid.cols),
         .rows = @intCast(grid.rows),
         .working_directory = working_directory,
+        .command = command,
+        .env = cfg.env,
     });
+    cfg.theme.applyToNewTerminal(tab.pty.terminal.term);
     tab.exit_code = null;
     return tab;
 }
@@ -89,15 +142,105 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, font_size: f32) !*
 // process CWD) only when neither is available. Caller owns the returned slice.
 // Propagates OOM rather than swallowing it, so a new tab never silently lands
 // in the wrong directory under allocation failure.
-fn initialWorkingDirectory(config: *const Config) std.mem.Allocator.Error!?[:0]u8 {
-    if (config.launchers.len > 0) {
-        const wd = config.launchers[0].working_directory;
+fn initialWorkingDirectory(cfg: *const Config) std.mem.Allocator.Error!?[:0]u8 {
+    if (cfg.launchers.len > 0) {
+        const wd = cfg.launchers[0].working_directory;
         if (wd.len > 0) return try allocator.dupeZ(u8, wd);
     }
     const home = std.c.getenv("HOME") orelse return null;
     const span = std.mem.span(home);
     if (span.len == 0) return null;
     return try allocator.dupeZ(u8, span);
+}
+
+// The first launcher's command line, matching the Windows default-tab choice.
+// Null keeps the plain login shell. Caller owns the returned slice.
+fn launcherCommand(cfg: *const Config) std.mem.Allocator.Error!?[:0]u8 {
+    if (cfg.launchers.len == 0) return null;
+    const command_line = cfg.launchers[0].command_line;
+    if (command_line.len == 0) return null;
+    return try allocator.dupeZ(u8, command_line);
+}
+
+/// Re-read the config file. Returns false when it could not be read (an editor
+/// mid-save holding the file), leaving the previous config in place so a
+/// transient failure never resets the terminal to defaults.
+export fn mostty_config_reload() bool {
+    const reloaded = Config.loadDefaultChecked(allocator) catch return false;
+    // Publish before freeing: Config owns an arena, and the old value must not
+    // be reachable once its strings are gone.
+    var previous = loaded_config;
+    loaded_config = reloaded;
+    if (previous) |*old| old.deinit();
+    return true;
+}
+
+/// Re-apply the current config to a live tab after `mostty_config_reload`.
+/// Returns true when the cell metrics changed, so the host must re-sync its
+/// drawable and grid.
+export fn mostty_tab_apply_config(tab_opt: ?*Tab) bool {
+    const tab = tab_opt orelse return false;
+    const cfg = config();
+    tab.renderer.paint = paintOptions(cfg);
+    cfg.theme.rebaseTerminal(tab.pty.terminal.term);
+    return tab.renderer.reconfigure(fontOptions(cfg)) catch false;
+}
+
+/// Path of the config file the host watches for changes. Returns the byte count
+/// written, or 0 when the location cannot be resolved or does not fit.
+export fn mostty_config_path(buf: [*]u8, cap: usize) usize {
+    const path = Config.defaultPath(allocator) orelse return 0;
+    defer allocator.free(path);
+    if (path.len > cap) return 0;
+    @memcpy(buf[0..path.len], path);
+    return path.len;
+}
+
+/// Cell background alpha as a 0..1 fraction, for the host to decide whether its
+/// layer and window must be translucent.
+export fn mostty_config_background_opacity() f32 {
+    return std.math.clamp(config().background_opacity, 0, 1);
+}
+
+export fn mostty_config_background_blur() bool {
+    return config().background_blur;
+}
+
+export fn mostty_config_maximize() bool {
+    return config().maximize;
+}
+
+export fn mostty_config_fullscreen() bool {
+    return config().fullscreen;
+}
+
+/// Frame interval for the host's render timer. macOS has no remote-session
+/// concept, so `render-interval-remote-ms` has no effect here.
+export fn mostty_config_render_interval_ms() u32 {
+    return config().render_interval_local_ms;
+}
+
+/// Publish the host's mouse selection so the renderer recolors those cells with
+/// `selection-background` / `selection-foreground` (inverse video when unset).
+export fn mostty_tab_set_selection(
+    tab_opt: ?*Tab,
+    active: bool,
+    start_col: u32,
+    start_row: u32,
+    end_col: u32,
+    end_row: u32,
+) void {
+    const tab = tab_opt orelse return;
+    tab.renderer.selection = if (active) .{
+        .start_col = clampToGridCoord(start_col),
+        .start_row = clampToGridCoord(start_row),
+        .end_col = clampToGridCoord(end_col),
+        .end_row = clampToGridCoord(end_row),
+    } else null;
+}
+
+fn clampToGridCoord(value: u32) u16 {
+    return @intCast(@min(value, std.math.maxInt(u16)));
 }
 
 export fn mostty_tab_destroy(tab_opt: ?*Tab) void {
@@ -335,13 +478,11 @@ export fn mostty_tab_selection_text(
         std.mem.swap(u32, &c0, &c1);
     }
 
-    var frame = GridModel.build(
-        allocator,
-        tab.pty.terminal.term,
-        tab.renderer.metrics,
-        tab.renderer.pixel_width,
-        tab.renderer.contentHeight(),
-    ) catch return 0;
+    var frame = GridModel.build(allocator, tab.pty.terminal.term, .{
+        .metrics = tab.renderer.metrics,
+        .pixel_width = tab.renderer.pixel_width,
+        .pixel_height = tab.renderer.contentHeight(),
+    }) catch return 0;
     defer frame.deinit();
 
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -554,7 +695,7 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     // renderer + Metal device), feeding VT bytes, rendering to a texture, mode
     // queries, and selection extraction. Feeding directly (without reading the
     // PTY) keeps the visible content deterministic.
-    const tab = mostty_tab_create(320, 96, 1, 14) orelse return error.TabCreateFailed;
+    const tab = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
     defer mostty_tab_destroy(tab);
 
     try std.testing.expect(mostty_tab_metal_device(tab) != null);
@@ -580,6 +721,136 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     try std.testing.expect(mostty_tab_app_cursor_keys(tab));
     mostty_tab_feed(tab, "\x1b[?2004h", 8);
     try std.testing.expect(mostty_tab_bracketed_paste(tab));
+}
+
+test "config colors decide the rendered defaults and palette entries" {
+    // MOSTTY-58 acceptance: `background` / `foreground` / `palette` must change
+    // what the terminal draws. Tab creation seeds the VT from the config theme,
+    // so this asserts that composition rather than the hard-coded fallbacks.
+    const tab = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+
+    var cfg = Config.parse(allocator,
+        \\background = 102040
+        \\foreground = e0d0a0
+        \\palette = 1=ff8800
+        \\
+    , "test");
+    defer cfg.deinit();
+    cfg.theme.applyToNewTerminal(tab.pty.terminal.term);
+
+    const content = "A\x1b[31mB";
+    mostty_tab_feed(tab, content.ptr, content.len);
+
+    var frame = try GridModel.build(allocator, tab.pty.terminal.term, .{
+        .metrics = tab.renderer.metrics,
+        .pixel_width = tab.renderer.pixel_width,
+        .pixel_height = tab.renderer.contentHeight(),
+    });
+    defer frame.deinit();
+
+    try std.testing.expectEqual(GridModel.Rgba.fromRgb(0x10, 0x20, 0x40), frame.background);
+    const plain = frameCell(frame, 0, 0);
+    try std.testing.expectEqual(GridModel.Rgba.fromRgb(0xe0, 0xd0, 0xa0), plain.style.foreground);
+    try std.testing.expectEqual(GridModel.Rgba.fromRgb(0x10, 0x20, 0x40), plain.style.background);
+    // SGR 31 is palette slot 1, so it must resolve through the configured value.
+    try std.testing.expectEqual(
+        GridModel.Rgba.fromRgb(0xff, 0x88, 0x00),
+        frameCell(frame, 1, 0).style.foreground,
+    );
+}
+
+fn frameCell(frame: GridModel.Frame, col: u16, row: u16) GridModel.Cell {
+    for (frame.cells) |cell| {
+        if (cell.col == col and cell.row == row) return cell;
+    }
+    unreachable;
+}
+
+test "font keys reach the renderer, and their absence falls back to the platform default" {
+    // MOSTTY-58: `font-family` / `font-size` must decide what the renderer
+    // builds. The rule when a key is absent is the documented macOS default, not
+    // a literal duplicated in the host layer.
+    var configured = Config.parse(allocator,
+        \\font-family = Iosevka, Ignored Fallback
+        \\font-family-bold = Iosevka Heavy
+        \\font-size = 17.5
+        \\
+    , "test");
+    defer configured.deinit();
+    const options = fontOptions(&configured);
+    try std.testing.expectEqualStrings("Iosevka", options.family);
+    try std.testing.expectEqualStrings("Iosevka Heavy", options.family_bold);
+    try std.testing.expectEqual(@as(f32, 17.5), options.size);
+    // Unset per-style families stay empty so the renderer synthesizes them.
+    try std.testing.expectEqual(@as(usize, 0), options.family_italic.len);
+
+    var empty = Config.parse(allocator, "", "test");
+    defer empty.deinit();
+    const defaults = fontOptions(&empty);
+    try std.testing.expectEqualStrings(CoreTextRenderer.default_family, defaults.family);
+    try std.testing.expectEqual(CoreTextRenderer.default_font_size, defaults.size);
+}
+
+test "background-opacity and selection colors reach the renderer's paint options" {
+    var cfg = Config.parse(allocator,
+        \\background-opacity = 0.8
+        \\selection-background = 205020
+        \\selection-foreground = ffffff
+        \\
+    , "test");
+    defer cfg.deinit();
+    const paint = paintOptions(&cfg);
+    // 0.8 of full opacity, rounded to the 8-bit channel the renderer writes.
+    try std.testing.expectEqual(@as(u8, 204), paint.background_alpha);
+    try std.testing.expectEqual(GridModel.Rgba.fromRgb(0x20, 0x50, 0x20), paint.selection_background.?);
+    try std.testing.expectEqual(GridModel.Rgba.fromRgb(0xff, 0xff, 0xff), paint.selection_foreground.?);
+
+    // `cursor-text` is a pure paint value, while `cursor-color` deliberately is
+    // not: it is seeded into the terminal so OSC 12 can still override it.
+    var cursor_cfg = Config.parse(allocator,
+        \\cursor-color = ff0000
+        \\cursor-text = 00ff00
+        \\
+    , "test");
+    defer cursor_cfg.deinit();
+    try std.testing.expectEqual(
+        GridModel.Rgba.fromRgb(0x00, 0xff, 0x00),
+        paintOptions(&cursor_cfg).cursor_text.?,
+    );
+
+    // The default config is nearly opaque but not fully, and leaves the
+    // selection colors unset so the renderer falls back to inverse video.
+    var defaults = Config.parse(allocator, "", "test");
+    defer defaults.deinit();
+    const default_paint = paintOptions(&defaults);
+    try std.testing.expectEqual(alphaFromOpacity(defaults.background_opacity), default_paint.background_alpha);
+    try std.testing.expectEqual(@as(?GridModel.Rgba, null), default_paint.selection_background);
+    try std.testing.expectEqual(@as(?GridModel.Rgba, null), default_paint.selection_foreground);
+    try std.testing.expectEqual(@as(?GridModel.Rgba, null), default_paint.cursor_text);
+}
+
+test "opacity maps onto the full alpha range and clamps out-of-range values" {
+    try std.testing.expectEqual(@as(u8, 255), alphaFromOpacity(1));
+    try std.testing.expectEqual(@as(u8, 0), alphaFromOpacity(0));
+    try std.testing.expectEqual(@as(u8, 255), alphaFromOpacity(2));
+    try std.testing.expectEqual(@as(u8, 0), alphaFromOpacity(-1));
+}
+
+test "launcherCommand replaces the login shell only when a command line is set" {
+    // A launcher with an empty command-line segment still contributes its
+    // working directory, so it must not be mistaken for "run nothing".
+    for ([_][]const u8{ "", "launcher = Shell | | /usr\n" }) |source| {
+        var cfg = Config.parse(allocator, source, "test");
+        defer cfg.deinit();
+        try std.testing.expectEqual(@as(?[:0]u8, null), try launcherCommand(&cfg));
+    }
+
+    var cfg = Config.parse(allocator, "launcher = Shell | htop -d 5 | /usr\n", "test");
+    defer cfg.deinit();
+    const command = try launcherCommand(&cfg) orelse return error.TestUnexpectedResult;
+    defer allocator.free(command);
+    try std.testing.expectEqualStrings("htop -d 5", command);
 }
 
 test "initialWorkingDirectory uses the first launcher's directory when set" {
@@ -609,7 +880,7 @@ test "mostty_tab_title mirrors the Windows path-basename rule" {
     // OSC-2 path title is reduced to its final component (Windows parity), a
     // non-path title passes through, and a filesystem root reduces to empty so
     // the caller keeps the previous label instead of blanking the tab.
-    const tab = mostty_tab_create(320, 96, 1, 14) orelse return error.TabCreateFailed;
+    const tab = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
     defer mostty_tab_destroy(tab);
 
     var buf: [256]u8 = undefined;

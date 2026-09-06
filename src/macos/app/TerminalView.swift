@@ -22,6 +22,12 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     private var lastPixelW: UInt32 = 0
     private var lastPixelH: UInt32 = 0
 
+    // Config-derived state the host owns. Fonts and colors live inside the
+    // bridge; these two shape AppKit-side behaviour instead.
+    private var backgroundOpacity = mostty_config_background_opacity()
+    private var renderIntervalMs = max(UInt32(1), mostty_config_render_interval_ms())
+    private var translucent: Bool { backgroundOpacity < 1 }
+
     private var renderTimer: Timer?
     private var blinkTimer: Timer?
     private var blinkOn = true
@@ -63,7 +69,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     required init?(coder: NSCoder) { fatalError("unsupported") }
 
     override func makeBackingLayer() -> CALayer { CAMetalLayer() }
-    override var isOpaque: Bool { true }
+    override var isOpaque: Bool { !translucent }
     override var acceptsFirstResponder: Bool { true }
     override func becomeFirstResponder() -> Bool { true }
 
@@ -93,7 +99,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         guard tab == nil, window != nil, bounds.width > 1, bounds.height > 1 else { return }
         let scale = currentScale()
         let (pw, ph) = pixelSize()
-        guard let t = mostty_tab_create(pw, ph, Float(scale), 14) else { return }
+        guard let t = mostty_tab_create(pw, ph, Float(scale)) else { return }
         tab = t
 
         guard let devPtr = mostty_tab_metal_device(t),
@@ -107,7 +113,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         layer.framebufferOnly = false
         layer.contentsScale = scale
         layer.drawableSize = CGSize(width: Int(pw), height: Int(ph))
-        layer.isOpaque = true
+        layer.isOpaque = !translucent
         metalLayer = layer
         commandQueue = dev.makeCommandQueue()
 
@@ -196,11 +202,49 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     // MARK: Rendering
 
     private func startTimer() {
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: Double(renderIntervalMs) / 1000.0, repeats: true) { [weak self] _ in
             self?.renderTick()
         }
         RunLoop.main.add(timer, forMode: .common)
         renderTimer = timer
+    }
+
+    /// Adopt a reloaded config. Fonts and colors are re-applied inside the
+    /// bridge; the layer's opacity and the frame cadence are host-owned.
+    func applyConfig() {
+        backgroundOpacity = mostty_config_background_opacity()
+        metalLayer?.isOpaque = !translucent
+
+        // Record the interval even for a tab that has not started yet, so it
+        // opens at the configured cadence instead of the one loaded at launch.
+        let interval = max(UInt32(1), mostty_config_render_interval_ms())
+        if interval != renderIntervalMs {
+            renderIntervalMs = interval
+            if renderTimer != nil {
+                renderTimer?.invalidate()
+                startTimer()
+            }
+        }
+
+        if let t = tab, mostty_tab_apply_config(t) {
+            // New cell metrics: the grid no longer matches the drawable, so let
+            // the resize path run even though the pixel size is unchanged. The
+            // resize itself is deferred to `resyncSurface` on the on-screen tab,
+            // because a background tab's bounds and backing scale are stale.
+            lastPixelW = 0
+            lastPixelH = 0
+        }
+        dirty = true
+        needsDisplay = true
+    }
+
+    /// Re-derive the grid from the current drawable and propagate it to sibling
+    /// tabs. Called on the on-screen tab after every tab has adopted a reloaded
+    /// font, so all sessions land on the same grid instead of background tabs
+    /// keeping the old one until they are next shown.
+    func resyncSurface() {
+        guard window != nil else { return }
+        syncSurfaceIfNeeded()
     }
 
     private func startBlink() {
@@ -371,14 +415,14 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         let cell = cellAt(event)
         selStart = cell; selEnd = cell
         selecting = true; hasSelection = false
-        overlay?.needsDisplay = true
+        publishSelection()
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard selecting else { return }
         selEnd = cellAt(event)
         hasSelection = selStart != selEnd
-        overlay?.needsDisplay = true
+        publishSelection()
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -386,7 +430,19 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         selecting = false
         selEnd = cellAt(event)
         hasSelection = selStart != selEnd
-        overlay?.needsDisplay = true
+        publishSelection()
+    }
+
+    /// Hand the selection to the bridge so the highlight is painted with the
+    /// configured `selection-background` / `selection-foreground` during
+    /// rasterization. Drawing it in an overlay instead could only tint the
+    /// finished pixels, which cannot honor a selection foreground color.
+    private func publishSelection() {
+        guard let t = tab else { return }
+        mostty_tab_set_selection(t, hasSelection,
+                                 UInt32(selStart.col), UInt32(selStart.row),
+                                 UInt32(selEnd.col), UInt32(selEnd.row))
+        dirty = true
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -510,15 +566,11 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 
     // Overlay accessors
-    var overlaySelection: (has: Bool, start: (col: Int, row: Int), end: (col: Int, row: Int)) {
-        (hasSelection, selStart, selEnd)
-    }
     var overlayMarkedText: String { markedText }
     var overlayCellPoints: (w: Double, h: Double) {
         let scale = Double(currentScale())
         return (Double(cellWidthPx) / scale, Double(cellHeightPx) / scale)
     }
-    var overlayGrid: (cols: Int, rows: Int) { (Int(cols), Int(rows)) }
     func overlayCursor() -> (col: Int, row: Int) {
         guard let t = tab else { return (0, 0) }
         var col: UInt32 = 0, row: UInt32 = 0
@@ -527,8 +579,9 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 }
 
-/// Transparent layer above the Metal content that draws the host-owned selection
-/// highlight and the IME composition text.
+/// Transparent layer above the Metal content that draws the IME composition text.
+/// The selection highlight is not drawn here: it is applied during rasterization
+/// so `selection-foreground` can recolor the glyphs themselves.
 final class OverlayView: NSView {
     weak var owner: MosttyTerminalView?
 
@@ -539,25 +592,6 @@ final class OverlayView: NSView {
         guard let owner = owner else { return }
         let (cwp, chp) = owner.overlayCellPoints
         guard cwp > 0, chp > 0 else { return }
-        let grid = owner.overlayGrid
-
-        let sel = owner.overlaySelection
-        if sel.has {
-            NSColor(calibratedRed: 0.35, green: 0.55, blue: 0.9, alpha: 0.35).setFill()
-            var (a, b) = (sel.start, sel.end)
-            if b.row < a.row || (b.row == a.row && b.col < a.col) { swap(&a, &b) }
-            var row = a.row
-            while row <= b.row {
-                let startCol = row == a.row ? a.col : 0
-                let endCol = row == b.row ? b.col : max(0, grid.cols - 1)
-                let x = Double(startCol) * cwp
-                let w = Double(endCol - startCol + 1) * cwp
-                let yTop = Double(row) * chp
-                let y = Double(bounds.height) - yTop - chp
-                NSRect(x: x, y: y, width: w, height: chp).fill()
-                row += 1
-            }
-        }
 
         let marked = owner.overlayMarkedText
         if !marked.isEmpty {

@@ -6,12 +6,19 @@ working command-line options today; everything below lives in the config file.
 ## File location
 
 ```
-%LOCALAPPDATA%\Mostty\config
+Windows   %LOCALAPPDATA%\Mostty\config
+macOS     ~/Library/Application Support/com.dfordsoft.mostty.terminal/Config
 ```
 
-The file has no extension. You can open (and create) it from the window's system
-menu via **Open Settings File…**, which launches it in Notepad and creates the
-file and its parent folder if missing.
+The file has no extension. On Windows you can open (and create) it from the
+window's system menu via **Open Settings File…**, which launches it in Notepad
+and creates the file and its parent folder if missing.
+
+`theme = <name>` resolves against a `themes/` directory in two places, the first
+match winning: next to the config file (`…\Mostty\themes` on Windows,
+`~/Library/Application Support/com.dfordsoft.mostty.terminal/themes` on macOS),
+then the themes shipped with the application (next to the executable on Windows,
+`Mostty.app/Contents/Resources/themes` on macOS).
 
 ## Syntax
 
@@ -35,7 +42,36 @@ The file is watched live. Saving it re-applies changes without a restart:
   `OSC 10/11/12/4` color overrides an app set at runtime).
 - **Launchers** are read on demand, so they take effect immediately.
 - **Env entries** apply to newly-spawned tabs. Existing tabs keep the
-  environment they were started with (ConPTY's environment is fixed at spawn).
+  environment they were started with (a process's environment is fixed at spawn).
+
+On macOS the config file's *directory* is watched, because editors save by
+writing a temporary file and renaming it over the original. Font, color, window
+opacity, and render-cadence changes are re-applied to every live tab; `maximize`
+and `fullscreen` are not, since they describe the initial window state and
+re-applying them would fight a window you have since resized.
+
+---
+
+## Platform support
+
+Every key is parsed on both platforms — an unsupported key is silently ignored,
+never warned about — but some only have an effect on Windows:
+
+| Key | Windows | macOS |
+| --- | --- | --- |
+| `font-family`, `font-size`, `font-family-bold` / `-italic` / `-bold-italic` | yes | yes (only the first `font-family` entry; the OS resolves missing glyphs) |
+| `theme`, `background`, `foreground`, `palette` | yes | yes |
+| `cursor-color`, `cursor-text` | yes | yes |
+| `selection-background`, `selection-foreground` | yes | yes |
+| `background-opacity`, `background-blur` | yes | yes |
+| `maximize`, `fullscreen` | yes | yes |
+| `render-interval-local-ms` | yes | yes |
+| `launcher`, `env` | yes | yes |
+| `emoji-font-family`, `font-ligatures`, `font-feature`, `font-codepoint-map`, `font-style*`, `font-synthetic-style` | yes | no — the macOS renderer draws per cell and has no shaping pipeline |
+| `tabbar-font-family`, `tabbar-font-size` | yes | no |
+| `background-image*` | yes | no |
+| `render-interval-remote-ms` | yes | no — macOS has no remote-session concept |
+| `gpu`, `renderer` | yes | no — Direct3D / OpenGL / Vulkan backend selection is Windows-only |
 
 ---
 
@@ -406,6 +442,9 @@ because the OS swaps the background for a flat gray.
 
 ### `gpu`
 
+**Windows only.** macOS parses the key and ignores it without warning: it
+presents through Metal on the system-selected device.
+
 Selects the Windows hardware adapter used to create Mostty's D3D11 rendering
 device. Set it to the full adapter name shown by Windows Device Manager or
 Task Manager:
@@ -426,6 +465,10 @@ device. With `MOSTTY_DIAG` enabled, the diagnostic log records whether the
 selection was automatic or explicit and the final adapter name.
 
 ### `renderer`
+
+**Windows only.** Every accepted value names a Direct3D / OpenGL / Vulkan
+backend, none of which exist on macOS; macOS parses the key and ignores it
+without warning, always rendering through CoreText and presenting with Metal.
 
 Selects the startup rendering backend:
 

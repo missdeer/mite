@@ -7,8 +7,20 @@
 
 typedef struct MosttyTab MosttyTab;
 
-MosttyTab *mostty_tab_create(uint32_t pixel_width, uint32_t pixel_height, float scale, float font_size);
+MosttyTab *mostty_tab_create(uint32_t pixel_width, uint32_t pixel_height, float scale);
 void mostty_tab_destroy(MosttyTab *tab);
+
+/* Configuration. Values are read from the file the app watches; `reload` returns
+   false when it was unreadable, leaving the previous config in place. */
+bool mostty_config_reload(void);
+size_t mostty_config_path(uint8_t *buf, size_t cap);
+float mostty_config_background_opacity(void);
+bool mostty_config_background_blur(void);
+bool mostty_config_maximize(void);
+bool mostty_config_fullscreen(void);
+uint32_t mostty_config_render_interval_ms(void);
+/* Returns true when the cell metrics changed and the drawable must be re-synced. */
+bool mostty_tab_apply_config(MosttyTab *tab);
 
 void *mostty_tab_metal_device(MosttyTab *tab);
 
@@ -37,6 +49,8 @@ bool mostty_tab_at_bottom(MosttyTab *tab);
 
 size_t mostty_tab_selection_text(MosttyTab *tab, uint32_t start_col, uint32_t start_row,
                                  uint32_t end_col, uint32_t end_row, uint8_t *buf, size_t cap);
+void mostty_tab_set_selection(MosttyTab *tab, bool active, uint32_t start_col, uint32_t start_row,
+                              uint32_t end_col, uint32_t end_row);
 
 size_t mostty_encode_key(uint32_t key, uint32_t mods, bool app_cursor, uint8_t *buf, size_t cap);
 

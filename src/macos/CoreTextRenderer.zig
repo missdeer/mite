@@ -16,10 +16,39 @@ const graphics = macos.graphics;
 const text = macos.text;
 const foundation = macos.foundation;
 
+/// Fallbacks used when the config leaves a key unset. macOS ships Menlo as its
+/// monospace terminal face; the size matches the `font-size` default resolution
+/// in `Config`.
+pub const default_family = "Menlo";
+pub const default_font_size: f32 = 14;
+
+/// Font selection resolved from the config. An empty per-style family means
+/// "synthesize this style from the regular face's symbolic traits".
+pub const FontOptions = struct {
+    family: []const u8 = default_family,
+    family_bold: []const u8 = &.{},
+    family_italic: []const u8 = &.{},
+    family_bold_italic: []const u8 = &.{},
+    size: f32 = default_font_size,
+};
+
+/// Window-level paint settings the host changes at runtime (config reload, and
+/// mouse-driven selection). A null color means "invert the cell", which is what
+/// the corresponding config key degrades to when unset.
+pub const Paint = struct {
+    background_alpha: u8 = 255,
+    selection_foreground: ?GridModel.Rgba = null,
+    selection_background: ?GridModel.Rgba = null,
+    // `cursor-color` is not here: it is seeded into the terminal's dynamic
+    // colors so a running app can override it with OSC 12, and is read from
+    // there at draw time. `cursor-text` has no such VT counterpart.
+    cursor_text: ?GridModel.Rgba = null,
+};
+
 pub const Options = struct {
     allocator: std.mem.Allocator,
-    family: []const u8 = "Menlo",
-    font_size: f32 = 14,
+    font: FontOptions = .{},
+    paint: Paint = .{},
     scale: f32 = 1,
     pixel_width: u32,
     pixel_height: u32,
@@ -38,24 +67,47 @@ pub const Cursor = struct {
     row: u16,
 };
 
+/// The four style families, owned by the renderer. Config strings live in an
+/// arena that a hot-reload replaces, so the renderer cannot borrow them.
+const FamilySet = struct {
+    // [regular, bold, italic, bold_italic]. Entries after the first may be empty.
+    names: [4][]const u8 = @splat(&.{}),
+
+    fn init(allocator: std.mem.Allocator, options: FontOptions) !FamilySet {
+        var result: FamilySet = .{};
+        errdefer result.deinit(allocator);
+        const sources = [4][]const u8{
+            if (options.family.len > 0) options.family else default_family,
+            options.family_bold,
+            options.family_italic,
+            options.family_bold_italic,
+        };
+        for (&result.names, sources) |*name, source| name.* = try allocator.dupe(u8, source);
+        return result;
+    }
+
+    fn deinit(self: *FamilySet, allocator: std.mem.Allocator) void {
+        for (&self.names) |*name| {
+            allocator.free(name.*);
+            name.* = &.{};
+        }
+    }
+};
+
 const FontSet = struct {
     regular: *text.Font,
     bold: *text.Font,
     italic: *text.Font,
     bold_italic: *text.Font,
 
-    fn init(family: []const u8, size: f32) !FontSet {
-        const name = try foundation.String.createWithBytes(family, .utf8, false);
-        defer name.release();
-        const descriptor = try text.FontDescriptor.createWithNameAndSize(name, size);
-        defer descriptor.release();
-        const regular = try text.Font.createWithFontDescriptor(descriptor, size);
+    fn init(families: FamilySet, size: f32) !FontSet {
+        const regular = try createFont(families.names[0], size);
         errdefer regular.release();
-        const bold = copyWithTraits(regular, true, false);
+        const bold = try styledFont(regular, families.names[1], size, true, false);
         errdefer bold.release();
-        const italic = copyWithTraits(regular, false, true);
+        const italic = try styledFont(regular, families.names[2], size, false, true);
         errdefer italic.release();
-        const bold_italic = copyWithTraits(regular, true, true);
+        const bold_italic = try styledFont(regular, families.names[3], size, true, true);
         errdefer bold_italic.release();
         return .{
             .regular = regular,
@@ -82,7 +134,7 @@ const FontSet = struct {
 };
 
 allocator: std.mem.Allocator,
-family: []u8,
+families: FamilySet,
 font_size: f32,
 scale: f32,
 fonts: FontSet,
@@ -91,14 +143,18 @@ pixel_width: u32,
 pixel_height: u32,
 pixels: []u8,
 metal: MetalBackend,
+paint: Paint,
+/// Host-driven mouse selection in viewport coordinates; null when nothing is
+/// selected.
+selection: ?GridModel.Selection = null,
 
 pub fn init(options: Options) !CoreTextRenderer {
-    if (options.font_size <= 0 or options.scale <= 0) return error.InvalidFontSize;
+    if (options.font.size <= 0 or options.scale <= 0) return error.InvalidFontSize;
     if (options.pixel_width == 0 or options.pixel_height == 0) return error.InvalidDrawableSize;
 
-    const family = try options.allocator.dupe(u8, options.family);
-    errdefer options.allocator.free(family);
-    var fonts = try FontSet.init(family, options.font_size * options.scale);
+    var families = try FamilySet.init(options.allocator, options.font);
+    errdefer families.deinit(options.allocator);
+    var fonts = try FontSet.init(families, options.font.size * options.scale);
     errdefer fonts.deinit();
     const metrics = try metricsForFont(fonts.regular);
     var metal = try MetalBackend.init();
@@ -111,8 +167,8 @@ pub fn init(options: Options) !CoreTextRenderer {
 
     return .{
         .allocator = options.allocator,
-        .family = family,
-        .font_size = options.font_size,
+        .families = families,
+        .font_size = options.font.size,
         .scale = options.scale,
         .fonts = fonts,
         .metrics = metrics,
@@ -120,6 +176,7 @@ pub fn init(options: Options) !CoreTextRenderer {
         .pixel_height = options.pixel_height,
         .pixels = pixels,
         .metal = metal,
+        .paint = options.paint,
     };
 }
 
@@ -127,8 +184,29 @@ pub fn deinit(self: *CoreTextRenderer) void {
     self.metal.deinit();
     self.allocator.free(self.pixels);
     self.fonts.deinit();
-    self.allocator.free(self.family);
+    self.families.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Adopt font settings from a reloaded config. Returns true when the cell
+/// metrics changed, so the caller knows the grid must be re-derived. Rebuilds
+/// everything before publishing so a failure leaves the current fonts intact.
+pub fn reconfigure(self: *CoreTextRenderer, options: FontOptions) !bool {
+    const size = if (options.size > 0) options.size else default_font_size;
+    var families = try FamilySet.init(self.allocator, options);
+    errdefer families.deinit(self.allocator);
+    var fonts = try FontSet.init(families, size * self.scale);
+    errdefer fonts.deinit();
+    const metrics = try metricsForFont(fonts.regular);
+
+    self.fonts.deinit();
+    self.families.deinit(self.allocator);
+    self.fonts = fonts;
+    self.families = families;
+    self.font_size = size;
+    const changed = !std.meta.eql(self.metrics, metrics);
+    self.metrics = metrics;
+    return changed;
 }
 
 pub fn resize(self: *CoreTextRenderer, pixel_width: u32, pixel_height: u32, scale: f32) !void {
@@ -139,7 +217,7 @@ pub fn resize(self: *CoreTextRenderer, pixel_width: u32, pixel_height: u32, scal
     var replacement_fonts: ?FontSet = null;
     var replacement_metrics = self.metrics;
     if (self.scale != scale) {
-        replacement_fonts = try FontSet.init(self.family, self.font_size * scale);
+        replacement_fonts = try FontSet.init(self.families, self.font_size * scale);
         errdefer if (replacement_fonts) |*fonts| fonts.deinit();
         replacement_metrics = try metricsForFont(replacement_fonts.?.regular);
     }
@@ -174,16 +252,25 @@ pub fn gridSize(self: *const CoreTextRenderer) GridModel.Size {
 
 pub fn render(self: *CoreTextRenderer, session: *TerminalSession, cursor: ?Cursor) !RenderResult {
     session.syncPixelSize(self.metrics.cell_width, self.metrics.cell_height);
-    var frame = try GridModel.build(
-        self.allocator,
-        session.term,
-        self.metrics,
-        self.pixel_width,
-        self.contentHeight(),
-    );
+    var frame = try GridModel.build(self.allocator, session.term, .{
+        .metrics = self.metrics,
+        .pixel_width = self.pixel_width,
+        .pixel_height = self.contentHeight(),
+        .background_alpha = self.paint.background_alpha,
+        .selection = self.selection,
+        .selection_foreground = self.paint.selection_foreground,
+        .selection_background = self.paint.selection_background,
+    });
     defer frame.deinit();
 
-    try self.rasterize(&frame, cursor);
+    // The cursor block follows the terminal's dynamic cursor color, which the
+    // config seeds and a running app can retarget with OSC 12. Null means the
+    // theme set none, so the block inverts the cell instead.
+    const cursor_color: ?GridModel.Rgba = if (session.term.colors.cursor.get()) |color|
+        GridModel.Rgba.fromRgb(color.r, color.g, color.b)
+    else
+        null;
+    try self.rasterize(&frame, cursor, cursor_color);
     try self.metal.render(self.pixels);
     return .{
         .cols = frame.cols,
@@ -192,7 +279,12 @@ pub fn render(self: *CoreTextRenderer, session: *TerminalSession, cursor: ?Curso
     };
 }
 
-fn rasterize(self: *CoreTextRenderer, frame: *const GridModel.Frame, cursor: ?Cursor) !void {
+fn rasterize(
+    self: *CoreTextRenderer,
+    frame: *const GridModel.Frame,
+    cursor: ?Cursor,
+    cursor_color: ?GridModel.Rgba,
+) !void {
     const color_space = try graphics.ColorSpace.createDeviceRGB();
     defer color_space.release();
     const bitmap_info = @intFromEnum(graphics.BitmapInfo.byte_order_32_little) |
@@ -214,17 +306,25 @@ fn rasterize(self: *CoreTextRenderer, frame: *const GridModel.Frame, cursor: ?Cu
     ctx.setShouldSmoothFonts(context, true);
     ctx.setTextDrawingMode(context, .fill);
     ctx.setTextMatrix(context, graphics.AffineTransform.identity());
+    // The pixel buffer is reused across frames, so a translucent background
+    // would blend with the previous frame instead of replacing it.
+    const drawable = graphics.Rect.init(0, 0, self.pixel_width, self.pixel_height);
+    ctx.clearRect(context, drawable);
     setFill(context, frame.background);
-    ctx.fillRect(context, graphics.Rect.init(0, 0, self.pixel_width, self.pixel_height));
+    ctx.fillRect(context, drawable);
 
     for (frame.cells) |cell| {
         var draw_cell = cell;
-        // The cursor cell is drawn as inverse video (swapped fg/bg), which keeps
-        // the block perfectly aligned with the glyph grid.
+        // The cursor block is drawn into the cell itself, which keeps it aligned
+        // with the glyph grid. `cursor-color` / `cursor-text` win when set;
+        // otherwise it falls back to inverse video. Either way it is an explicit
+        // highlight, so it stays opaque regardless of window opacity.
         if (cursor) |cur| {
             if (cell.col == cur.col and cell.row == cur.row) {
-                draw_cell.style.foreground = cell.style.background;
-                draw_cell.style.background = cell.style.foreground;
+                draw_cell.style.background = cursor_color orelse cell.style.foreground;
+                draw_cell.style.foreground = self.paint.cursor_text orelse cell.style.background;
+                draw_cell.style.foreground.a = 255;
+                draw_cell.style.background.a = 255;
             }
         }
 
@@ -232,8 +332,13 @@ fn rasterize(self: *CoreTextRenderer, frame: *const GridModel.Frame, cursor: ?Cu
         const y = @as(f64, @floatFromInt(self.pixel_height - (@as(u32, draw_cell.row) + 1) * self.metrics.cell_height));
         const width = @as(f64, @floatFromInt(@as(u32, draw_cell.width) * self.metrics.cell_width));
         const height = @as(f64, @floatFromInt(self.metrics.cell_height));
+        const rect = graphics.Rect.init(x, y, width, height);
+        // A translucent fill blends with what the drawable-wide background just
+        // painted, which would compound the alpha; clear the cell first so its
+        // own alpha is what reaches the compositor.
+        if (draw_cell.style.background.a != 255) ctx.clearRect(context, rect);
         setFill(context, draw_cell.style.background);
-        ctx.fillRect(context, graphics.Rect.init(x, y, width, height));
+        ctx.fillRect(context, rect);
         if (draw_cell.style.invisible) continue;
 
         const font = self.fonts.select(draw_cell.style);
@@ -329,6 +434,24 @@ fn setFill(context: *graphics.BitmapContext, color: GridModel.Rgba) void {
     );
 }
 
+fn createFont(family: []const u8, size: f32) !*text.Font {
+    const name = try foundation.String.createWithBytes(family, .utf8, false);
+    defer name.release();
+    const descriptor = try text.FontDescriptor.createWithNameAndSize(name, size);
+    defer descriptor.release();
+    return try text.Font.createWithFontDescriptor(descriptor, size);
+}
+
+// An explicit `font-family-<style>` chooses the family; otherwise the style
+// inherits the regular one. Either way the style's traits are applied on top, so
+// `font-family-bold = Menlo` still renders bold rather than the regular face.
+fn styledFont(regular: *text.Font, family: []const u8, size: f32, bold: bool, italic: bool) !*text.Font {
+    if (family.len == 0) return copyWithTraits(regular, bold, italic);
+    const base = try createFont(family, size);
+    defer base.release();
+    return copyWithTraits(base, bold, italic);
+}
+
 fn copyWithTraits(base: *text.Font, bold: bool, italic: bool) *text.Font {
     const traits = text.FontSymbolicTraits{ .bold = bold, .italic = italic };
     if (base.copyWithSymbolicTraits(traits)) |font| return font;
@@ -367,7 +490,9 @@ fn pixelBufferLength(width: u32, height: u32) !usize {
 }
 
 test "CoreText resolves ordinary and wide glyphs" {
-    var fonts = try FontSet.init("Menlo", 14);
+    var families = try FamilySet.init(std.testing.allocator, .{});
+    defer families.deinit(std.testing.allocator);
+    var fonts = try FontSet.init(families, 14);
     defer fonts.deinit();
     var ordinary_glyph: [1]graphics.Glyph = .{0};
     try std.testing.expect(fonts.regular.getGlyphsForCharacters(&[_]u16{'A'}, &ordinary_glyph));
@@ -421,4 +546,126 @@ test "CoreText and Metal render a resized styled terminal frame" {
     try std.testing.expect(result.cols > 0);
     try std.testing.expect(result.rows > 0);
     try std.testing.expect(@intFromPtr(result.texture) != 0);
+}
+
+test "background-opacity survives into the rasterized pixels" {
+    // The compositor can only show through what the rasterizer produces, so the
+    // configured alpha has to reach the pixel buffer. The buffer is BGRA with
+    // premultiplied alpha, so byte 3 of each pixel is the alpha channel.
+    var session: TerminalSession = undefined;
+    var context: u8 = 0;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 8,
+        .rows = 2,
+        .hooks = .{ .context = &context },
+    });
+    defer session.deinit();
+
+    var renderer = try CoreTextRenderer.init(.{
+        .allocator = std.testing.allocator,
+        .paint = .{ .background_alpha = 89 },
+        .pixel_width = 320,
+        .pixel_height = 96,
+    });
+    defer renderer.deinit();
+    _ = try renderer.render(&session, null);
+
+    var translucent_pixels: usize = 0;
+    var index: usize = 3;
+    while (index < renderer.pixels.len) : (index += 4) {
+        if (renderer.pixels[index] == 89) translucent_pixels += 1;
+    }
+    try std.testing.expect(translucent_pixels > 0);
+
+    // The same frame at full opacity must leave nothing translucent, otherwise
+    // the assertion above would pass for the wrong reason.
+    try std.testing.expect(try renderer.reconfigure(.{}) == false);
+    renderer.paint.background_alpha = 255;
+    _ = try renderer.render(&session, null);
+    index = 3;
+    while (index < renderer.pixels.len) : (index += 4) {
+        try std.testing.expectEqual(@as(u8, 255), renderer.pixels[index]);
+    }
+}
+
+test "font-size drives the cell metrics, and reconfigure adopts a new size" {
+    // MOSTTY-58: `font-size` must reach the renderer rather than a hard-coded
+    // literal. The observable consequence of a larger point size is a larger
+    // cell, which is what the grid geometry is derived from.
+    var small = try CoreTextRenderer.init(.{
+        .allocator = std.testing.allocator,
+        .font = .{ .size = 10 },
+        .pixel_width = 320,
+        .pixel_height = 96,
+    });
+    defer small.deinit();
+    var large = try CoreTextRenderer.init(.{
+        .allocator = std.testing.allocator,
+        .font = .{ .size = 24 },
+        .pixel_width = 320,
+        .pixel_height = 96,
+    });
+    defer large.deinit();
+    try std.testing.expect(large.metrics.cell_width > small.metrics.cell_width);
+    try std.testing.expect(large.metrics.cell_height > small.metrics.cell_height);
+
+    // A hot-reload to the larger size must land on exactly the same metrics as
+    // starting there, and must report the change so the grid gets re-derived.
+    try std.testing.expect(try small.reconfigure(.{ .size = 24 }));
+    try std.testing.expectEqual(large.metrics, small.metrics);
+    try std.testing.expectEqual(@as(f32, 24), small.font_size);
+    // Re-applying an unchanged config must not claim the grid moved.
+    try std.testing.expect(!try small.reconfigure(.{ .size = 24 }));
+}
+
+test "an unset per-style family synthesizes from the regular face" {
+    // `font-family-bold` is optional: leaving it empty must still yield a usable
+    // bold face (synthesized), while setting it must be honored.
+    var derived = try FamilySet.init(std.testing.allocator, .{ .family = "Menlo" });
+    defer derived.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Menlo", derived.names[0]);
+    try std.testing.expectEqual(@as(usize, 0), derived.names[1].len);
+    var derived_fonts = try FontSet.init(derived, 14);
+    defer derived_fonts.deinit();
+    try std.testing.expect(derived_fonts.select(.{
+        .foreground = GridModel.DEFAULT_FOREGROUND,
+        .background = GridModel.DEFAULT_BACKGROUND,
+        .bold = true,
+    }) != derived_fonts.regular);
+
+    var explicit = try FamilySet.init(std.testing.allocator, .{
+        .family = "Menlo",
+        .family_bold = "Courier New",
+    });
+    defer explicit.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Courier New", explicit.names[1]);
+    var explicit_fonts = try FontSet.init(explicit, 14);
+    defer explicit_fonts.deinit();
+    try std.testing.expect(explicit_fonts.bold != explicit_fonts.regular);
+}
+
+test "an explicit per-style family still carries that style's traits" {
+    // `font-family-bold = Menlo` names a family, not a face. Creating it
+    // verbatim would render bold text in the regular weight, so the bold trait
+    // must still be applied on top of the chosen family.
+    var families = try FamilySet.init(std.testing.allocator, .{
+        .family = "Menlo",
+        .family_bold = "Menlo",
+    });
+    defer families.deinit(std.testing.allocator);
+    var fonts = try FontSet.init(families, 14);
+    defer fonts.deinit();
+    try std.testing.expect(fonts.bold != fonts.regular);
+    try std.testing.expect(fonts.bold_italic != fonts.regular);
+}
+
+test "an empty family falls back to the platform default" {
+    // A config that omits `font-family` must not produce an empty family name;
+    // it resolves to the documented macOS default instead.
+    var families = try FamilySet.init(std.testing.allocator, .{ .family = &.{} });
+    defer families.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(default_family, families.names[0]);
 }

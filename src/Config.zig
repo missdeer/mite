@@ -1036,7 +1036,7 @@ fn applyThemeFile(gpa: std.mem.Allocator, theme: *ThemeColors, value: []const u8
         gpa.dupe(u8, name) catch oom()
     else
         findThemeFile(gpa, name) orelse {
-            std.log.warn("config: theme '{s}' not found in %LOCALAPPDATA%/Mostty/themes or <exe>/themes", .{name});
+            std.log.warn("config: theme '{s}' not found in the user or bundled themes directory", .{name});
             return;
         };
     defer gpa.free(path);
@@ -1077,7 +1077,7 @@ pub fn loadThemeColorsByName(gpa: std.mem.Allocator, name: []const u8) ?ThemeCol
         gpa.dupe(u8, name) catch oom()
     else
         findThemeFile(gpa, name) orelse {
-            std.log.warn("theme '{s}' not found in %LOCALAPPDATA%/Mostty/themes or <exe>/themes", .{name});
+            std.log.warn("theme '{s}' not found in the user or bundled themes directory", .{name});
             return null;
         };
     defer gpa.free(path);
@@ -1201,23 +1201,49 @@ fn systemPrefersDark() bool {
     return true;
 }
 
-// Searches the theme name under %LOCALAPPDATA%/Mostty/themes then <exeDir>/themes.
-// Returns the first existing path (caller owns it) or null.
+// Searches the theme name under the per-user themes directory, then the themes
+// shipped with the application. Returns the first existing path (caller owns it)
+// or null.
 fn findThemeFile(gpa: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    if (envVarOwned(gpa, "LOCALAPPDATA")) |lad| {
-        defer gpa.free(lad);
-        const p = std.fs.path.join(gpa, &.{ lad, "Mostty", "themes", name }) catch oom();
-        if (fileExists(p)) return p;
-        gpa.free(p);
-    } else |_| {}
-
-    if (exeDir(gpa)) |dir| {
+    // Resolved lazily: a hit in the user directory must not have already
+    // allocated the bundled one, which the early return would then leak.
+    for ([_]*const fn (std.mem.Allocator) ?[]const u8{ &userThemeDir, &bundledThemeDir }) |resolve| {
+        const dir = resolve(gpa) orelse continue;
         defer gpa.free(dir);
-        const p = std.fs.path.join(gpa, &.{ dir, "themes", name }) catch oom();
+        const p = std.fs.path.join(gpa, &.{ dir, name }) catch oom();
         if (fileExists(p)) return p;
         gpa.free(p);
     }
     return null;
+}
+
+// %LOCALAPPDATA%/Mostty/themes on Windows; the themes/ sibling of the macOS
+// config file. Caller owns the slice.
+fn userThemeDir(gpa: std.mem.Allocator) ?[]const u8 {
+    if (builtin.os.tag == .macos) {
+        const home = envVarOwned(gpa, "HOME") catch return null;
+        defer gpa.free(home);
+        if (home.len == 0) return null;
+        return std.fs.path.join(gpa, &.{
+            home, "Library", "Application Support", "com.dfordsoft.mostty.terminal", "themes",
+        }) catch oom();
+    }
+    const localappdata = envVarOwned(gpa, "LOCALAPPDATA") catch return null;
+    defer gpa.free(localappdata);
+    return std.fs.path.join(gpa, &.{ localappdata, "Mostty", "themes" }) catch oom();
+}
+
+// Themes shipped with the application: next to the exe on Windows, and inside
+// Contents/Resources of the macOS app bundle (whose executable lives one level
+// down in Contents/MacOS). Caller owns the slice.
+fn bundledThemeDir(gpa: std.mem.Allocator) ?[]const u8 {
+    const dir = exeDir(gpa) orelse return null;
+    defer gpa.free(dir);
+    if (builtin.os.tag == .macos) {
+        const contents = std.fs.path.dirname(dir) orelse return null;
+        return std.fs.path.join(gpa, &.{ contents, "Resources", "themes" }) catch oom();
+    }
+    return std.fs.path.join(gpa, &.{ dir, "themes" }) catch oom();
 }
 
 fn fileExists(path: []const u8) bool {
@@ -1226,8 +1252,8 @@ fn fileExists(path: []const u8) bool {
 }
 
 // Directory containing the running executable (caller owns the slice). Only the
-// Windows theme search consumes this; on other platforms it returns null so the
-// theme lookup simply falls through to the bundled defaults.
+// theme search consumes this; on platforms without a lookup it returns null so
+// the theme lookup simply falls through to the bundled defaults.
 fn exeDir(gpa: std.mem.Allocator) ?[]const u8 {
     if (builtin.os.tag == .windows) {
         var buf: [std.os.windows.PATH_MAX_WIDE:0]u16 = undefined;
@@ -1237,6 +1263,11 @@ fn exeDir(gpa: std.mem.Allocator) ?[]const u8 {
         defer gpa.free(full);
         const dir = std.fs.path.dirname(full) orelse return null;
         return gpa.dupe(u8, dir) catch oom();
+    }
+    if (builtin.os.tag == .macos) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const len = std.process.executableDirPath(runtimeIo(), &buf) catch return null;
+        return gpa.dupe(u8, buf[0..len]) catch oom();
     }
     return null;
 }
