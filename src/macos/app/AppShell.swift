@@ -22,11 +22,9 @@ final class AppModel: ObservableObject {
         item.view.onTitleChange = { [weak item] title in
             item?.title = title.isEmpty ? "Terminal" : title
         }
-        item.view.onExit = { [weak item] in
-            guard let item = item else { return }
-            if !item.title.hasSuffix("(terminated)") {
-                item.title = item.title + " (terminated)"
-            }
+        item.view.onExit = { [weak self, weak item] in
+            guard let self = self, let item = item else { return }
+            self.close(item.id)
         }
         item.view.onSurfaceResize = { [weak self, weak item] pw, ph, scale in
             guard let self = self, let item = item else { return }
