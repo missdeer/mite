@@ -64,11 +64,12 @@ struct ClipboardTests {
             }
         }
 
-        func mouse(_ type: NSEvent.EventType, _ col: Int, clicks: Int = 1) -> NSEvent {
+        func mouse(_ type: NSEvent.EventType, _ col: Int, clicks: Int = 1,
+                   flags: NSEvent.ModifierFlags = []) -> NSEvent {
             let cell = view.overlayCellPoints
             let point = view.convert(NSPoint(x: (Double(col) + 0.5) * cell.w,
                                              y: Double(view.bounds.height) - cell.h * 0.5), to: nil)
-            return NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+            return NSEvent.mouseEvent(with: type, location: point, modifierFlags: flags,
                                       timestamp: 0, windowNumber: window.windowNumber,
                                       context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
         }
@@ -102,6 +103,58 @@ struct ClipboardTests {
         view.mouseDown(with: mouse(.leftMouseDown, 2))
         view.mouseUp(with: mouse(.leftMouseUp, 2))
         expect(pasteboard.string(forType: .string) == "sentinel", "a new single click clears word selection")
+
+        func openedURL() -> String? {
+            guard let value = clipboard_test_opened_url() else { return nil }
+            return String(cString: value)
+        }
+        // Intercept only the platform browser dispatch; the production mouse handlers run unchanged.
+        clipboard_test_url("https://example.test/a", true)
+        defer { clipboard_test_restore_url_open() }
+        view.updateTrackingAreas()
+        expect(view.trackingAreas.contains { $0.options.contains(.mouseMoved) && $0.options.contains(.cursorUpdate) },
+               "terminal registers mouse and cursor tracking")
+        view.mouseMoved(with: mouse(.mouseMoved, 12))
+        expect(clipboard_test_hovered_url(), "URL hover publishes the detected range to the renderer")
+        expect(NSCursor.current == NSCursor.pointingHand, "URL hover sets the hand cursor")
+        view.mouseMoved(with: mouse(.mouseMoved, -1))
+        expect(!clipboard_test_hovered_url(), "outside-grid movement clears URL feedback")
+        expect(NSCursor.current == NSCursor.arrow, "leaving URL restores the normal cursor")
+        view.mouseMoved(with: mouse(.mouseMoved, 12))
+        let leave = NSEvent.enterExitEvent(with: .mouseExited, location: .zero, modifierFlags: [],
+                                          timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                          eventNumber: 0, trackingNumber: 0, userData: nil)!
+        view.mouseExited(with: leave)
+        expect(!clipboard_test_hovered_url(), "mouse exit clears URL feedback")
+
+        view.mouseMoved(with: mouse(.mouseMoved, 12))
+        clipboard_test_url("http://changed.test/b", true)
+        clipboard("sentinel")
+        view.mouseDown(with: mouse(.leftMouseDown, 12, clicks: 2))
+        view.mouseUp(with: mouse(.leftMouseUp, 12, clicks: 2))
+        expect(openedURL() == "http://changed.test/b", "double-click dispatches the current URL to the default browser API")
+        expect(pasteboard.string(forType: .string) == "sentinel", "opening a URL does not copy a stale selection")
+
+        clipboard_test_url("https://example.test/a", true)
+        view.mouseDown(with: mouse(.leftMouseDown, 12, clicks: 2, flags: .shift))
+        view.mouseUp(with: mouse(.leftMouseUp, 12, clicks: 2, flags: .shift))
+        expect(openedURL() == nil, "Shift-double-click preserves URL text selection without opening")
+        expect(pasteboard.string(forType: .string) == "hello", "Shift-double-click still copies the selected token")
+
+        clipboard_test_url("https://example.test/a", false)
+        clipboard("sentinel")
+        view.mouseDown(with: mouse(.leftMouseDown, 12, clicks: 2))
+        view.mouseUp(with: mouse(.leftMouseUp, 12, clicks: 2))
+        expect(openedURL() == "https://example.test/a" && pasteboard.string(forType: .string) == "hello",
+               "failed browser dispatch falls back to word selection")
+        clipboard_test_url(nil, true)
+        view.mouseMoved(with: mouse(.mouseMoved, 12))
+        expect(!clipboard_test_hovered_url(), "changed viewport content invalidates a previous URL hit")
+        clipboard_test_url("https://example.test/a", true)
+        view.mouseMoved(with: mouse(.mouseMoved, 12))
+        view.shutdown()
+        expect(!clipboard_test_hovered_url() && NSCursor.current == NSCursor.arrow,
+               "closing a hovered tab clears the URL feedback and hand cursor")
         // Return before exiting so clipboard restoration and shutdown run on failure.
         if failures > 0 {
             print("\(failures) clipboard regression checks failed")

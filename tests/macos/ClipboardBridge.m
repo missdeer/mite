@@ -1,4 +1,6 @@
 #import <Metal/Metal.h>
+#import <AppKit/AppKit.h>
+#import <objc/runtime.h>
 #include <assert.h>
 #include <string.h>
 #include "ClipboardBridge.h"
@@ -12,6 +14,35 @@ static uint32_t selection_end;
 static bool word_selection;
 static uint32_t word_col;
 static id<MTLDevice> device;
+static NSString *url_text;
+static NSString *opened_url;
+static bool hovered_url;
+static bool url_open_success;
+static IMP original_open_url;
+
+static BOOL recordOpenURL(id workspace, SEL selector, NSURL *url) {
+    opened_url = url.absoluteString;
+    return url_open_success;
+}
+
+void clipboard_test_url(const char *url, bool open_success) {
+    if (!original_open_url) {
+        Method method = class_getInstanceMethod(NSWorkspace.class, @selector(openURL:));
+        original_open_url = method_setImplementation(method, (IMP)recordOpenURL);
+    }
+    url_text = url ? [NSString stringWithUTF8String:url] : nil;
+    opened_url = nil;
+    url_open_success = open_success;
+}
+const char *clipboard_test_opened_url(void) { return opened_url.UTF8String; }
+bool clipboard_test_hovered_url(void) { return hovered_url; }
+void clipboard_test_restore_url_open(void) {
+    if (original_open_url) {
+        Method method = class_getInstanceMethod(NSWorkspace.class, @selector(openURL:));
+        method_setImplementation(method, original_open_url);
+        original_open_url = NULL;
+    }
+}
 
 void clipboard_test_reset(bool bracketed) { written_count = 0; bracketed_paste = bracketed; }
 size_t clipboard_test_written(uint8_t *buf, size_t cap) {
@@ -54,6 +85,18 @@ void mostty_tab_set_selection(MosttyTab *tab, bool active, uint32_t sc, uint32_t
 bool mostty_tab_select_word(MosttyTab *tab, uint32_t col, uint32_t row) {
     selection_active = true; word_selection = true; word_col = col;
     return true;
+}
+bool mostty_tab_hover_url(MosttyTab *tab, bool active, uint32_t col, uint32_t row) {
+    hovered_url = active && url_text != nil && col >= 10 && col < 30 && row == 0;
+    return hovered_url;
+}
+size_t mostty_tab_url_at(MosttyTab *tab, uint32_t col, uint32_t row, uint8_t *buf, size_t cap) {
+    if (!url_text || col < 10 || col >= 30 || row != 0) return 0;
+    const char *text = url_text.UTF8String;
+    size_t len = strlen(text);
+    if (len > cap) return 0;
+    memcpy(buf, text, len);
+    return len;
 }
 size_t mostty_tab_selection_text(MosttyTab *tab, uint8_t *buf, size_t cap) {
     assert(selection_active);

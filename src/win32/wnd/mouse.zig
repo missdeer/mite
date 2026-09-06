@@ -12,7 +12,7 @@ const tab_bar = @import("../tab_bar.zig");
 const tab_mgmt = @import("../tab_mgmt.zig");
 const tooltip = @import("../tooltip.zig");
 const types = @import("../types.zig");
-const url_hover = @import("../url_hover.zig");
+const url_hover = @import("../../terminal/url_hover.zig");
 const util = @import("../util.zig");
 const window_geom = @import("../window_geom.zig");
 

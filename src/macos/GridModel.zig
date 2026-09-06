@@ -9,6 +9,7 @@ const std = @import("std");
 const vt = @import("vt");
 const TerminalSession = @import("../terminal/Session.zig");
 const Config = @import("../Config.zig");
+const url_hover = @import("../terminal/url_hover.zig");
 
 pub const Rgba = packed struct(u32) {
     r: u8,
@@ -120,6 +121,7 @@ pub const Options = struct {
     /// the Windows renderer.
     background_alpha: u8 = alphaFromOpacity((Config{}).background_opacity),
     selection: ?Selection = null,
+    hovered_url: ?*const url_hover.Hit = null,
     selection_foreground: ?Rgba = optionalRgba((Config{}).theme.selection_foreground),
     selection_background: ?Rgba = optionalRgba((Config{}).theme.selection_background),
 };
@@ -195,6 +197,11 @@ pub fn build(
 
             const width: u8 = if (raw.wide == .wide and col + 1 < cols) 2 else 1;
             var style = styleForCell(raw, page, foreground, background, term);
+            if (options.hovered_url) |hit| {
+                if (hit.contains(@intCast(row), @intCast(col), @intCast(cols - 1))) {
+                    if (style.underline == 0) style.underline = 1;
+                }
+            }
             selection.apply(&style, @intCast(col), @intCast(row), width);
             try cells.append(allocator, .{
                 .col = @intCast(col),
@@ -367,6 +374,36 @@ test "grid model preserves ordinary, wide, and styled VT cells" {
     }
     try std.testing.expect(found_wide);
     try std.testing.expect(found_styled);
+}
+
+test "URL hover underlines only detected cells across a soft wrap" {
+    var session: TerminalSession = undefined;
+    var context: u8 = 0;
+    try testSession(&session, &context, 12, 3);
+    defer session.deinit();
+    const url = "https://example.test/a";
+    session.feed("See " ++ url ++ " end");
+    const hit = url_hover.detectAt(session.term, 3, 1) orelse return error.MissingUrl;
+    try std.testing.expectEqualStrings(url, hit.url());
+    var hovered = try build(std.testing.allocator, session.term, .{
+        .metrics = .{ .cell_width = 9, .cell_height = 18 },
+        .pixel_width = 108,
+        .pixel_height = 54,
+        .hovered_url = &hit,
+    });
+    defer hovered.deinit();
+    var plain = try build(std.testing.allocator, session.term, .{
+        .metrics = .{ .cell_width = 9, .cell_height = 18 },
+        .pixel_width = 108,
+        .pixel_height = 54,
+    });
+    defer plain.deinit();
+    for (hovered.cells, plain.cells, 0..) |cell, original, index| {
+        const inside_url = index >= "See ".len and index < "See ".len + url.len;
+        try std.testing.expectEqual(@as(u8, if (inside_url) 1 else 0), cell.style.underline);
+        try std.testing.expectEqual(@as(u8, 0), original.style.underline);
+    }
+    try std.testing.expect(url_hover.detectAt(session.term, 0, 0) == null);
 }
 
 test "unset terminal colors use Config defaults in the rendered grid" {

@@ -21,6 +21,7 @@ src/
   mosttywindows.zig        process entry, WinMain shim, main message loop
   mosttymacos.zig          macOS static-core library entry
   terminal/Session.zig     platform-neutral VT state, stream, and effects owner
+  terminal/url_hover.zig   shared viewport URL detection for Windows and macOS
   macos/PtySession.zig     macOS shell process, PTY, and VT session owner
   macos/GridModel.zig      VT viewport to resolved renderer-cell conversion
   macos/CoreTextRenderer.zig CoreText rasterization and renderer resource owner
@@ -93,7 +94,6 @@ src/
     # Higher-level UI features
     png_decode.zig         WIC PNG decode for Kitty f=100 payloads
     paste.zig              clipboard paste, drag-drop, bracketed-paste guard
-    url_hover.zig          left/right URL detection across soft-wrapped rows
     tooltip.zig            native TOOLTIPS_CLASS control for tab-bar hover
     mouse_report.zig       X10/SGR/UTF8/SGR_PIXELS mouse-report encoding
 ```
@@ -453,6 +453,9 @@ Mouse selections are tracked by the VT screen; the bridge copies them with VT
 selection formatting and clips their highlight to the viewport when rendering.
 Both platforms use `terminal/word_selection.zig` for double-click token boundaries
 and CJK-aware expansion.
+URL hover uses the shared viewport detector. The macOS host refreshes the hit
+before rendering, paints its underline through `GridModel`, and re-detects the
+target on double-click before passing it to `NSWorkspace` for browser opening.
 
 The flow per chunk of PTY bytes is:
 

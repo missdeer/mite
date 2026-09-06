@@ -17,6 +17,7 @@ const GridModel = @import("GridModel.zig");
 const Config = @import("../Config.zig");
 const title_mod = @import("../terminal/title.zig");
 const word_selection = @import("../terminal/word_selection.zig");
+const url_hover = @import("../terminal/url_hover.zig");
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("capi is macOS-only");
@@ -264,6 +265,26 @@ fn visibleSelection(tab: *Tab) ?GridModel.Selection {
         .end_col = if (end.viewport.y >= term.rows) term.cols - 1 else @intCast(end.viewport.x),
         .end_row = @intCast(@min(end.viewport.y, term.rows - 1)),
     };
+}
+
+/// Refresh URL feedback against the current viewport; inactive clears it.
+export fn mostty_tab_hover_url(tab_opt: ?*Tab, active: bool, col: u32, row: u32) bool {
+    const tab = tab_opt orelse return false;
+    tab.renderer.hovered_url = null;
+    if (!active or viewportPin(tab, col, row) == null) return false;
+    tab.renderer.hovered_url = url_hover.detectAt(tab.pty.terminal.term, @intCast(col), @intCast(row));
+    return tab.renderer.hovered_url != null;
+}
+
+/// Re-detect at click time so opening never uses a stale hover target.
+export fn mostty_tab_url_at(tab_opt: ?*Tab, col: u32, row: u32, buf: [*]u8, cap: usize) usize {
+    const tab = tab_opt orelse return 0;
+    if (viewportPin(tab, col, row) == null) return 0;
+    const hit = url_hover.detectAt(tab.pty.terminal.term, @intCast(col), @intCast(row)) orelse return 0;
+    const url = hit.url();
+    if (url.len > cap) return 0;
+    @memcpy(buf[0..url.len], url);
+    return url.len;
 }
 
 export fn mostty_tab_destroy(tab_opt: ?*Tab) void {
@@ -771,6 +792,46 @@ test "word selection includes offscreen wrapped text and clips only its highligh
     mostty_tab_set_selection(tab, false, 0, 0, 0, 0);
     try std.testing.expect(visibleSelection(tab) == null);
     try std.testing.expectEqual(@as(usize, 0), mostty_tab_selection_text(tab, &out, 0));
+}
+
+test "URL bridge detects wrapped URLs and refreshes the click target" {
+    const tab = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    try tab.pty.terminal.resize(12, 4);
+    const url = "https://example.test/a";
+    tab.pty.terminal.feed("See " ++ url ++ " end");
+    try std.testing.expect(mostty_tab_hover_url(tab, true, 3, 1));
+    try std.testing.expectEqualStrings(url, tab.renderer.hovered_url.?.url());
+    var out: [128]u8 = undefined;
+    const n = mostty_tab_url_at(tab, 3, 1, &out, out.len);
+    try std.testing.expectEqualStrings(url, out[0..n]);
+    try std.testing.expectEqual(@as(usize, 0), mostty_tab_url_at(tab, 3, 1, &out, 4));
+    tab.pty.terminal.feed("\x1b[2J\x1b[Hhttp://new.test/ end");
+    const changed = mostty_tab_url_at(tab, 3, 0, &out, out.len);
+    try std.testing.expectEqualStrings("http://new.test/", out[0..changed]);
+    try std.testing.expect(!mostty_tab_hover_url(tab, false, 3, 0));
+    try std.testing.expect(tab.renderer.hovered_url == null);
+    try std.testing.expect(!mostty_tab_hover_url(tab, true, 999, 0));
+    tab.pty.terminal.feed("\x1b[2J\x1b[Hplain text");
+    try std.testing.expectEqual(@as(usize, 0), mostty_tab_url_at(tab, 3, 0, &out, out.len));
+    try std.testing.expect(!mostty_tab_hover_url(tab, true, 3, 0));
+}
+
+test "URL hover changes rendered underline pixels and clears them on leave" {
+    const tab = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    tab.pty.terminal.feed("http://x.test/a");
+    var cols: u32 = 0;
+    var rows: u32 = 0;
+    try std.testing.expect(mostty_tab_render(tab, false, &cols, &rows) != null);
+    const plain = try std.testing.allocator.dupe(u8, tab.renderer.pixels);
+    defer std.testing.allocator.free(plain);
+    try std.testing.expect(mostty_tab_hover_url(tab, true, 2, 0));
+    try std.testing.expect(mostty_tab_render(tab, false, &cols, &rows) != null);
+    try std.testing.expect(!std.mem.eql(u8, plain, tab.renderer.pixels));
+    try std.testing.expect(!mostty_tab_hover_url(tab, false, 0, 0));
+    try std.testing.expect(mostty_tab_render(tab, false, &cols, &rows) != null);
+    try std.testing.expectEqualSlices(u8, plain, tab.renderer.pixels);
 }
 
 test "config colors decide the rendered defaults and palette entries" {

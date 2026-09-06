@@ -5,7 +5,7 @@ const vt = @import("vt");
 const types = @import("types.zig");
 const cp_mod = @import("child_process.zig");
 const pty_ring_mod = @import("pty_ring.zig");
-const url_hover = @import("url_hover.zig");
+const url_hover = @import("../terminal/url_hover.zig");
 const TerminalSession = @import("../terminal/Session.zig");
 
 const TabId = types.TabId;

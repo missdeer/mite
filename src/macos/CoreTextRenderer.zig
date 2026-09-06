@@ -8,6 +8,7 @@ const GridModel = @import("GridModel.zig");
 const MetalBackend = @import("MetalBackend.zig");
 const TerminalSession = @import("../terminal/Session.zig");
 const Config = @import("../Config.zig");
+const url_hover = @import("../terminal/url_hover.zig");
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("CoreTextRenderer is macOS-only");
@@ -145,6 +146,7 @@ paint: Paint,
 /// Host-driven mouse selection in viewport coordinates; null when nothing is
 /// selected.
 selection: ?GridModel.Selection = null,
+hovered_url: ?url_hover.Hit = null,
 
 pub fn init(options: Options) !CoreTextRenderer {
     if (options.font.size <= 0 or options.scale <= 0) return error.InvalidFontSize;
@@ -256,6 +258,7 @@ pub fn render(self: *CoreTextRenderer, session: *TerminalSession, cursor: ?Curso
         .pixel_height = self.contentHeight(),
         .background_alpha = self.paint.background_alpha,
         .selection = self.selection,
+        .hovered_url = if (self.hovered_url) |*hit| hit else null,
         .selection_foreground = self.paint.selection_foreground,
         .selection_background = self.paint.selection_background,
     });

@@ -45,6 +45,8 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     private var selecting = false
     private var selectingWord = false
     private var hasSelection = false
+    private var urlTrackingArea: NSTrackingArea?
+    private var hoveringURL = false
     private var scrollAccum = 0.0
     private var markedText = ""
 
@@ -78,7 +80,12 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window != nil { setupIfNeeded() }
+        if let window = window {
+            window.acceptsMouseMovedEvents = true
+            setupIfNeeded()
+        } else {
+            updateURLHover(at: nil)
+        }
     }
 
     override func layout() {
@@ -133,6 +140,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 
     func shutdown() {
+        updateURLHover(at: nil)
         guard alive else {
             if let t = tab { mostty_tab_destroy(t); tab = nil }
             return
@@ -267,6 +275,9 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         guard window != nil else { return }
         syncSurfaceIfNeeded()
         guard alive, dirty, let t = tab, let layer = metalLayer, let queue = commandQueue else { return }
+        let mouse = window?.isKeyWindow == true
+            ? window.map { convert($0.mouseLocationOutsideOfEventStream, from: nil) } : nil
+        updateURLHover(at: mouse)
         dirty = false
         // Focused cursor blinks; unfocused shows a steady block.
         let focused = window?.firstResponder === self
@@ -395,27 +406,84 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
     // MARK: Mouse
 
-    private func cellAt(_ event: NSEvent) -> (col: Int, row: Int) {
-        let p = convert(event.locationInWindow, from: nil)
+    private func gridCell(at p: NSPoint) -> (col: Int, row: Int) {
         let scale = Double(currentScale())
         let cwPts = Double(cellWidthPx) / scale
         let chPts = Double(cellHeightPx) / scale
-        let col = cwPts > 0 ? Int(Double(p.x) / cwPts) : 0
+        let col = cwPts > 0 ? Int(floor(Double(p.x) / cwPts)) : 0
         // Rows are laid out downward from the top edge, and the renderer keeps a
         // gutter at the bottom, so the row must be measured from the top rather
         // than inferred from the row count.
-        let rowFromTop = chPts > 0 ? Int((Double(bounds.height) - Double(p.y)) / chPts) : 0
-        let clampedCol = min(max(0, col), max(0, Int(cols) - 1))
-        let clampedRow = min(max(0, rowFromTop), max(0, Int(rows) - 1))
+        let rowFromTop = chPts > 0 ? Int(floor((Double(bounds.height) - Double(p.y)) / chPts)) : 0
+        return (col, rowFromTop)
+    }
+
+    private func cellAt(_ event: NSEvent) -> (col: Int, row: Int) {
+        let cell = gridCell(at: convert(event.locationInWindow, from: nil))
+        let clampedCol = min(max(0, cell.col), max(0, Int(cols) - 1))
+        let clampedRow = min(max(0, cell.row), max(0, Int(rows) - 1))
         return (clampedCol, clampedRow)
+    }
+
+    private func viewportCell(at point: NSPoint) -> (col: UInt32, row: UInt32)? {
+        guard bounds.contains(point) else { return nil }
+        let cell = gridCell(at: point)
+        guard cell.col >= 0, cell.row >= 0, cell.col < Int(cols), cell.row < Int(rows) else { return nil }
+        return (UInt32(cell.col), UInt32(cell.row))
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = urlTrackingArea { removeTrackingArea(area) }
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseMoved, .mouseEnteredAndExited, .cursorUpdate,
+                                            .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        urlTrackingArea = area
+    }
+
+    private func updateURLHover(at point: NSPoint?) {
+        guard let t = tab else { return }
+        let cell = selecting ? nil : point.flatMap { viewportCell(at: $0) }
+        let hit = mostty_tab_hover_url(t, cell != nil, cell?.col ?? 0, cell?.row ?? 0)
+        if hit != hoveringURL { dirty = true }
+        if hit { NSCursor.pointingHand.set() }
+        else if hoveringURL { NSCursor.arrow.set() }
+        hoveringURL = hit
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateURLHover(at: convert(event.locationInWindow, from: nil))
+        dirty = true
+    }
+
+    override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
+    override func cursorUpdate(with event: NSEvent) { mouseMoved(with: event) }
+    override func mouseExited(with event: NSEvent) { updateURLHover(at: nil) }
+
+    private func openURL(at point: NSPoint) -> Bool {
+        guard let t = tab, let cell = viewportCell(at: point) else { return false }
+        var buf = [UInt8](repeating: 0, count: 4096)
+        let n = mostty_tab_url_at(t, cell.col, cell.row, &buf, buf.count)
+        guard n > 0, let url = URL(string: String(decoding: buf[0..<n], as: UTF8.self)) else { return false }
+        return NSWorkspace.shared.open(url)
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         guard let t = tab else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        if event.clickCount == 2, !event.modifierFlags.contains(.shift), openURL(at: point) {
+            selecting = false; selectingWord = false; hasSelection = false
+            publishSelection()
+            updateURLHover(at: point)
+            return
+        }
         let cell = cellAt(event)
         selStart = cell; selEnd = cell
         selecting = true; hasSelection = false
+        updateURLHover(at: nil)
         selectingWord = event.clickCount == 2
         if selectingWord {
             hasSelection = mostty_tab_select_word(t, UInt32(cell.col), UInt32(cell.row))

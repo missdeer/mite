@@ -50,6 +50,9 @@ bool mostty_tab_at_bottom(MosttyTab *tab);
 /* cap == 0 queries the required size; an undersized buffer returns zero. */
 size_t mostty_tab_selection_text(MosttyTab *tab, uint8_t *buf, size_t cap);
 bool mostty_tab_select_word(MosttyTab *tab, uint32_t col, uint32_t row);
+bool mostty_tab_hover_url(MosttyTab *tab, bool active, uint32_t col, uint32_t row);
+/* Re-detects at the click position; returns zero if absent or the buffer is too small. */
+size_t mostty_tab_url_at(MosttyTab *tab, uint32_t col, uint32_t row, uint8_t *buf, size_t cap);
 void mostty_tab_set_selection(MosttyTab *tab, bool active, uint32_t start_col, uint32_t start_row,
                               uint32_t end_col, uint32_t end_row);
 

@@ -1,4 +1,5 @@
 //! Detects http/https URLs at a viewport (col,row) for mouse-hover linkification.
+//! Shared by the Windows and macOS hosts.
 //!
 //! Scans the URL run across visually-adjacent viewport rows, regardless of the
 //! row.wrap flag. Ghostty derives row.wrap from the VT printer's auto-wrap
