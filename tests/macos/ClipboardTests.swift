@@ -64,13 +64,13 @@ struct ClipboardTests {
             }
         }
 
-        func mouse(_ type: NSEvent.EventType, _ col: Int) -> NSEvent {
+        func mouse(_ type: NSEvent.EventType, _ col: Int, clicks: Int = 1) -> NSEvent {
             let cell = view.overlayCellPoints
             let point = view.convert(NSPoint(x: (Double(col) + 0.5) * cell.w,
                                              y: Double(view.bounds.height) - cell.h * 0.5), to: nil)
             return NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
                                       timestamp: 0, windowNumber: window.windowNumber,
-                                      context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+                                      context: nil, eventNumber: 0, clickCount: clicks, pressure: 1)!
         }
         clipboard("sentinel")
         view.mouseDown(with: mouse(.leftMouseDown, 0))
@@ -87,6 +87,21 @@ struct ClipboardTests {
         expect(pasteboard.string(forType: .string) == "sentinel", "a click without selection preserves the clipboard")
         view.mouseUp(with: mouse(.leftMouseUp, 4))
         expect(pasteboard.string(forType: .string) == "sentinel", "an unmatched release preserves the clipboard")
+        for (col, expected) in [(2, "hello"), (8, "x")] {
+            clipboard("sentinel")
+            view.mouseDown(with: mouse(.leftMouseDown, col, clicks: 2))
+            expect(pasteboard.string(forType: .string) == "sentinel", "double-click waits for release to copy")
+            view.mouseUp(with: mouse(.leftMouseUp, col, clicks: 2))
+            expect(pasteboard.string(forType: .string) == expected,
+                   "double-click release preserves the entire word, including a single-cell word")
+            clipboard("sentinel")
+            view.copy(nil)
+            expect(pasteboard.string(forType: .string) == expected, "manual copy retains the selected word")
+        }
+        clipboard("sentinel")
+        view.mouseDown(with: mouse(.leftMouseDown, 2))
+        view.mouseUp(with: mouse(.leftMouseUp, 2))
+        expect(pasteboard.string(forType: .string) == "sentinel", "a new single click clears word selection")
         // Return before exiting so clipboard restoration and shutdown run on failure.
         if failures > 0 {
             print("\(failures) clipboard regression checks failed")

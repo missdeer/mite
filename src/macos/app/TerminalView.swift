@@ -43,6 +43,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     private var selStart = (col: 0, row: 0)
     private var selEnd = (col: 0, row: 0)
     private var selecting = false
+    private var selectingWord = false
     private var hasSelection = false
     private var scrollAccum = 0.0
     private var markedText = ""
@@ -411,15 +412,22 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        guard tab != nil else { return }
+        guard let t = tab else { return }
         let cell = cellAt(event)
         selStart = cell; selEnd = cell
         selecting = true; hasSelection = false
+        selectingWord = event.clickCount == 2
+        if selectingWord {
+            hasSelection = mostty_tab_select_word(t, UInt32(cell.col), UInt32(cell.row))
+            dirty = true
+            return
+        }
         publishSelection()
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard selecting else { return }
+        selectingWord = false
         selEnd = cellAt(event)
         hasSelection = selStart != selEnd
         publishSelection()
@@ -428,9 +436,12 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     override func mouseUp(with event: NSEvent) {
         guard selecting else { return }
         selecting = false
-        selEnd = cellAt(event)
-        hasSelection = selStart != selEnd
-        publishSelection()
+        if !selectingWord {
+            selEnd = cellAt(event)
+            hasSelection = selStart != selEnd
+            publishSelection()
+        }
+        selectingWord = false
         copy(nil)
     }
 
@@ -470,11 +481,11 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
     @objc func copy(_ sender: Any?) {
         guard hasSelection, let t = tab else { return }
-        var buf = [UInt8](repeating: 0, count: 1 << 16)
-        let n = mostty_tab_selection_text(t,
-                                          UInt32(selStart.col), UInt32(selStart.row),
-                                          UInt32(selEnd.col), UInt32(selEnd.row),
-                                          &buf, buf.count)
+        var probe: UInt8 = 0
+        let size = mostty_tab_selection_text(t, &probe, 0)
+        guard size > 0 else { return }
+        var buf = [UInt8](repeating: 0, count: size)
+        let n = mostty_tab_selection_text(t, &buf, buf.count)
         guard n > 0 else { return }
         let text = String(decoding: buf[0..<n], as: UTF8.self)
         NSPasteboard.general.clearContents()

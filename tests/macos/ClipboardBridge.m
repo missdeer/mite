@@ -9,6 +9,8 @@ static size_t written_count;
 static bool bracketed_paste;
 static bool selection_active;
 static uint32_t selection_end;
+static bool word_selection;
+static uint32_t word_col;
 static id<MTLDevice> device;
 
 void clipboard_test_reset(bool bracketed) { written_count = 0; bracketed_paste = bracketed; }
@@ -47,13 +49,17 @@ bool mostty_tab_bracketed_paste(MosttyTab *tab) { return bracketed_paste; }
 void mostty_tab_scroll(MosttyTab *tab, int32_t rows) {}
 void mostty_tab_scroll_to_bottom(MosttyTab *tab) {}
 void mostty_tab_set_selection(MosttyTab *tab, bool active, uint32_t sc, uint32_t sr, uint32_t ec, uint32_t er) {
-    selection_active = active; selection_end = ec;
+    selection_active = active; selection_end = ec; word_selection = false;
 }
-size_t mostty_tab_selection_text(MosttyTab *tab, uint32_t sc, uint32_t sr, uint32_t ec, uint32_t er, uint8_t *buf, size_t cap) {
-    // Reject stale drag coordinates: release must publish its final endpoint.
-    assert(selection_active && selection_end == ec);
-    const char *text = ec == 4 ? "hello" : "hel";
+bool mostty_tab_select_word(MosttyTab *tab, uint32_t col, uint32_t row) {
+    selection_active = true; word_selection = true; word_col = col;
+    return true;
+}
+size_t mostty_tab_selection_text(MosttyTab *tab, uint8_t *buf, size_t cap) {
+    assert(selection_active);
+    const char *text = word_selection ? (word_col == 8 ? "x" : "hello") : (selection_end == 4 ? "hello" : "hel");
     size_t len = strlen(text);
+    if (cap == 0) return len;
     assert(len <= cap);
     memcpy(buf, text, len);
     return len;

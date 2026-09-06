@@ -449,6 +449,10 @@ rasterizes the resolved cells into a BGRA buffer, and submits that buffer throug
 `MetalBackend` to an offscreen Metal texture. Resize and backing-scale changes
 replace the font metrics, pixel buffer, and Metal textures together. The later
 SwiftUI shell owns presentation of that texture and all input/window lifecycle.
+Mouse selections are tracked by the VT screen; the bridge copies them with VT
+selection formatting and clips their highlight to the viewport when rendering.
+Both platforms use `terminal/word_selection.zig` for double-click token boundaries
+and CJK-aware expansion.
 
 The flow per chunk of PTY bytes is:
 

@@ -16,6 +16,7 @@ const CoreTextRenderer = @import("CoreTextRenderer.zig");
 const GridModel = @import("GridModel.zig");
 const Config = @import("../Config.zig");
 const title_mod = @import("../terminal/title.zig");
+const word_selection = @import("../terminal/word_selection.zig");
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("capi is macOS-only");
@@ -221,16 +222,48 @@ export fn mostty_tab_set_selection(
     end_row: u32,
 ) void {
     const tab = tab_opt orelse return;
-    tab.renderer.selection = if (active) .{
-        .start_col = clampToGridCoord(start_col),
-        .start_row = clampToGridCoord(start_row),
-        .end_col = clampToGridCoord(end_col),
-        .end_row = clampToGridCoord(end_row),
-    } else null;
+    const screen = tab.pty.terminal.term.screens.active;
+    screen.clearSelection();
+    if (!active) return;
+    const start = viewportPin(tab, start_col, start_row) orelse return;
+    const end = viewportPin(tab, end_col, end_row) orelse return;
+    screen.select(vt.Selection.init(start, end, false)) catch return;
 }
 
-fn clampToGridCoord(value: u32) u16 {
-    return @intCast(@min(value, std.math.maxInt(u16)));
+fn viewportPin(tab: *Tab, col: u32, row: u32) ?vt.Pin {
+    const term = tab.pty.terminal.term;
+    if (col >= term.cols or row >= term.rows) return null;
+    return term.screens.active.pages.pin(.{ .viewport = .{ .x = @intCast(col), .y = row } });
+}
+
+/// Expand the clicked cell using the same token boundaries as Windows.
+export fn mostty_tab_select_word(tab_opt: ?*Tab, col: u32, row: u32) bool {
+    const tab = tab_opt orelse return false;
+    const screen = tab.pty.terminal.term.screens.active;
+    screen.clearSelection();
+    var pin = viewportPin(tab, col, row) orelse return false;
+    if (pin.rowAndCell().cell.wide == .spacer_tail and pin.x > 0) pin.x -= 1;
+    const sel = word_selection.selectWordCJK(pin, &word_selection.WORD_BOUNDARIES) orelse
+        vt.Selection.init(pin, pin, false);
+    screen.select(sel) catch return false;
+    return true;
+}
+
+fn visibleSelection(tab: *Tab) ?GridModel.Selection {
+    const term = tab.pty.terminal.term;
+    const screen = term.screens.active;
+    const sel = screen.selection orelse return null;
+    const start = screen.pages.pointFromPin(.viewport, sel.topLeft(screen));
+    const end = screen.pages.pointFromPin(.viewport, sel.bottomRight(screen)) orelse return null;
+    if (start) |pt| {
+        if (pt.viewport.y >= term.rows) return null;
+    }
+    return .{
+        .start_col = if (start) |pt| @intCast(pt.viewport.x) else 0,
+        .start_row = if (start) |pt| @intCast(pt.viewport.y) else 0,
+        .end_col = if (end.viewport.y >= term.rows) term.cols - 1 else @intCast(end.viewport.x),
+        .end_row = @intCast(@min(end.viewport.y, term.rows - 1)),
+    };
 }
 
 export fn mostty_tab_destroy(tab_opt: ?*Tab) void {
@@ -333,6 +366,7 @@ export fn mostty_tab_render(tab_opt: ?*Tab, cursor_on: bool, out_cols: *u32, out
         }
     }
 
+    tab.renderer.selection = visibleSelection(tab);
     const result = tab.renderer.render(&tab.pty.terminal, cursor_cell) catch return null;
     out_cols.* = result.cols;
     out_rows.* = result.rows;
@@ -446,74 +480,18 @@ export fn mostty_tab_at_bottom(tab_opt: ?*Tab) bool {
     return tab.pty.terminal.term.screens.active.viewportIsBottom();
 }
 
-/// Extract the text of a linear selection [start .. end] over the current
-/// viewport as UTF-8 into `buf`. Rows between the endpoints are taken in full;
-/// trailing blank cells on each row are trimmed and rows joined with newlines.
-export fn mostty_tab_selection_text(
-    tab_opt: ?*Tab,
-    start_col: u32,
-    start_row: u32,
-    end_col: u32,
-    end_row: u32,
-    buf: [*]u8,
-    cap: usize,
-) usize {
+/// Copy the current VT selection as UTF-8. A zero capacity queries the required
+/// byte count; an undersized buffer returns zero without splitting text.
+export fn mostty_tab_selection_text(tab_opt: ?*Tab, buf: [*]u8, cap: usize) usize {
     const tab = tab_opt orelse return 0;
-    var r0 = start_row;
-    var c0 = start_col;
-    var r1 = end_row;
-    var c1 = end_col;
-    if (r1 < r0 or (r1 == r0 and c1 < c0)) {
-        std.mem.swap(u32, &r0, &r1);
-        std.mem.swap(u32, &c0, &c1);
-    }
-
-    var frame = GridModel.build(allocator, tab.pty.terminal.term, .{
-        .metrics = tab.renderer.metrics,
-        .pixel_width = tab.renderer.pixel_width,
-        .pixel_height = tab.renderer.contentHeight(),
-    }) catch return 0;
-    defer frame.deinit();
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(allocator);
-
-    var row: u32 = r0;
-    while (row <= r1) : (row += 1) {
-        const line_start: u32 = if (row == r0) c0 else 0;
-        const line_end: u32 = if (row == r1) c1 else frame.cols;
-        var line = std.ArrayListUnmanaged(u8).empty;
-        defer line.deinit(allocator);
-        for (frame.cells) |cell| {
-            if (cell.row != row) continue;
-            if (cell.col < line_start or cell.col > line_end) continue;
-            appendCell(&line, cell) catch return 0;
-        }
-        trimTrailingSpaces(&line);
-        if (row != r0) out.append(allocator, '\n') catch return 0;
-        out.appendSlice(allocator, line.items) catch return 0;
-    }
-
-    const n = @min(out.items.len, cap);
-    @memcpy(buf[0..n], out.items[0..n]);
-    return n;
-}
-
-fn appendCell(line: *std.ArrayListUnmanaged(u8), cell: GridModel.Cell) !void {
-    try appendCodepoint(line, cell.codepoint);
-    for (cell.grapheme) |cp| try appendCodepoint(line, cp);
-}
-
-fn appendCodepoint(line: *std.ArrayListUnmanaged(u8), codepoint: u21) !void {
-    var utf8: [4]u8 = undefined;
-    const len = std.unicode.utf8Encode(codepoint, &utf8) catch return;
-    try line.appendSlice(allocator, utf8[0..len]);
-}
-
-fn trimTrailingSpaces(line: *std.ArrayListUnmanaged(u8)) void {
-    while (line.items.len > 0 and line.items[line.items.len - 1] == ' ') {
-        _ = line.pop();
-    }
+    const screen = tab.pty.terminal.term.screens.active;
+    const sel = screen.selection orelse return 0;
+    const text = screen.selectionString(allocator, .{ .sel = sel }) catch return 0;
+    defer allocator.free(text);
+    if (cap == 0) return text.len;
+    if (text.len > cap) return 0;
+    @memcpy(buf[0..text.len], text);
+    return text.len;
 }
 
 // -- Keyboard encoding -------------------------------------------------------
@@ -703,7 +681,8 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     try std.testing.expect(cols > 0 and rows > 0);
 
     var out: [64]u8 = undefined;
-    const n = mostty_tab_selection_text(tab, 0, 0, @intCast(line.len - 1), 0, &out, out.len);
+    mostty_tab_set_selection(tab, true, 0, 0, @intCast(line.len - 1), 0);
+    const n = mostty_tab_selection_text(tab, &out, out.len);
     try std.testing.expectEqualStrings(line, out[0..n]);
 
     // Terminal modes drive input encoding; verify they track VT state.
@@ -711,6 +690,87 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     try std.testing.expect(mostty_tab_app_cursor_keys(tab));
     mostty_tab_feed(tab, "\x1b[?2004h", 8);
     try std.testing.expect(mostty_tab_bracketed_paste(tab));
+}
+
+test "selection copy unwraps soft lines and includes a wide character from its right half" {
+    const tab = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    try tab.pty.terminal.resize(6, 4);
+
+    const cases = .{
+        .{ "abcdefghi", 0, 0, 2, 1, "abcdefghi" },
+        .{ "abc\r\ndef", 0, 0, 2, 1, "abc\ndef" },
+        .{ "\u{4e2d}\u{6587}", 1, 0, 1, 0, "\u{4e2d}" },
+        .{ "e\u{301}", 0, 0, 0, 0, "e\u{301}" },
+        .{ "abcdefghi", 2, 1, 0, 0, "abcdefghi" },
+    };
+    inline for (cases) |case| {
+        tab.pty.terminal.feed("\x1b[2J\x1b[H" ++ case[0]);
+        var out: [128]u8 = undefined;
+        mostty_tab_set_selection(tab, true, case[1], case[2], case[3], case[4]);
+        const n = mostty_tab_selection_text(tab, &out, out.len);
+        try std.testing.expectEqualStrings(case[5], out[0..n]);
+    }
+}
+
+test "double click uses Windows token boundaries and VT text across wraps" {
+    const tab = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    const cases = .{
+        .{ 80, "https://example.com/a-b?q=v", 10, 0, "https://example.com/a-b?q=v" },
+        .{ 80, "/usr/local/my_file $HOME key:value", 8, 0, "/usr/local/my_file" },
+        .{ 80, "/usr/local/my_file $HOME key:value", 19, 0, "$HOME" },
+        .{ 80, "/usr/local/my_file $HOME key:value", 25, 0, "key:value" },
+        .{ 80, "user@host", 1, 0, "user" },
+        .{ 80, "user@host", 6, 0, "host" },
+        .{ 80, "\u{4e2d}\u{6587}\u{ff0c}\u{6d4b}\u{8bd5}", 3, 0, "\u{4e2d}\u{6587}" },
+        .{ 80, "\u{4e2d}\u{6587}\u{ff0c}\u{6d4b}\u{8bd5}", 7, 0, "\u{6d4b}\u{8bd5}" },
+        .{ 80, "e\u{301}lan", 0, 0, "e\u{301}lan" },
+        .{ 80, "a b", 0, 0, "a" },
+        .{ 80, "", 0, 0, "" },
+        .{ 6, "abcdefghi", 1, 1, "abcdefghi" },
+        .{ 6, "abcdef\r\nghi", 5, 0, "abcdef" },
+        .{ 5, "abcd\u{ff0c}z", 2, 0, "abcd" },
+        .{ 5, "abcd\u{4e2d}\u{6587}", 1, 1, "abcd\u{4e2d}\u{6587}" },
+    };
+    inline for (cases) |case| {
+        mostty_tab_set_selection(tab, false, 0, 0, 0, 0);
+        tab.pty.terminal.feed("\x1b[2J\x1b[H");
+        try tab.pty.terminal.resize(case[0], 4);
+        tab.pty.terminal.feed(case[1]);
+        try std.testing.expect(mostty_tab_select_word(tab, case[2], case[3]));
+        var out: [128]u8 = undefined;
+        const size = mostty_tab_selection_text(tab, &out, 0);
+        try std.testing.expectEqual(case[4].len, size);
+        const n = mostty_tab_selection_text(tab, &out, out.len);
+        try std.testing.expectEqualStrings(case[4], out[0..n]);
+        try std.testing.expect(visibleSelection(tab) != null);
+    }
+    try std.testing.expect(!mostty_tab_select_word(tab, 999, 0));
+    var out: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), mostty_tab_selection_text(tab, &out, out.len));
+}
+
+test "word selection includes offscreen wrapped text and clips only its highlight" {
+    const tab = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    try tab.pty.terminal.resize(6, 2);
+    tab.pty.terminal.feed("abcdefghijklmnop");
+    try std.testing.expect(mostty_tab_select_word(tab, 1, 0));
+    var out: [64]u8 = undefined;
+    const n = mostty_tab_selection_text(tab, &out, out.len);
+    try std.testing.expectEqualStrings("abcdefghijklmnop", out[0..n]);
+    try std.testing.expectEqual(GridModel.Selection{
+        .start_col = 0,
+        .start_row = 0,
+        .end_col = 3,
+        .end_row = 1,
+    }, visibleSelection(tab).?);
+    // Copy must never return a partial UTF-8/grapheme sequence on capacity failure.
+    try std.testing.expectEqual(@as(usize, 0), mostty_tab_selection_text(tab, &out, 3));
+    mostty_tab_set_selection(tab, false, 0, 0, 0, 0);
+    try std.testing.expect(visibleSelection(tab) == null);
+    try std.testing.expectEqual(@as(usize, 0), mostty_tab_selection_text(tab, &out, 0));
 }
 
 test "config colors decide the rendered defaults and palette entries" {

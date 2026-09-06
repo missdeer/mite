@@ -47,8 +47,9 @@ void mostty_tab_scroll(MosttyTab *tab, int32_t delta_rows);
 void mostty_tab_scroll_to_bottom(MosttyTab *tab);
 bool mostty_tab_at_bottom(MosttyTab *tab);
 
-size_t mostty_tab_selection_text(MosttyTab *tab, uint32_t start_col, uint32_t start_row,
-                                 uint32_t end_col, uint32_t end_row, uint8_t *buf, size_t cap);
+/* cap == 0 queries the required size; an undersized buffer returns zero. */
+size_t mostty_tab_selection_text(MosttyTab *tab, uint8_t *buf, size_t cap);
+bool mostty_tab_select_word(MosttyTab *tab, uint32_t col, uint32_t row);
 void mostty_tab_set_selection(MosttyTab *tab, bool active, uint32_t start_col, uint32_t start_row,
                               uint32_t end_col, uint32_t end_row);
 
