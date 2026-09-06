@@ -25,6 +25,10 @@ jobs:
         with:
           version: 0.16.0
 
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26'
+
       - name: Build
         run: zig build
 

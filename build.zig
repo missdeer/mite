@@ -218,9 +218,22 @@ fn buildMacosApp(b: *std.Build, target: std.Build.ResolvedTarget) void {
         }
     }
 
+    // Tahoe otherwise shrinks legacy ICNS artwork into a light background tile.
+    // Reuse the 700px source at the Icon Composer canvas size of 1024 points.
+    const icon_source = b.addWriteFiles();
+    _ = icon_source.addCopyFile(b.path("src/macos/app/Mostty.icon/icon.json"), "Mostty.icon/icon.json");
+    _ = icon_source.addCopyFile(b.path("src/mostty.png"), "Mostty.icon/Assets/mostty.png");
+    const compile_icon = b.addSystemCommand(&.{ "xcrun", "actool" });
+    compile_icon.addDirectoryArg(icon_source.getDirectory().path(b, "Mostty.icon"));
+    compile_icon.addArgs(&.{ "--platform", "macosx", "--minimum-deployment-target", "13.0", "--app-icon", "Mostty", "--compile" });
+    const icon_output = compile_icon.addOutputDirectoryArg("icon-assets");
+    compile_icon.addArg("--output-partial-info-plist");
+    _ = compile_icon.addOutputFileArg("icon-info.plist");
+    const install_icon_assets = b.addInstallFileWithDir(icon_output.path(b, "Assets.car"), .{ .custom = "Mostty.app/Contents/Resources" }, "Assets.car");
+
     const install_exe = b.addInstallFileWithDir(exe, .{ .custom = "Mostty.app/Contents/MacOS" }, "Mostty");
     const install_plist = b.addInstallFileWithDir(b.path("src/macos/app/Info.plist"), .{ .custom = "Mostty.app/Contents" }, "Info.plist");
-    const install_icon = b.addInstallFileWithDir(b.path("src/mostty.icns"), .{ .custom = "Mostty.app/Contents/Resources" }, "mostty.icns");
+    const install_icon = b.addInstallFileWithDir(icon_output.path(b, "Mostty.icns"), .{ .custom = "Mostty.app/Contents/Resources" }, "Mostty.icns");
     // Ship the bundled themes so a config's `theme = <name>` resolves through the
     // Contents/Resources/themes lookup, mirroring <exeDir>/themes on Windows.
     const install_themes = b.addInstallDirectory(.{
@@ -234,6 +247,7 @@ fn buildMacosApp(b: *std.Build, target: std.Build.ResolvedTarget) void {
         &install_exe.step,
         &install_plist.step,
         &install_icon.step,
+        &install_icon_assets.step,
         &install_themes.step,
     }) |step| {
         app_step.dependOn(step);

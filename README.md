@@ -97,7 +97,7 @@ CI downloads `Microsoft.Windows.Console.ConPTY.1.23.251216003.nupkg` from the Mi
 
 ### macOS
 
-A native SwiftUI/AppKit application built on the same platform-neutral terminal core. The Zig core owns the PTY, the `libghostty-vt` state machine, and the grid model behind a C-ABI boundary (`src/macos/capi.zig`); text is shaped and rasterized with CoreText and presented through a Metal (`CAMetalLayer`) surface, so terminal behavior stays consistent with the Windows build. Requires macOS 13 or newer. `zig build` on a macOS host assembles a launchable `Mostty.app` into `zig-out/`, and CI publishes an arm64 `.dmg` on tagged releases.
+A native SwiftUI/AppKit application built on the same platform-neutral terminal core. The Zig core owns the PTY, the `libghostty-vt` state machine, and the grid model behind a C-ABI boundary (`src/macos/capi.zig`); text is shaped and rasterized with CoreText and presented through a Metal (`CAMetalLayer`) surface, so terminal behavior stays consistent with the Windows build. Requires macOS 13 or newer. Building requires full Xcode 26 or newer for the Icon Composer asset compiler (`actool`). `zig build` on a macOS host assembles a launchable `Mostty.app` into `zig-out/`, and CI publishes an arm64 `.dmg` on tagged releases.
 
 #### macOS features
 

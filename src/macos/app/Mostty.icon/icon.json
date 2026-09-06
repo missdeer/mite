@@ -1,0 +1,20 @@
+{
+  "fill": { "solid": "srgb:0.025,0.035,0.05,1" },
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "mostty.png",
+          "name": "Mostty",
+          "glass": false,
+          "position": { "scale": 1.4628571429, "translation-in-points": [0, 0] }
+        }
+      ],
+      "lighting": "combined",
+      "shadow": { "kind": "neutral", "opacity": 0 },
+      "specular": false,
+      "translucency": { "enabled": false, "value": 0 }
+    }
+  ],
+  "supported-platforms": { "squares": ["macOS"] }
+}

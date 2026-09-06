@@ -19,7 +19,9 @@
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>CFBundleIconFile</key>
-    <string>mostty.icns</string>
+    <string>Mostty</string>
+    <key>CFBundleIconName</key>
+    <string>Mostty</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSPrincipalClass</key>

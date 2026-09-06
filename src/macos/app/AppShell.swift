@@ -323,18 +323,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) { AppModel.shared.shutdownAll() }
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        let possibleUrls: [URL?] = [
-            Bundle.main.url(forResource: "mostty", withExtension: "icns"),
-            Bundle.main.resourceURL?.appendingPathComponent("mostty.icns"),
-            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/mostty.icns"),
-            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("Resources/mostty.icns"),
-        ]
-        for url in possibleUrls.compactMap({ $0 }) {
-            if FileManager.default.fileExists(atPath: url.path), let img = NSImage(contentsOf: url) {
-                NSApp.applicationIconImage = img
-                break
-            }
-        }
         NSApp.activate(ignoringOtherApps: true)
         // SwiftUI has not built the Window scene yet at this point.
         DispatchQueue.main.async { AppModel.shared.applyInitialWindowState() }
