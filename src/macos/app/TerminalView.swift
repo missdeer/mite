@@ -431,6 +431,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         selEnd = cellAt(event)
         hasSelection = selStart != selEnd
         publishSelection()
+        copy(nil)
     }
 
     /// Hand the selection to the bridge so the highlight is painted with the
@@ -482,7 +483,10 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
     @objc func paste(_ sender: Any?) {
         guard let t = tab, let s = NSPasteboard.general.string(forType: .string) else { return }
-        var bytes = Array(s.utf8)
+        // Terminals expect Enter as CR, including inside bracketed paste.
+        let normalized = s.replacingOccurrences(of: "\r\n", with: "\r")
+                          .replacingOccurrences(of: "\n", with: "\r")
+        var bytes = Array(normalized.utf8)
         if mostty_tab_bracketed_paste(t) {
             // Strip any embedded paste-end marker so clipboard content can't
             // terminate bracketed paste early and inject the trailing bytes as
