@@ -5,9 +5,8 @@
 //!
 //! The drawing code lives under `src/vendor/ghostty-sprite/` and is invoked
 //! via the comptime range table built below. We rasterize into an alpha-8
-//! z2d surface, then gamma-encode the alpha and replicate it across BGRA so
-//! the shader's ClearType-coverage decode (`pow(c, 2.2)`) treats sprites as
-//! uniform grayscale coverage.
+//! z2d surface. macOS consumes linear alpha; Windows gamma-encodes it into
+//! BGRA for the shader's ClearType-coverage decode (`pow(c, 2.2)`).
 
 const std = @import("std");
 const sprite_font = @import("../vendor/ghostty-sprite/font/main.zig");
@@ -184,6 +183,30 @@ pub fn render(
     metrics: Metrics,
     out_bgra: []u8,
 ) !bool {
+    return renderPixels(.atlas_bgra, alloc, cp, cell_w, cell_h, metrics, out_bgra);
+}
+
+/// Linear alpha-8 coverage, row-major from the top-left of the full cell.
+pub fn renderAlpha(
+    alloc: std.mem.Allocator,
+    cp: u21,
+    cell_w: u32,
+    cell_h: u32,
+    metrics: Metrics,
+    out_alpha: []u8,
+) !bool {
+    return renderPixels(.alpha, alloc, cp, cell_w, cell_h, metrics, out_alpha);
+}
+
+fn renderPixels(
+    comptime format: enum { atlas_bgra, alpha },
+    alloc: std.mem.Allocator,
+    cp: u21,
+    cell_w: u32,
+    cell_h: u32,
+    metrics: Metrics,
+    output: []u8,
+) !bool {
     const draw = getDrawFn(cp) orelse return false;
 
     // Padding mirrors ghostty's renderGlyph (cell/4 each side). Lets draw
@@ -202,24 +225,29 @@ pub fn render(
     // and gamma-encode while replicating into BGRA.
     const buf = std.mem.sliceAsBytes(canvas.sfc.image_surface_alpha8.buf);
     const stride: u32 = @intCast(canvas.sfc.getWidth());
-    std.debug.assert(out_bgra.len >= cell_w * cell_h * 4);
+    const channels = if (format == .alpha) 1 else 4;
+    std.debug.assert(output.len >= cell_w * cell_h * channels);
 
     var y: u32 = 0;
     while (y < cell_h) : (y += 1) {
         const src_row = (padding_y + y) * stride + padding_x;
-        const dst_row = y * cell_w * 4;
+        const dst_row = y * cell_w * channels;
         var x: u32 = 0;
         while (x < cell_w) : (x += 1) {
+            if (format == .alpha) {
+                output[dst_row + x] = buf[src_row + x];
+                continue;
+            }
             // Gamma-encode linear coverage so the shader's pow(c, 2.2)
             // decode recovers the original linear value. Must stay in
             // lock-step with terminal.hlsl's to_linear exponent and
             // DirectWrite's CreateCustomRenderingParams gamma.
             const encoded = gamma_lut[buf[src_row + x]];
             const dst = dst_row + x * 4;
-            out_bgra[dst + 0] = encoded; // B
-            out_bgra[dst + 1] = encoded; // G
-            out_bgra[dst + 2] = encoded; // R
-            out_bgra[dst + 3] = 255; // A: opaque to match the DirectWrite-path atlas contract
+            output[dst + 0] = encoded; // B
+            output[dst + 1] = encoded; // G
+            output[dst + 2] = encoded; // R
+            output[dst + 3] = 255; // A: opaque to match the DirectWrite-path atlas contract
         }
     }
 
@@ -238,3 +266,25 @@ const gamma_lut: [256]u8 = blk: {
     }
     break :blk lut;
 };
+
+test "linear masks and Windows atlas coverage agree for every sprite family" {
+    const width = 13;
+    const height = 25;
+    const metrics = buildMetrics(width, height);
+    var alpha: [width * height]u8 = undefined;
+    var atlas: [width * height * 4]u8 = undefined;
+    for ([_]u21{ 0x2580, 0x253c, 0x28ff, 0xe0b0, 0x25e2, 0x1fb00 }) |cp| {
+        try std.testing.expect(try renderAlpha(std.testing.allocator, cp, width, height, metrics, &alpha));
+        try std.testing.expect(try render(std.testing.allocator, cp, width, height, metrics, &atlas));
+        try std.testing.expect(std.mem.indexOfNone(u8, &alpha, &.{0}) != null);
+        for (alpha, 0..) |coverage, i| {
+            // Windows' shader decodes gamma 2.2; macOS must receive linear coverage.
+            const decoded = std.math.pow(f32, @as(f32, @floatFromInt(atlas[i * 4])) / 255, 2.2) * 255;
+            try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(coverage)), decoded, 1.2);
+            try std.testing.expectEqual(atlas[i * 4], atlas[i * 4 + 1]);
+            try std.testing.expectEqual(atlas[i * 4], atlas[i * 4 + 2]);
+            try std.testing.expectEqual(@as(u8, 255), atlas[i * 4 + 3]);
+        }
+    }
+    try std.testing.expect(!try renderAlpha(std.testing.allocator, 'A', width, height, metrics, &alpha));
+}

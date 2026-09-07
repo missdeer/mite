@@ -25,7 +25,7 @@ const color = @import("color.zig");
 const emoji = @import("emoji.zig");
 const glyph_mod = @import("glyph.zig");
 const com = @import("com.zig");
-const sprite = @import("../sprite.zig");
+const sprite = @import("../../renderer/sprite.zig");
 const GlyphIndexCache = @import("../GlyphIndexCache.zig");
 
 const shader = gpu.shader;

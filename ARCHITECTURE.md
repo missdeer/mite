@@ -30,6 +30,7 @@ src/
   Cmdline.zig              startup options, including the per-process renderer override
   Config.zig               1.4 kLOC — config file parser, theme resolution, arena owner
   vendor/ghostty-sprite/   vendored Ghostty sprite face (block/box/braille/...)
+  renderer/sprite.zig      shared ghostty-sprite dispatcher and alpha/BGRA output
   win32/
     mostty.manifest        DPI/UAC manifest
     mostty.rc / icons      Win32 resources
@@ -77,7 +78,6 @@ src/
     vulkan/loader.zig      checked runtime Vulkan procedure tables
     render.zig             renderWindow orchestration (state → renderer.render)
     GlyphIndexCache.zig    circular-LRU mapping (codepoint,half,style) → atlas slot
-    sprite.zig             ghostty-sprite dispatcher + z2d canvas
     d3d11/gpu.zig          device, shaders, const buffer, staging textures
     d3d11/swap_chain.zig   DirectComposition flip-model + adapter classification
     d3d11/grid.zig         persistent grid RTV, scissor draw, blit to back buffer
@@ -449,6 +449,10 @@ rasterizes the resolved cells into a BGRA buffer, and submits that buffer throug
 `MetalBackend` to an offscreen Metal texture. Resize and backing-scale changes
 replace the font metrics, pixel buffer, and Metal textures together. The later
 SwiftUI shell owns presentation of that texture and all input/window lifecycle.
+Tile-design characters use the shared sprite rasterizer at exact cell dimensions.
+The macOS renderer caches linear alpha masks until cell metrics change and paints
+them with the resolved foreground color; Windows retains its gamma-encoded BGRA
+atlas output. Grapheme clusters and ordinary text continue through font rendering.
 Mouse selections are tracked by the VT screen; the bridge copies them with VT
 selection formatting and clips their highlight to the viewport when rendering.
 Both platforms use `terminal/word_selection.zig` for double-click token boundaries

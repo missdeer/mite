@@ -118,6 +118,7 @@ fn buildMacos(
         }),
     });
     core.root_module.addImport("vt", vt);
+    core.root_module.addImport("z2d", b.dependency("z2d", .{ .target = target, .optimize = optimize }).module("z2d"));
     core.root_module.linkSystemLibrary("c", .{});
     b.installArtifact(core);
 
@@ -132,6 +133,7 @@ fn buildMacos(
             }),
         });
         tests.root_module.addImport("vt", vt);
+        tests.root_module.addImport("z2d", b.dependency("z2d", .{ .target = target, .optimize = optimize }).module("z2d"));
         addMacosFrameworks(tests.root_module);
         tests.root_module.linkSystemLibrary("c", .{});
         const run_tests = b.addRunArtifact(tests);
@@ -152,6 +154,7 @@ fn buildMacos(
             }),
         });
         renderer_check.root_module.addImport("vt", vt);
+        renderer_check.root_module.addImport("z2d", b.dependency("z2d", .{ .target = target, .optimize = optimize }).module("z2d"));
         renderer_check.root_module.linkSystemLibrary("c", .{});
         check_step.dependOn(&renderer_check.step);
         test_step.dependOn(&renderer_check.step);
@@ -189,6 +192,7 @@ fn buildMacosApp(b: *std.Build, target: std.Build.ResolvedTarget) void {
         }),
     });
     core.root_module.addImport("vt", vt);
+    core.root_module.addImport("z2d", b.dependency("z2d", .{ .target = app_target, .optimize = .ReleaseFast }).module("z2d"));
     core.root_module.linkSystemLibrary("c", .{});
 
     // Apple spells the arches differently than Zig; swiftc must target the same

@@ -9,6 +9,7 @@ const MetalBackend = @import("MetalBackend.zig");
 const TerminalSession = @import("../terminal/Session.zig");
 const Config = @import("../Config.zig");
 const url_hover = @import("../terminal/url_hover.zig");
+const sprite = @import("../renderer/sprite.zig");
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("CoreTextRenderer is macOS-only");
@@ -147,6 +148,7 @@ paint: Paint,
 /// selected.
 selection: ?GridModel.Selection = null,
 hovered_url: ?url_hover.Hit = null,
+sprite_masks: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
 
 pub fn init(options: Options) !CoreTextRenderer {
     if (options.font.size <= 0 or options.scale <= 0) return error.InvalidFontSize;
@@ -181,6 +183,8 @@ pub fn init(options: Options) !CoreTextRenderer {
 }
 
 pub fn deinit(self: *CoreTextRenderer) void {
+    self.clearSpriteMasks();
+    self.sprite_masks.deinit(self.allocator);
     self.metal.deinit();
     self.allocator.free(self.pixels);
     self.fonts.deinit();
@@ -205,6 +209,7 @@ pub fn reconfigure(self: *CoreTextRenderer, options: FontOptions) !bool {
     self.families = families;
     self.font_size = size;
     const changed = !std.meta.eql(self.metrics, metrics);
+    if (changed) self.clearSpriteMasks();
     self.metrics = metrics;
     return changed;
 }
@@ -232,6 +237,7 @@ pub fn resize(self: *CoreTextRenderer, pixel_width: u32, pixel_height: u32, scal
         self.fonts.deinit();
         self.fonts = fonts;
     }
+    if (!std.meta.eql(self.metrics, replacement_metrics)) self.clearSpriteMasks();
     self.metrics = replacement_metrics;
     self.scale = scale;
     self.pixel_width = pixel_width;
@@ -343,7 +349,54 @@ fn rasterize(
         if (draw_cell.style.invisible) continue;
 
         const font = self.fonts.select(draw_cell.style);
+        if (draw_cell.grapheme.len == 0 and sprite.hasCodepoint(draw_cell.codepoint)) {
+            try self.drawSprite(context, draw_cell, x, y);
+            const baseline = y + font.getDescent() + @max(0, (height - font.getAscent() - font.getDescent()) / 2);
+            drawDecorations(context, font, draw_cell.style, x, baseline, width);
+            continue;
+        }
         try drawCellText(context, font, draw_cell, x, y, width, self.metrics.cell_height);
+    }
+}
+
+fn clearSpriteMasks(self: *CoreTextRenderer) void {
+    var masks = self.sprite_masks.valueIterator();
+    while (masks.next()) |mask| self.allocator.free(mask.*);
+    self.sprite_masks.clearRetainingCapacity();
+}
+
+fn drawSprite(self: *CoreTextRenderer, context: *graphics.BitmapContext, cell: GridModel.Cell, x: f64, y: f64) !void {
+    const width = @as(u32, cell.width) * self.metrics.cell_width;
+    const height = self.metrics.cell_height;
+    const key = @as(u32, cell.codepoint) | (@as(u32, cell.width) << 21);
+    const mask = self.sprite_masks.get(key) orelse blk: {
+        const mask = try self.allocator.alloc(u8, @as(usize, width) * height);
+        errdefer self.allocator.free(mask);
+        const rendered = try sprite.renderAlpha(self.allocator, cell.codepoint, width, height, sprite.buildMetrics(width, height), mask);
+        std.debug.assert(rendered);
+        try self.sprite_masks.put(self.allocator, key, mask);
+        break :blk mask;
+    };
+    // Equal-coverage runs preserve the rasterizer's exact pixel edges and
+    // antialiasing without resampling or creating a CoreGraphics image per cell.
+    for (0..height) |row| {
+        var col: usize = 0;
+        while (col < width) {
+            const coverage = mask[row * width + col];
+            const start = col;
+            col += 1;
+            while (col < width and mask[row * width + col] == coverage) : (col += 1) {}
+            if (coverage == 0) continue;
+            var color = cell.style.foreground;
+            color.a = @intCast((@as(u16, color.a) * coverage + 127) / 255);
+            setFill(context, color);
+            graphics.BitmapContext.context.fillRect(context, graphics.Rect.init(
+                x + @as(f64, @floatFromInt(start)),
+                y + @as(f64, @floatFromInt(height - row - 1)),
+                @floatFromInt(col - start),
+                1,
+            ));
+        }
     }
 }
 
@@ -590,6 +643,98 @@ test "background-opacity survives into the rasterized pixels" {
     while (index < renderer.pixels.len) : (index += 4) {
         try std.testing.expectEqual(@as(u8, 255), renderer.pixels[index]);
     }
+}
+
+test "box strokes meet every cell edge across fonts and backing scales" {
+    var session: TerminalSession = undefined;
+    var context: u8 = 0;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 4,
+        .rows = 3,
+        .hooks = .{ .context = &context },
+    });
+    defer session.deinit();
+    session.feed("\x1b[38;2;255;255;255;48;2;0;0;0m\u{2500}\u{2500}\r\n\u{2502}\r\n\u{2502}");
+    var renderer = try CoreTextRenderer.init(.{
+        .allocator = std.testing.allocator,
+        .pixel_width = 400,
+        .pixel_height = 300,
+    });
+    defer renderer.deinit();
+    for ([_][]const u8{ "Menlo", "Courier New" }) |family| {
+        for ([_]f32{ 11, 19 }) |size| {
+            _ = try renderer.reconfigure(.{ .family = family, .size = size });
+            for ([_]f32{ 1, 2 }) |scale| {
+                try renderer.resize(400, 300, scale);
+                _ = try renderer.render(&session, null);
+                const cw = renderer.metrics.cell_width;
+                const ch = renderer.metrics.cell_height;
+                // Every column of the joined horizontal stroke must contain ink.
+                for (0..2 * cw) |x| {
+                    var ink: u8 = 0;
+                    for (0..ch) |y| ink = @max(ink, renderer.pixels[(y * renderer.pixel_width + x) * 4]);
+                    try std.testing.expect(ink > 127);
+                }
+                // Vertical strokes must reach both the top and bottom of each cell.
+                for (ch..3 * ch) |y| {
+                    var ink: u8 = 0;
+                    for (0..cw) |x| ink = @max(ink, renderer.pixels[(y * renderer.pixel_width + x) * 4]);
+                    try std.testing.expect(ink > 127);
+                }
+            }
+        }
+    }
+}
+
+test "sprites preserve orientation, colors, selection and metric changes" {
+    var session: TerminalSession = undefined;
+    var context: u8 = 0;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 12,
+        .rows = 2,
+        .hooks = .{ .context = &context },
+    });
+    defer session.deinit();
+    session.feed("\x1b]11;#0000ff\x07\x1b[38;2;255;0;0m\u{2580}\u{2588}\u{2500}\u{28ff}\u{e0b0}\u{25e2}\u{1fb00}");
+    var renderer = try CoreTextRenderer.init(.{
+        .allocator = std.testing.allocator,
+        .pixel_width = 640,
+        .pixel_height = 200,
+        .paint = .{ .background_alpha = 128 },
+    });
+    defer renderer.deinit();
+    _ = try renderer.render(&session, null);
+    const cw = renderer.metrics.cell_width;
+    const ch = renderer.metrics.cell_height;
+    const upper = (ch / 4 * renderer.pixel_width + cw / 2) * 4;
+    const lower = (3 * ch / 4 * renderer.pixel_width + cw / 2) * 4;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, renderer.pixels[upper..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 128, 0, 0, 128 }, renderer.pixels[lower..][0..4]);
+    try std.testing.expectEqual(@as(u32, 7), renderer.sprite_masks.count());
+    // Recoloring reuses geometry but must adopt the current selection colors.
+    renderer.selection = .{ .start_col = 0, .end_col = 0, .start_row = 0, .end_row = 0 };
+    renderer.paint.selection_foreground = .{ .r = 0, .g = 255, .b = 0 };
+    renderer.paint.selection_background = .{ .r = 255, .g = 255, .b = 0 };
+    _ = try renderer.render(&session, null);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, renderer.pixels[upper..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 255, 255 }, renderer.pixels[lower..][0..4]);
+    try std.testing.expectEqual(@as(u32, 7), renderer.sprite_masks.count());
+
+    _ = try renderer.reconfigure(.{ .size = 24 });
+    try std.testing.expectEqual(@as(u32, 0), renderer.sprite_masks.count());
+    _ = try renderer.render(&session, null);
+    const mask = renderer.sprite_masks.get(0x2580 | (1 << 21)).?;
+    try std.testing.expectEqual(renderer.metrics.cell_width * renderer.metrics.cell_height, mask.len);
+    try renderer.resize(640, 300, 2);
+    try std.testing.expectEqual(@as(u32, 0), renderer.sprite_masks.count());
+    _ = try renderer.render(&session, null);
+    try std.testing.expect(renderer.sprite_masks.count() > 0);
 }
 
 test "font-size drives the cell metrics, and reconfigure adopts a new size" {
