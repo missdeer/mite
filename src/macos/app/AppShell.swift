@@ -61,7 +61,8 @@ final class ConfigWatcher {
     private func watchFile() {
         fileSource?.cancel()
         fileSource = nil
-        guard let source = Self.makeSource(path, mask: [.write, .extend, .rename, .delete]) else { return }
+        // Truncating to an empty file can emit only NOTE_ATTRIB on macOS.
+        guard let source = Self.makeSource(path, mask: [.write, .extend, .attrib, .rename, .delete]) else { return }
         fileSource = source
         source.setEventHandler { [weak self] in self?.schedule() }
         source.resume()
@@ -86,6 +87,11 @@ final class AppModel: ObservableObject {
 
     @Published var tabs: [TabItem] = []
     @Published var selectedID: UUID?
+    @Published var launchers: [TerminalLauncher] = []
+    @Published var themes: [String] = []
+    @Published var activeTheme = ""
+    private var confirmingClose = false
+    private let windowDelegate = TerminalWindowDelegate()
 
     var selectedTab: TabItem? { tabs.first { $0.id == selectedID } }
 
@@ -94,6 +100,7 @@ final class AppModel: ObservableObject {
     private var configWatcher: ConfigWatcher?
 
     init() {
+        refreshMenus()
         newTab()
         configWatcher = ConfigWatcher { [weak self] in self?.reloadConfig() }
     }
@@ -104,6 +111,11 @@ final class AppModel: ObservableObject {
     /// user has since resized.
     func reloadConfig() {
         guard mostty_config_reload() else { return }
+        refreshMenus()
+        applyConfig()
+    }
+
+    private func applyConfig() {
         // Every tab adopts the new font first, then the on-screen tab derives the
         // grid once and broadcasts it. Doing the resize inside the loop would let
         // the active tab publish a grid before the others had the metrics for it,
@@ -120,6 +132,7 @@ final class AppModel: ObservableObject {
     /// ContainerView, which re-asserts it after SwiftUI builds the scene.
     func applyInitialWindowState() {
         guard let window = terminalWindow() else { return }
+        installWindowDelegate(window)
         if mostty_config_maximize(), !window.isZoomed { window.zoom(nil) }
         if mostty_config_fullscreen(), !window.styleMask.contains(.fullScreen) {
             window.toggleFullScreen(nil)
@@ -132,14 +145,97 @@ final class AppModel: ObservableObject {
         container?.window ?? NSApp.windows.first { $0.contentView != nil }
     }
 
-    func newTab() {
+    private func readText(_ read: (UnsafeMutablePointer<UInt8>, Int) -> Int) -> String {
+        var probe: UInt8 = 0
+        let count = read(&probe, 0)
+        guard count > 0 else { return "" }
+        var buffer = [UInt8](repeating: 0, count: count)
+        let written = read(&buffer, buffer.count)
+        return String(decoding: buffer.prefix(written), as: UTF8.self)
+    }
+
+    func refreshMenus() {
+        launchers = (0..<mostty_config_launcher_count()).map { index in
+            TerminalLauncher(
+                label: readText { mostty_config_launcher_text(index, 0, $0, $1) },
+                command: readText { mostty_config_launcher_text(index, 1, $0, $1) },
+                directory: readText { mostty_config_launcher_text(index, 2, $0, $1) })
+        }
+        themes = (0..<mostty_config_refresh_themes()).map { index in
+            readText { mostty_config_theme_name(index, $0, $1) }
+        }
+        activeTheme = readText { mostty_config_active_theme($0, $1) }
+    }
+
+    func selectTheme(_ name: String) {
+        guard mostty_config_select_theme(name) else {
+            showError("Unable to Load Theme", detail: name)
+            return
+        }
+        activeTheme = name
+        applyConfig()
+    }
+
+    func openConfig() {
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let count = mostty_config_path(&buffer, buffer.count)
+        guard count > 0 else {
+            showError("Unable to Open Configuration", detail: "The configuration path is unavailable.")
+            return
+        }
+        let url = URL(fileURLWithPath: String(decoding: buffer.prefix(count), as: UTF8.self))
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try Data().write(to: url, options: .withoutOverwriting)
+            }
+            NSWorkspace.shared.open([url], withApplicationAt: URL(fileURLWithPath: "/System/Applications/TextEdit.app"),
+                                    configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                if let error = error {
+                    DispatchQueue.main.async { self.showError("Unable to Open Configuration", detail: error.localizedDescription) }
+                }
+            }
+        } catch {
+            showError("Unable to Open Configuration", detail: error.localizedDescription)
+        }
+    }
+
+    private func showError(_ title: String, detail: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.runModal()
+    }
+
+    func toggleFullscreen() { terminalWindow()?.toggleFullScreen(nil) }
+
+    func selectTab(at index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        selectedID = tabs[index].id
+    }
+
+    func cycleTab(_ delta: Int) {
+        guard !tabs.isEmpty else { return }
+        let current = tabs.firstIndex { $0.id == selectedID } ?? 0
+        selectTab(at: (current + delta % tabs.count + tabs.count) % tabs.count)
+    }
+
+    func installWindowDelegate(_ window: NSWindow) {
+        guard window.delegate !== windowDelegate else { return }
+        windowDelegate.original = window.delegate
+        windowDelegate.model = self
+        window.delegate = windowDelegate
+    }
+
+    func newTab(launcher: TerminalLauncher? = nil) {
         let item = TabItem()
+        item.view.launcher = launcher
         item.view.onTitleChange = { [weak item] title in
             item?.title = title.isEmpty ? "Terminal" : title
         }
         item.view.onExit = { [weak self, weak item] in
             guard let self = self, let item = item else { return }
-            self.close(item.id)
+            self.close(item.id, confirm: false)
         }
         item.view.onSurfaceResize = { [weak self, weak item] pw, ph, scale in
             guard let self = self, let item = item else { return }
@@ -155,7 +251,27 @@ final class AppModel: ObservableObject {
         if let id = selectedID { close(id) }
     }
 
-    func close(_ id: UUID) {
+    func confirmClose(_ candidates: [TabItem]) -> Bool {
+        guard !confirmingClose else { return false }
+        guard mostty_config_confirm_close(), candidates.contains(where: { $0.view.hasActiveSession }) else { return true }
+        confirmingClose = true
+        defer {
+            confirmingClose = false
+            if tabs.isEmpty { DispatchQueue.main.async { NSApp.terminate(nil) } }
+        }
+        let alert = NSAlert()
+        alert.messageText = candidates.count == 1 ? "Close this terminal session?" : "Close all terminal sessions?"
+        alert.informativeText = "Running processes will be terminated."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Close")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    func close(_ id: UUID, confirm: Bool = true) {
+        guard let candidate = tabs.first(where: { $0.id == id }) else { return }
+        if confirm, !confirmClose([candidate]) { return }
+        // The alert runs a nested event loop; a child can exit while it is open.
         guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
         let item = tabs.remove(at: idx)
         item.view.shutdown()
@@ -169,6 +285,25 @@ final class AppModel: ObservableObject {
         for t in tabs { t.view.shutdown() }
         tabs.removeAll()
     }
+}
+
+/// Preserve SwiftUI's window delegate callbacks while intercepting close requests.
+final class TerminalWindowDelegate: NSObject, NSWindowDelegate {
+    weak var original: NSWindowDelegate?
+    weak var model: AppModel?
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard let model = model, model.confirmClose(model.tabs) else { return false }
+        guard original?.windowShouldClose?(sender) ?? true else { return false }
+        model.shutdownAll()
+        return true
+    }
+
+    override func responds(to selector: Selector!) -> Bool {
+        super.responds(to: selector) || (original?.responds(to: selector) ?? false)
+    }
+
+    override func forwardingTarget(for selector: Selector!) -> Any? { original }
 }
 
 /// Hosts the selected tab's persistent terminal view, swapping it on selection
@@ -201,6 +336,9 @@ final class ContainerView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         applyWindowAppearance()
+        if let window = window {
+            DispatchQueue.main.async { AppModel.shared.installWindowDelegate(window) }
+        }
     }
 
     /// `background-opacity < 1` only shows through if the window itself stops
@@ -272,6 +410,11 @@ struct TabBar: View {
             }
             .buttonStyle(.borderless)
             .help("New Tab")
+            .contextMenu {
+                ForEach(Array(model.launchers.enumerated()), id: \.offset) { _, launcher in
+                    Button(launcher.label) { model.newTab(launcher: launcher) }
+                }
+            }
             Spacer()
         }
         .padding(.horizontal, 8)
@@ -319,6 +462,9 @@ struct ContentView: View {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        AppModel.shared.confirmClose(AppModel.shared.tabs) ? .terminateNow : .terminateCancel
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationWillTerminate(_ notification: Notification) { AppModel.shared.shutdownAll() }
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -329,7 +475,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+#if !MOSTTY_APP_TESTS
 @main
+#endif
 struct MosttyApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var model = AppModel.shared
@@ -347,6 +495,38 @@ struct MosttyApp: App {
                 Button("Close Tab") { model.closeSelected() }
                     .keyboardShortcut("w", modifiers: .command)
             }
+            CommandGroup(replacing: .appSettings) {
+                Button("Open Configuration File") { model.openConfig() }
+                    .keyboardShortcut(",", modifiers: .command)
+                Menu("Theme") {
+                    ForEach(Array(Set(model.themes.map { themeBucket($0) })).sorted(), id: \.self) { bucket in
+                        Menu(bucket) {
+                            ForEach(model.themes.filter { themeBucket($0) == bucket }, id: \.self) { name in
+                                Button { model.selectTheme(name) } label: {
+                                    if name == model.activeTheme { Label(name, systemImage: "checkmark") }
+                                    else { Text(name) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            CommandMenu("Tabs") {
+                Button("Previous Tab") { model.cycleTab(-1) }
+                    .keyboardShortcut("[", modifiers: [.command, .shift])
+                Button("Next Tab") { model.cycleTab(1) }
+                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                Divider()
+                ForEach(1...9, id: \.self) { number in
+                    Button("Select Tab \(number)") { model.selectTab(at: number - 1) }
+                        .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: .command)
+                        .disabled(model.tabs.count < number)
+                }
+            }
+            CommandGroup(after: .windowSize) {
+                Button("Toggle Full Screen") { model.toggleFullscreen() }
+                    .keyboardShortcut("f", modifiers: [.command, .control])
+            }
             CommandGroup(replacing: .pasteboard) {
                 Button("Copy") {
                     NSApp.sendAction(#selector(MosttyTerminalView.copy(_:)), to: nil, from: nil)
@@ -358,5 +538,12 @@ struct MosttyApp: App {
                 .keyboardShortcut("v", modifiers: .command)
             }
         }
+    }
+
+    private func themeBucket(_ name: String) -> String {
+        guard let first = name.uppercased().first else { return "#" }
+        if ("A"..."Z").contains(String(first)) { return String(first) }
+        if ("0"..."9").contains(String(first)) { return "0-9" }
+        return "#"
     }
 }

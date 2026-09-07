@@ -58,6 +58,10 @@ MosttyTab *mostty_tab_create(uint32_t w, uint32_t h, float scale) {
     assert(tab_count < sizeof(tabs));
     return (MosttyTab *)&tabs[tab_count++];
 }
+MosttyTab *mostty_tab_create_with_launcher(uint32_t w, uint32_t h, float scale,
+                                         const char *command, const char *directory) {
+    return mostty_tab_create(w, h, scale);
+}
 MosttyTab *clipboard_test_created_tab(void) { return tab_count ? (MosttyTab *)&tabs[tab_count - 1] : NULL; }
 MosttyTab *clipboard_test_write_tab(void) { return write_tab; }
 void mostty_tab_destroy(MosttyTab *tab) {}

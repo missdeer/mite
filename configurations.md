@@ -13,6 +13,13 @@ macOS     ~/Library/Application Support/com.dfordsoft.mostty.terminal/Config
 The file has no extension. On Windows you can open (and create) it from the
 window's system menu via **Open Settings File…**, which launches it in Notepad
 and creates the file and its parent folder if missing.
+On macOS, **Mostty > Open Configuration File** (`Cmd+,`) opens it in TextEdit
+and creates it if needed. **Mostty > Theme** switches all tabs immediately;
+this choice lasts until the next config reload or application restart.
+
+macOS tab navigation uses `Cmd+1` through `Cmd+9`, and `Cmd+Shift+[` /
+`Cmd+Shift+]` cycle backward / forward. Right-click **+** to select a configured
+launcher. `Ctrl+Cmd+F` toggles native fullscreen.
 
 `theme = <name>` resolves against a `themes/` directory in two places, the first
 match winning: next to the config file (`…\Mostty\themes` on Windows,
@@ -65,6 +72,7 @@ never warned about — but some only have an effect on Windows:
 | `selection-background`, `selection-foreground` | yes | yes |
 | `background-opacity`, `background-blur` | yes | yes |
 | `maximize`, `fullscreen` | yes | yes |
+| `confirm-close-surface` | no | yes |
 | `render-interval-local-ms` | yes | yes |
 | `launcher`, `env` | yes | yes |
 | `emoji-font-family`, `font-ligatures`, `font-feature`, `font-codepoint-map`, `font-style*`, `font-synthetic-style` | yes | no — the macOS renderer draws per cell and has no shaping pipeline |
@@ -408,6 +416,12 @@ state rather than a normal-sized window.
 
 **Hot-reload:** no (startup only). Editing the key on a running window does
 not maximize/restore it — use the title-bar maximize button or `Win+Up`.
+
+### `confirm-close-surface`
+
+On macOS, prompt before closing a tab or window with a running session, or
+quitting the application. Default: `true`. Naturally exited sessions close
+without prompting. Set `confirm-close-surface = false` to disable confirmation.
 
 ### `fullscreen`
 

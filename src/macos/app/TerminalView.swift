@@ -2,6 +2,12 @@ import AppKit
 import Metal
 import QuartzCore
 
+struct TerminalLauncher {
+    let label: String
+    let command: String
+    let directory: String
+}
+
 /// One terminal surface: owns a bridge tab (PTY + renderer), presents frames
 /// through a CAMetalLayer, and captures keyboard / mouse / IME input. All bridge
 /// calls except the background reader happen on the main thread.
@@ -54,6 +60,12 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
     var onTitleChange: ((String) -> Void)?
     var onExit: (() -> Void)?
+    var launcher: TerminalLauncher?
+    var hasActiveSession: Bool {
+        guard alive, !terminated, let tab = tab else { return false }
+        var code: Int32 = 0
+        return !mostty_tab_poll_exit(tab, &code)
+    }
     /// Fired after a window-driven resize so sibling tabs can adopt the same
     /// grid immediately, keeping every session consistent with the window.
     var onSurfaceResize: ((UInt32, UInt32, Float) -> Void)?
@@ -108,7 +120,13 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         guard tab == nil, window != nil, bounds.width > 1, bounds.height > 1 else { return }
         let scale = currentScale()
         let (pw, ph) = pixelSize()
-        guard let t = mostty_tab_create(pw, ph, Float(scale)) else { return }
+        let created: OpaquePointer?
+        if let launcher = launcher {
+            created = mostty_tab_create_with_launcher(pw, ph, Float(scale), launcher.command, launcher.directory)
+        } else {
+            created = mostty_tab_create(pw, ph, Float(scale))
+        }
+        guard let t = created else { return }
         tab = t
 
         guard let devPtr = mostty_tab_metal_device(t),

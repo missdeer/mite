@@ -8,6 +8,8 @@
 typedef struct MosttyTab MosttyTab;
 
 MosttyTab *mostty_tab_create(uint32_t pixel_width, uint32_t pixel_height, float scale);
+MosttyTab *mostty_tab_create_with_launcher(uint32_t pixel_width, uint32_t pixel_height,
+                                         float scale, const char *command, const char *directory);
 void mostty_tab_destroy(MosttyTab *tab);
 
 /* Configuration. Values are read from the file the app watches; `reload` returns
@@ -18,6 +20,15 @@ float mostty_config_background_opacity(void);
 bool mostty_config_background_blur(void);
 bool mostty_config_maximize(void);
 bool mostty_config_fullscreen(void);
+bool mostty_config_confirm_close(void);
+size_t mostty_config_launcher_count(void);
+/* Launcher fields: 0 label, 1 command, 2 directory; cap == 0 queries length. */
+size_t mostty_config_launcher_text(size_t index, uint32_t field, uint8_t *buf, size_t cap);
+size_t mostty_config_refresh_themes(void);
+/* Text accessors return the required length for cap == 0, or zero if too small. */
+size_t mostty_config_theme_name(size_t index, uint8_t *buf, size_t cap);
+size_t mostty_config_active_theme(uint8_t *buf, size_t cap);
+bool mostty_config_select_theme(const char *name);
 uint32_t mostty_config_render_interval_ms(void);
 /* Returns true when the cell metrics changed and the drawable must be re-synced. */
 bool mostty_tab_apply_config(MosttyTab *tab);

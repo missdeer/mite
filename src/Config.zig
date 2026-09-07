@@ -260,6 +260,8 @@ maximize: bool = false,
 // mode (the Raymond Chen recipe) so the distinction is meaningless on Windows
 // and shared Ghostty configs shouldn't warn.
 fullscreen: bool = false,
+// macOS prompts before closing a running session unless explicitly disabled.
+confirm_close_surface: bool = true,
 
 // Render-throttle frame interval (ms). Two independent caps because the
 // "right" cadence differs: local D3D presents are nearly free at 60 FPS,
@@ -392,6 +394,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
     var background_image_repeat = defaults.background_image_repeat;
     var maximize = defaults.maximize;
     var fullscreen = defaults.fullscreen;
+    var confirm_close_surface = defaults.confirm_close_surface;
     var render_interval_local_ms = defaults.render_interval_local_ms;
     var render_interval_remote_ms = defaults.render_interval_remote_ms;
     var gpu = defaults.gpu;
@@ -603,6 +606,11 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
                 std.log.warn("config: {s}:{}: invalid fullscreen '{s}' (expect true/false or non-native*)", .{ source_name, line_no, value });
                 continue;
             };
+        } else if (std.mem.eql(u8, key, "confirm-close-surface")) {
+            confirm_close_surface = parseStrictBool(value) orelse {
+                std.log.warn("config: {s}:{}: invalid confirm-close-surface '{s}' (expect true/false)", .{ source_name, line_no, value });
+                continue;
+            };
         } else if (std.mem.eql(u8, key, "font-codepoint-map")) {
             parseCodepointMap(a, value, &codepoint_maps) catch {
                 std.log.warn("config: {s}:{}: invalid font-codepoint-map '{s}'", .{ source_name, line_no, value });
@@ -666,6 +674,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
         .background_image_repeat = background_image_repeat,
         .maximize = maximize,
         .fullscreen = fullscreen,
+        .confirm_close_surface = confirm_close_surface,
         .render_interval_local_ms = render_interval_local_ms,
         .render_interval_remote_ms = render_interval_remote_ms,
         .gpu = gpu,
@@ -1100,8 +1109,8 @@ pub fn loadThemeColorsByName(gpa: std.mem.Allocator, name: []const u8) ?ThemeCol
     return theme;
 }
 
-// Lists every theme file basename under both search dirs (LOCALAPPDATA first,
-// then exeDir). De-duplicates by basename (LOCALAPPDATA wins, matching
+// Lists every theme file basename under both search dirs (user first,
+// then bundled). De-duplicates by basename (user wins, matching
 // findThemeFile precedence) and sorts case-insensitively. Returns a gpa-owned
 // outer slice plus gpa-owned name strings — caller frees each name and the
 // outer slice.
@@ -1109,16 +1118,8 @@ pub fn listThemeNames(gpa: std.mem.Allocator) [][]u8 {
     var names: std.ArrayListUnmanaged([]u8) = .empty;
     defer names.deinit(gpa);
 
-    if (envVarOwned(gpa, "LOCALAPPDATA")) |lad| {
-        defer gpa.free(lad);
-        const dir = std.fs.path.join(gpa, &.{ lad, "Mostty", "themes" }) catch oom();
-        defer gpa.free(dir);
-        appendThemesFromDir(gpa, dir, &names);
-    } else |_| {}
-
-    if (exeDir(gpa)) |d| {
-        defer gpa.free(d);
-        const dir = std.fs.path.join(gpa, &.{ d, "themes" }) catch oom();
+    for ([_]*const fn (std.mem.Allocator) ?[]const u8{ &userThemeDir, &bundledThemeDir }) |resolve| {
+        const dir = resolve(gpa) orelse continue;
         defer gpa.free(dir);
         appendThemesFromDir(gpa, dir, &names);
     }
@@ -1357,6 +1358,17 @@ test "omitted settings and a missing config file retain field defaults" {
             try std.testing.expectEqualDeep(@field(defaults, field), @field(cfg, field));
         }
     }
+}
+
+test "close confirmation defaults on and only valid configuration disables it" {
+    for ([_][]const u8{ "", "confirm-close-surface = true", "confirm-close-surface = invalid" }) |source| {
+        var cfg = parse(std.testing.allocator, source, "test");
+        defer cfg.deinit();
+        try std.testing.expect(cfg.confirm_close_surface);
+    }
+    var cfg = parse(std.testing.allocator, "confirm-close-surface = false", "test");
+    defer cfg.deinit();
+    try std.testing.expect(!cfg.confirm_close_surface);
 }
 
 test "parseHex accepts #RRGGBB and RRGGBB, rejects bad length" {

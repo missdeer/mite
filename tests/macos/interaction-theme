@@ -1,0 +1,4 @@
+background = #123456
+foreground = #abcdef
+selection-background = #345678
+palette = 1=#bb2200

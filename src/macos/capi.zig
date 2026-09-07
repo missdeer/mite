@@ -41,7 +41,7 @@ const Tab = struct {
 // config's strings live in, so callers copy values out instead of borrowing.
 var loaded_config: ?Config = null;
 
-fn config() *const Config {
+fn config() *Config {
     if (loaded_config == null) loaded_config = Config.loadDefault(allocator);
     return &loaded_config.?;
 }
@@ -82,13 +82,26 @@ const optionalRgba = GridModel.optionalRgba;
 /// PTY, VT, and renderer agree on dimensions from the first frame. Returns null
 /// on any failure (renderer, Metal, or shell spawn).
 export fn mostty_tab_create(pixel_width: u32, pixel_height: u32, scale: f32) ?*Tab {
-    return createTab(pixel_width, pixel_height, scale) catch null;
+    const cfg = config();
+    const launcher = if (cfg.launchers.len > 0) &cfg.launchers[0] else null;
+    return createTab(pixel_width, pixel_height, scale, launcher) catch null;
+}
+
+/// The host copies launcher values when building the menu, so a config reload
+/// cannot change the selected command while the menu is open.
+export fn mostty_tab_create_with_launcher(pixel_width: u32, pixel_height: u32, scale: f32, command: [*:0]const u8, directory: [*:0]const u8) ?*Tab {
+    const launcher: Config.Launcher = .{
+        .label = "",
+        .command_line = std.mem.span(command),
+        .working_directory = std.mem.span(directory),
+    };
+    return createTab(pixel_width, pixel_height, scale, &launcher) catch null;
 }
 
 // Split out so `errdefer` runs on failure: the exported wrapper returns an
 // optional, and `return null` is a normal (not error) return, which would skip
 // any errdefer cleanup and leak the Tab plus its renderer resources.
-fn createTab(pixel_width: u32, pixel_height: u32, scale: f32) !*Tab {
+fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, launcher: ?*const Config.Launcher) !*Tab {
     const cfg = config();
 
     const tab = try allocator.create(Tab);
@@ -107,11 +120,9 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32) !*Tab {
     const grid = tab.renderer.gridSize();
     if (grid.cols == 0 or grid.rows == 0) return error.EmptyGrid;
 
-    // MOSTTY-51: a new tab's shell starts in the configured working directory
-    // (the first launcher's, matching the Windows default-tab choice) or $HOME.
-    const working_directory = try initialWorkingDirectory(cfg);
+    const working_directory = try initialWorkingDirectory(launcher);
     defer if (working_directory) |wd| allocator.free(wd);
-    const command = try launcherCommand(cfg);
+    const command = try launcherCommand(launcher);
     defer if (command) |value| allocator.free(value);
 
     try tab.pty.init(.{
@@ -129,14 +140,14 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32) !*Tab {
     return tab;
 }
 
-// Resolves the initial CWD for a new tab: the first configured launcher's
+// Resolves the initial CWD for a new tab: the selected launcher's
 // working_directory when set, otherwise $HOME. Returns null (inherit the
 // process CWD) only when neither is available. Caller owns the returned slice.
 // Propagates OOM rather than swallowing it, so a new tab never silently lands
 // in the wrong directory under allocation failure.
-fn initialWorkingDirectory(cfg: *const Config) std.mem.Allocator.Error!?[:0]u8 {
-    if (cfg.launchers.len > 0) {
-        const wd = cfg.launchers[0].working_directory;
+fn initialWorkingDirectory(launcher: ?*const Config.Launcher) std.mem.Allocator.Error!?[:0]u8 {
+    if (launcher) |item| {
+        const wd = item.working_directory;
         if (wd.len > 0) return try allocator.dupeZ(u8, wd);
     }
     const home = std.c.getenv("HOME") orelse return null;
@@ -145,11 +156,10 @@ fn initialWorkingDirectory(cfg: *const Config) std.mem.Allocator.Error!?[:0]u8 {
     return try allocator.dupeZ(u8, span);
 }
 
-// The first launcher's command line, matching the Windows default-tab choice.
+// The selected launcher's command line.
 // Null keeps the plain login shell. Caller owns the returned slice.
-fn launcherCommand(cfg: *const Config) std.mem.Allocator.Error!?[:0]u8 {
-    if (cfg.launchers.len == 0) return null;
-    const command_line = cfg.launchers[0].command_line;
+fn launcherCommand(launcher: ?*const Config.Launcher) std.mem.Allocator.Error!?[:0]u8 {
+    const command_line = (launcher orelse return null).command_line;
     if (command_line.len == 0) return null;
     return try allocator.dupeZ(u8, command_line);
 }
@@ -204,6 +214,65 @@ export fn mostty_config_maximize() bool {
 
 export fn mostty_config_fullscreen() bool {
     return config().fullscreen;
+}
+
+export fn mostty_config_confirm_close() bool {
+    return config().confirm_close_surface;
+}
+
+export fn mostty_config_launcher_count() usize {
+    return config().launchers.len;
+}
+
+export fn mostty_config_launcher_text(index: usize, field: u32, buf: [*]u8, cap: usize) usize {
+    const cfg = config();
+    if (index >= cfg.launchers.len) return 0;
+    const launcher = cfg.launchers[index];
+    return copyText(switch (field) {
+        0 => launcher.label,
+        1 => launcher.command_line,
+        2 => launcher.working_directory,
+        else => return 0,
+    }, buf, cap);
+}
+
+fn copyText(value: []const u8, buf: [*]u8, cap: usize) usize {
+    if (cap == 0) return value.len;
+    if (cap < value.len) return 0;
+    @memcpy(buf[0..value.len], value);
+    return value.len;
+}
+
+var theme_names: ?[][]u8 = null;
+
+export fn mostty_config_refresh_themes() usize {
+    if (theme_names) |names| {
+        for (names) |name| allocator.free(name);
+        allocator.free(names);
+    }
+    theme_names = Config.listThemeNames(allocator);
+    return @min(theme_names.?.len, 1024);
+}
+
+export fn mostty_config_theme_name(index: usize, buf: [*]u8, cap: usize) usize {
+    const names = theme_names orelse return 0;
+    if (index >= @min(names.len, 1024)) return 0;
+    return copyText(names[index], buf, cap);
+}
+
+export fn mostty_config_active_theme(buf: [*]u8, cap: usize) usize {
+    return copyText(config().theme_name orelse "", buf, cap);
+}
+
+export fn mostty_config_select_theme(name: [*:0]const u8) bool {
+    const value = std.mem.span(name);
+    var colors = Config.loadThemeColorsByName(allocator, value) orelse return false;
+    const cfg = config();
+    const owned = cfg.arena.?.allocator().dupe(u8, value) catch return false;
+    cfg.color_overrides.applyTo(&colors);
+    cfg.theme = colors;
+    cfg.theme_name = owned;
+    return true;
 }
 
 /// Frame interval for the host's render timer. macOS has no remote-session
@@ -939,7 +1008,7 @@ test "default config reaches a real renderer's font and pixel alpha" {
     const previous = loaded_config;
     loaded_config = cfg;
     defer loaded_config = previous;
-    const tab = try createTab(320, 96, 1);
+    const tab = try createTab(320, 96, 1, null);
     defer mostty_tab_destroy(tab);
     try std.testing.expectEqual((Config{}).font_size_pt.?, tab.renderer.font_size);
     try std.testing.expectEqualStrings((Config{}).font_families[0], tab.renderer.families.names[0]);
@@ -1004,12 +1073,13 @@ test "launcherCommand replaces the login shell only when a command line is set" 
     for ([_][]const u8{ "", "launcher = Shell | | /usr\n" }) |source| {
         var cfg = Config.parse(allocator, source, "test");
         defer cfg.deinit();
-        try std.testing.expectEqual(@as(?[:0]u8, null), try launcherCommand(&cfg));
+        const launcher = if (cfg.launchers.len > 0) &cfg.launchers[0] else null;
+        try std.testing.expectEqual(@as(?[:0]u8, null), try launcherCommand(launcher));
     }
 
     var cfg = Config.parse(allocator, "launcher = Shell | htop -d 5 | /usr\n", "test");
     defer cfg.deinit();
-    const command = try launcherCommand(&cfg) orelse return error.TestUnexpectedResult;
+    const command = try launcherCommand(&cfg.launchers[0]) orelse return error.TestUnexpectedResult;
     defer allocator.free(command);
     try std.testing.expectEqualStrings("htop -d 5", command);
 }
@@ -1018,7 +1088,7 @@ test "initialWorkingDirectory uses the first launcher's directory when set" {
     // MOSTTY-51: a configured launcher directory wins over $HOME.
     var cfg = Config.parse(allocator, "launcher = My Shell | /bin/zsh | /usr\n", "test");
     defer cfg.deinit();
-    const wd = try initialWorkingDirectory(&cfg) orelse return error.TestUnexpectedResult;
+    const wd = try initialWorkingDirectory(&cfg.launchers[0]) orelse return error.TestUnexpectedResult;
     defer allocator.free(wd);
     try std.testing.expectEqualStrings("/usr", wd);
 }
@@ -1030,10 +1100,85 @@ test "initialWorkingDirectory falls back to $HOME without a configured directory
     for ([_][]const u8{ "", "launcher = My Shell | /bin/zsh |\n" }) |src| {
         var cfg = Config.parse(allocator, src, "test");
         defer cfg.deinit();
-        const wd = try initialWorkingDirectory(&cfg) orelse return error.TestUnexpectedResult;
+        const launcher = if (cfg.launchers.len > 0) &cfg.launchers[0] else null;
+        const wd = try initialWorkingDirectory(launcher) orelse return error.TestUnexpectedResult;
         defer allocator.free(wd);
         try std.testing.expectEqualStrings(home, wd);
     }
+}
+
+test "launcher menu exposes each configured choice and uses its command and directory" {
+    var cfg = Config.parse(allocator, "launcher = First | echo first | /usr\nlauncher = Second | echo second | /var\nconfirm-close-surface = false\n", "test");
+    defer cfg.deinit();
+    const previous = loaded_config;
+    loaded_config = cfg;
+    defer loaded_config = previous;
+    try std.testing.expect(!mostty_config_confirm_close());
+    try std.testing.expectEqual(@as(usize, 2), mostty_config_launcher_count());
+    var buf: [64]u8 = undefined;
+    const n = mostty_config_launcher_text(1, 0, &buf, buf.len);
+    try std.testing.expectEqualStrings("Second", buf[0..n]);
+    try std.testing.expectEqual(@as(usize, 6), mostty_config_launcher_text(1, 0, &buf, 0));
+    try std.testing.expectEqual(@as(usize, 0), mostty_config_launcher_text(1, 0, &buf, 1));
+    try std.testing.expectEqual(@as(usize, 0), mostty_config_launcher_text(2, 0, &buf, buf.len));
+    const command = (try launcherCommand(&cfg.launchers[1])).?;
+    defer allocator.free(command);
+    const directory = (try initialWorkingDirectory(&cfg.launchers[1])).?;
+    defer allocator.free(directory);
+    try std.testing.expectEqualStrings("echo second", command);
+    try std.testing.expectEqualStrings("/var", directory);
+}
+
+test "launcher bridge starts the chosen command in its directory and reports natural exit" {
+    const tab = mostty_tab_create_with_launcher(640, 240, 1, "printf 'launcher-ok:'; pwd", "/usr") orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    var buffer: [4096]u8 = undefined;
+    var eof = false;
+    for (0..200) |_| {
+        const n = mostty_tab_read(tab, &buffer, buffer.len);
+        if (n == -2) continue;
+        if (n <= 0) {
+            eof = true;
+            break;
+        }
+        mostty_tab_feed(tab, &buffer, @intCast(n));
+    }
+    try std.testing.expect(eof);
+    const contents = try tab.pty.terminal.term.plainString(allocator);
+    defer allocator.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "launcher-ok:/usr") != null);
+    _ = try tab.pty.wait();
+    var code: i32 = undefined;
+    try std.testing.expect(mostty_tab_poll_exit(tab, &code));
+}
+
+test "theme choice rebases all sessions while preserving explicit config and OSC colors" {
+    const previous = loaded_config;
+    loaded_config = Config.parse(allocator, "foreground = #010203\n", "test");
+    defer {
+        loaded_config.?.deinit();
+        loaded_config = previous;
+    }
+    const first = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(first);
+    const second = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(second);
+    const osc = "\x1b]11;#778899\x07";
+    mostty_tab_feed(second, osc.ptr, osc.len);
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(runtimeIo(), "tests/macos/interaction-theme", allocator);
+    defer allocator.free(path);
+    try std.testing.expect(mostty_config_select_theme(path));
+    for ([_]*Tab{ first, second }) |tab| {
+        _ = mostty_tab_apply_config(tab);
+        try std.testing.expectEqual(Config.u24ToRgb(0x010203), tab.pty.terminal.term.colors.foreground.get().?);
+        try std.testing.expectEqual(Config.u24ToRgb(0xbb2200), tab.pty.terminal.term.colors.palette.current[1]);
+        try std.testing.expectEqual(optionalRgba(0x345678), tab.renderer.paint.selection_background);
+    }
+    try std.testing.expectEqual(Config.u24ToRgb(0x123456), first.pty.terminal.term.colors.background.get().?);
+    try std.testing.expectEqual(Config.u24ToRgb(0x778899), second.pty.terminal.term.colors.background.get().?);
+    const before = config().theme;
+    try std.testing.expect(!mostty_config_select_theme("/MOSTTY-61-nonexistent-theme"));
+    try std.testing.expectEqualDeep(before, config().theme);
 }
 
 test "mostty_tab_title mirrors the Windows path-basename rule" {
