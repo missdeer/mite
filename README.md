@@ -42,7 +42,11 @@ Mostty.exe --renderer native-vulkan --background-opacity 1 --background-blur fal
 ```
 
 `--background-opacity <0..1>` and `--background-blur <true|false>` override the
-matching config values for that process.
+matching config values at startup without editing the file; a later config
+reload can replace those opacity and blur overrides. The active renderer stays
+fixed until restart. See [Command-line options](configurations.md#command-line-options)
+for all accepted options, including legacy font options that are parsed but
+not applied.
 
 Renderer changes require a restart. Unsupported drivers or presentation capabilities are reported at startup; research backends may offer an explicit D3D11 fallback but never switch silently. See [Configuration](configurations.md#renderer) for requirements and backend-specific behavior.
 
@@ -100,6 +104,11 @@ CI downloads `Microsoft.Windows.Console.ConPTY.1.23.251216003.nupkg` from the Mi
 A native SwiftUI/AppKit application built on the same platform-neutral terminal core. The Zig core owns the PTY, the `libghostty-vt` state machine, and the grid model behind a C-ABI boundary (`src/macos/capi.zig`); text is shaped and rasterized with CoreText and presented through a Metal (`CAMetalLayer`) surface, so terminal behavior stays consistent with the Windows build. Requires macOS 13 or newer. Building requires full Xcode 26 or newer for the Icon Composer asset compiler (`actool`). `zig build` on a macOS host assembles a launchable `Mostty.app` into `zig-out/`, and CI publishes an arm64 `.dmg` on tagged releases.
 
 #### macOS features
+
+Configuration is read from `~/Library/Application Support/com.dfordsoft.mostty.terminal/Config`;
+use **Mostty > Open Configuration File** (`Cmd+,`) to open or create it.
+See [Configuration](configurations.md#platform-support) for supported keys,
+platform differences, and examples; macOS does not use the Windows command-line overrides.
 
 - Multiple tabs in one window, each with its own PTY-backed shell process, VT state, and title. The tab title tracks the running program / current path.
 - Mouse selection with copy to the clipboard, mouse-wheel scrollback, and paste with a bracketed-paste guard that strips embedded paste-end markers (mirrors the Windows behavior).

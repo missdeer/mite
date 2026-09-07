@@ -1,7 +1,8 @@
 # Mostty Configuration
 
-Mostty is configured through a single plain-text config file. There are no
-working command-line options today; everything below lives in the config file.
+Mostty is configured through a single plain-text config file on Windows and
+macOS. Windows also supports the startup command-line overrides listed below.
+See [Platform support](#platform-support) for each key's applicability.
 
 ## File location
 
@@ -27,6 +28,29 @@ match winning: next to the config file (`…\Mostty\themes` on Windows,
 then the themes shipped with the application (next to the executable on Windows,
 `Mostty.app/Contents/Resources/themes` on macOS).
 
+## Command-line options
+
+The Windows executable accepts these options:
+
+| Option | Effect |
+| --- | --- |
+| `--renderer <backend>` | Overrides the configured backend at startup; accepts `d3d11`, `d3d12`, `opengl`, `pure-opengl`, `vulkan`, or `native-vulkan`. |
+| `--background-opacity <0..1>` | Overrides the configured background opacity at startup. |
+| `--background-blur <true\|false>` | Overrides the configured blur at startup; accepts only `true` or `false` (case-insensitive), unlike the broader config-file syntax. |
+| `-h`, `--help` | Prints usage and exits. |
+| `--ttf <path>`, `--font-size <float>` | Parsed legacy options, but not applied to rendering; use `font-family` and `font-size` in the config file. |
+
+For example, to use an opaque native Vulkan window:
+
+```powershell
+Mostty.exe --renderer native-vulkan --background-opacity 1 --background-blur false
+```
+
+These overrides do not edit the config file. A later config reload can replace
+the opacity and blur overrides; the active renderer stays fixed until restart.
+The macOS application does not use this command-line parser and has no
+equivalent configuration overrides; use its config file.
+
 ## Syntax
 
 - One `key = value` per line. Whitespace around the key and value is trimmed.
@@ -34,7 +58,7 @@ then the themes shipped with the application (next to the executable on Windows,
 - There is **no comment syntax**. A line without `=` is reported as a warning
   and skipped, so do not use `#`/`//` comment lines.
 - Unknown keys produce a warning. A small set of Ghostty keys that Mostty has no
-  feature for is accepted-and-ignored silently (so a ported Ghostty config does
+  feature for is accepted-and-ignored silently on both platforms (so a ported Ghostty config does
   not spam warnings): `split-*`, `search-*`, `window-titlebar-*`,
   `unfocused-split-fill`, `palette-generate`, `palette-harmonious`, `config-file`,
   `font-thicken`, `font-thicken-strength`, `font-shaping-break`.
@@ -44,7 +68,7 @@ then the themes shipped with the application (next to the executable on Windows,
 The file is watched live. Saving it re-applies changes without a restart:
 
 - **Font** changes rebuild the renderer and reflow every tab.
-- **Font ligature** changes repaint immediately without resizing tabs.
+- **Font ligature** changes repaint immediately without resizing tabs (Windows only).
 - **Theme/color** changes re-baseline every tab's colors (preserving any live
   `OSC 10/11/12/4` color overrides an app set at runtime).
 - **Launchers** are read on demand, so they take effect immediately.
@@ -61,12 +85,14 @@ re-applying them would fight a window you have since resized.
 
 ## Platform support
 
-Every key is parsed on both platforms — an unsupported key is silently ignored,
-never warned about — but some only have an effect on Windows:
+Both platforms read the config file. The table covers every supported key;
+`no` means a valid value is parsed but has no effect on that platform, without
+a platform-support warning. Invalid values can still produce warnings, and
+unknown keys follow the rules in [Syntax](#syntax).
 
 | Key | Windows | macOS |
 | --- | --- | --- |
-| `font-family`, `font-size`, `font-family-bold` / `-italic` / `-bold-italic` | yes | yes (only the first `font-family` entry; the OS resolves missing glyphs) |
+| `font-family`, `font-size`, `font-family-bold`, `font-family-italic`, `font-family-bold-italic` | yes | yes (only the first `font-family` entry; the OS resolves missing glyphs) |
 | `theme`, `background`, `foreground`, `palette` | yes | yes |
 | `cursor-color`, `cursor-text` | yes | yes |
 | `selection-background`, `selection-foreground` | yes | yes |
@@ -75,11 +101,15 @@ never warned about — but some only have an effect on Windows:
 | `confirm-close-surface` | no | yes |
 | `render-interval-local-ms` | yes | yes |
 | `launcher`, `env` | yes | yes |
-| `emoji-font-family`, `font-ligatures`, `font-feature`, `font-codepoint-map`, `font-style*`, `font-synthetic-style` | yes | no — the macOS renderer draws per cell and has no shaping pipeline |
+| `emoji-font-family`, `font-ligatures`, `font-feature`, `font-codepoint-map`, `font-style`, `font-style-bold`, `font-style-italic`, `font-style-bold-italic`, `font-synthetic-style` | yes | no — macOS uses CoreText per cell without these font controls |
 | `tabbar-font-family`, `tabbar-font-size` | yes | no |
-| `background-image*` | yes | no |
+| `background-image`, `background-image-opacity`, `background-image-position`, `background-image-fit`, `background-image-repeat` | yes | no |
 | `render-interval-remote-ms` | yes | no — macOS has no remote-session concept |
 | `gpu`, `renderer` | yes | no — Direct3D / OpenGL / Vulkan backend selection is Windows-only |
+
+The key descriptions below follow this table. DirectWrite, DWM, Win32 menus,
+and Windows paths describe Windows behavior; shared keys with different macOS
+behavior have explicit platform notes.
 
 ---
 
@@ -93,7 +123,8 @@ supported.
 ### `font-family`
 
 Comma-separated list of font family names. May be repeated; all entries
-accumulate into a fallback chain (first match wins per glyph).
+accumulate into a fallback chain on Windows (first match wins per glyph).
+macOS uses only the first family and lets CoreText resolve missing glyphs.
 
 ```
 font-family = JetBrains Mono, Consolas
@@ -198,8 +229,10 @@ font-family-bold-italic = Cascadia Code
 
 Each is a single family — comma lists are not parsed here. The regular
 `font-family` chain still acts as the fallback for codepoints the style-family
-lacks, so a style-family covering only ASCII gracefully degrades to the main
-font for CJK / icons / emoji.
+lacks on Windows, so a style-family covering only ASCII gracefully degrades to
+the main font for CJK / icons / emoji. On macOS, CoreText applies the style's
+bold/italic traits to the selected family (or the regular family when unset)
+and uses system glyph fallback; `font-synthetic-style` has no effect.
 
 ### `font-style` / `font-style-bold` / `font-style-italic` / `font-style-bold-italic`
 
@@ -284,7 +317,6 @@ Loads a theme file as the color baseline. The value is one of:
 
 ```
 theme = Dracula
-theme = C:\Users\me\my-theme
 theme = light:Rose Pine Dawn, dark:Rose Pine
 ```
 
@@ -292,13 +324,19 @@ theme = light:Rose Pine Dawn, dark:Rose Pine
 that matches the current Windows *Apps* light/dark mode
 (`HKCU\…\Themes\Personalize\AppsUseLightTheme`) and **automatically re-selects**
 when you toggle Windows light/dark mode at runtime. If only one of the two is
-given, that one is used.
+given, that one is used. On macOS, the dark variant is always preferred
+(falling back to light if no dark variant is given); system appearance changes
+do not switch the theme.
 
 **Theme search order** (a bare name, not an absolute path):
 
-1. `%LOCALAPPDATA%\Mostty\themes\<name>` — your overrides.
-2. `<exe directory>\themes\<name>` — the bundled themes shipped next to
-   `Mostty.exe` (installed by `zig build`).
+| Priority | Windows | macOS |
+| --- | --- | --- |
+| 1: user overrides | `%LOCALAPPDATA%\Mostty\themes\<name>` | `~/Library/Application Support/com.dfordsoft.mostty.terminal/themes/<name>` |
+| 2: bundled themes | `<exe directory>\themes\<name>` | `Mostty.app/Contents/Resources/themes/<name>` |
+
+Absolute paths bypass this search, for example `C:\Users\me\my-theme` on
+Windows or `/Users/me/my-theme` on macOS; use a full path, not `~`, in the value.
 
 A theme file uses the exact same `key = value` color keys listed below. `theme`
 and `config-file` keys inside a theme file are ignored (no recursion).
@@ -358,8 +396,9 @@ palette = 200=#ff00ff
 ### `background-opacity`
 
 Alpha of the default cell background, in `0.0`–`1.0`. `1.0` is fully opaque;
-anything less lets the DWM blur-behind region show through, so the desktop
-wallpaper / lower windows are visible behind unstyled cells. Cells with an
+anything less makes the default background translucent. On Windows this uses
+the DWM blur-behind region; on macOS it uses a transparent window and Metal
+layer, with an optional native blur backdrop. Cells with an
 explicit `bg_color_*` (selection, OSC color cells, highlighted regions) stay
 opaque so they remain readable on busy backgrounds.
 
@@ -372,8 +411,8 @@ is kept. Hot-reloads — the renderer reads the value live each frame.
 
 ### `background-blur`
 
-Whether DWM blur-behind is enabled on the window. With it on (default), the
-compositor honors the per-pixel alpha from `background-opacity` so the desktop
+**Windows:** whether DWM blur-behind is enabled on the window. With it on
+(default), the compositor honors the per-pixel alpha from `background-opacity` so the desktop
 shows through translucent cells, with the soft Aero-style blur on Windows 11
 builds that still support it. With it off, the blur-behind region is cancelled
 and translucent pixels composite as plain black under most modern Windows
@@ -396,9 +435,15 @@ Ghostty config does not warn-and-default to the wrong value:
 - `macos-glass-regular` / `macos-glass-clear` (Ghostty's macOS-only glass
   enums) → on, matching Ghostty's own `BackgroundBlur.enabled()`.
 
-Note: this is the legacy `DwmEnableBlurBehindWindow` API, not Mica / Acrylic
+On Windows this is the legacy `DwmEnableBlurBehindWindow` API, not Mica / Acrylic
 via `DWMWA_SYSTEMBACKDROP_TYPE`. Hot-reloads — toggling the key re-invokes
 the DWM call and triggers a repaint.
+
+**macOS:** enables a native `NSVisualEffectView` blur backdrop when
+`background-opacity` is below `1`. Turning it off removes the backdrop while
+leaving the configured transparency in place. The same accepted values above
+act only as on/off switches, not blur radii or selectable glass materials.
+Changes hot-reload; at full opacity the backdrop is not used.
 
 ### `maximize`
 
@@ -410,12 +455,14 @@ integer (`0` → off, `>0` → on).
 maximize = true
 ```
 
-Default: `false`. Applied after the initial `ShowWindow`; combine with
+Default: `false`. On Windows, applied after the initial `ShowWindow`; combine with
 `fullscreen = true` to have toggling fullscreen off restore the maximized
 state rather than a normal-sized window.
 
 **Hot-reload:** no (startup only). Editing the key on a running window does
-not maximize/restore it — use the title-bar maximize button or `Win+Up`.
+not maximize/restore it. On Windows, use the title-bar maximize button or
+`Win+Up`. On macOS, this invokes the native window zoom when the window first
+appears; use the native Zoom command to change it later.
 
 ### `confirm-close-surface`
 
@@ -425,8 +472,9 @@ without prompting. Set `confirm-close-surface = false` to disable confirmation.
 
 ### `fullscreen`
 
-Whether new windows start in borderless fullscreen (the same mode reached via
-**Full screen** in the system menu / `Alt+Enter`).
+Whether new windows start in fullscreen: borderless on Windows (the same mode
+reached via **Full screen** in the system menu / `Alt+Enter`), native fullscreen
+on macOS (toggled at runtime with `Ctrl+Cmd+F`).
 
 ```
 fullscreen = true
@@ -440,15 +488,16 @@ Default: `false`. Accepted values (case-insensitive) mirror Ghostty's
 - `non-native` / `non-native-visible-menu` / `non-native-padded-notch`
   (Ghostty's macOS-only variants) → on
 
-Mostty has a single borderless mode, so every "enabled" variant collapses to
-the same toggle. Unlike `background-blur`, bare integers and the
+Every "enabled" variant collapses to the platform's single fullscreen toggle;
+the `non-native*` names do not select a non-native mode on macOS.
+Unlike `background-blur`, bare integers and the
 `macos-glass-*` enums are **not** accepted here — they belong to a different
 Ghostty key and accepting them would silently misroute a typo.
 
-**Hot-reload:** no (startup only). Use `Alt+Enter` or **Full screen** in the
-system menu to toggle at runtime.
+**Hot-reload:** no (startup only). At runtime use `Alt+Enter` or **Full screen**
+in the Windows system menu, or `Ctrl+Cmd+F` on macOS.
 
-**Background opacity / blur in fullscreen.** Because Mostty's fullscreen is a
+**Windows background opacity / blur in fullscreen.** Because Windows fullscreen is a
 DWM-composited borderless popup (not exclusive / "native" fullscreen),
 `background-opacity` and `background-blur` keep working unchanged — the
 desktop / lower windows continue to show through translucent cells. This
@@ -537,7 +586,7 @@ paths.
 
 ### `render-interval-local-ms` / `render-interval-remote-ms`
 
-Minimum interval (in milliseconds) between rendered frames. Mostty coalesces
+Minimum interval (in milliseconds) between rendered frames. On Windows, Mostty coalesces
 render requests behind a `SetTimer`-driven cap so a burst of PTY output does
 not fire one `WM_PAINT` per chunk. Two independent caps are kept because the
 "right" cadence differs by session type:
@@ -565,6 +614,10 @@ window to the remote cap without a restart. Editing these keys in the config
 file also takes effect immediately via the same re-application path (no
 restart needed).
 
+On macOS, only `render-interval-local-ms` is used, as the per-tab frame timer
+interval regardless of connection type; changes restart that timer on reload.
+`render-interval-remote-ms` has no effect.
+
 ### `launcher`
 
 Defines an entry for opening a new tab with a custom command. The value is:
@@ -576,15 +629,25 @@ launcher = <label> | <command-line> | <working-directory>
 - `<label>` — display name for the launcher.
 - `<command-line>` — the command to run. The first and last `|` delimit the
   fields, so the command-line itself may contain literal `|` (e.g. a pipeline).
-- `<working-directory>` — optional. If omitted (only one `|` present), the new
-  tab inherits the parent working directory.
+- `<working-directory>` — optional. If omitted or empty, Windows inherits the
+  parent working directory; macOS uses `$HOME` (inheriting only if unavailable).
+
+Windows examples (commands are passed to Windows process creation):
 
 ```
 launcher = PowerShell | powershell.exe
 launcher = WSL home | wsl.exe ~ | C:\Users\me
 ```
 
-May be repeated to define multiple launchers.
+macOS example (commands run through `$SHELL -lc`, with `/bin/zsh` as fallback):
+
+```
+launcher = Zsh | /bin/zsh -l | /Users/me
+```
+
+May be repeated to define multiple launchers. The first entry is used for the
+initial tab and normal new-tab action; right-click **+** to select another.
+Without a launcher, Windows starts `cmd.exe` and macOS starts the login shell.
 
 ### `env`
 
@@ -604,15 +667,16 @@ may contain `=` (everything after the first `=` is the value) and may be
 empty (`env = FOO=` sets `FOO` to the empty string).
 
 **Precedence.** Config entries replace same-named variables inherited from
-the Mostty process environment. Names are compared case-insensitively to
-match Windows env semantics (so `env = path=...` replaces a parent `Path`).
-If multiple `env` lines share a name, the last one wins.
+the Mostty process environment. Windows compares names case-insensitively
+(so `env = path=...` replaces a parent `Path`); macOS compares them
+case-sensitively (`PATH` and `path` are different variables). If multiple `env`
+lines share a name under the platform's comparison, the last one wins.
 
 **`TERM`.** Mostty injects `TERM=xterm-256color` into every child by default.
 An explicit `env = TERM=<value>` overrides that default.
 
 **SSH note.** Setting `env = LANG=...` only makes `LANG` available to the
-Windows-side shell. To forward it to a remote host over SSH, add `SendEnv
+local shell on either platform. To forward it to a remote host over SSH, add `SendEnv
 LANG LC_*` to `~/.ssh/config` (the remote `sshd` must accept the same names
 via `AcceptEnv`, which macOS/Linux defaults usually do).
 
@@ -621,6 +685,8 @@ via `AcceptEnv`, which macOS/Linux defaults usually do).
 ## Example config
 
 Only real `key = value` lines are valid — do not add `#` comment lines.
+
+### Windows
 
 ```
 font-family             = JetBrains Mono, Consolas
@@ -642,4 +708,17 @@ launcher                = PowerShell | powershell.exe
 launcher                = WSL | wsl.exe ~
 env                     = LANG=en_US.UTF-8
 env                     = LC_CTYPE=zh_CN.UTF-8
+```
+
+### macOS
+
+```
+font-family             = Menlo
+font-size               = 13
+theme                   = Rose Pine
+background-opacity      = 0.85
+background-blur         = true
+render-interval-local-ms = 16
+confirm-close-surface   = true
+env                     = LANG=en_US.UTF-8
 ```
