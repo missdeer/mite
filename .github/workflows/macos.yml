@@ -35,6 +35,9 @@ jobs:
       - name: Test
         run: zig build test
 
+      - name: Verify bundled themes
+        run: python3 tests/macos/bundle-themes.py zig-out/Mostty.app
+
       - name: Package app bundle
         run: |
           mkdir -p dist stage
