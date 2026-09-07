@@ -11,6 +11,21 @@ A fast, lightweight native terminal emulator with libghostty at its core. Runs n
 >
 > Windows and macOS. If you need a Linux build, use [ghostty](https://github.com/ghostty-org/ghostty) directly.
 
+### Features
+
+Both Windows and macOS provide:
+
+- **Tabbed sessions.** Multiple independent shells in one window, with per-tab terminal state and titles. Right-click `+` to choose a configured launcher or an SSH host discovered from `~/.ssh/config`. Tabs close when their shell exits; closing the last tab quits the app. Manual tab/window closure prompts for confirmation by default.
+- **Live configuration and themes.** Change fonts, terminal colors, the palette, cursor and selection colors, transparency, blur, and render cadence through a plain-text config file. Saving the file updates running tabs. Bundled and user-installed Ghostty-compatible color themes can also be selected from a menu. Launcher and environment changes apply to new sessions; maximize/fullscreen settings apply at startup.
+- **Unicode text and terminal glyphs.** Native font rendering with bold/italic faces, wide characters, grapheme clusters, and system font fallback. Shared procedural glyph rendering keeps box drawing, blocks, braille, Powerline separators, and legacy computing symbols aligned to the cell grid.
+- **Selection and clipboard.** Drag to select text and release to copy automatically. Double-click selects words with CJK-aware punctuation boundaries and correct handling of wide characters and wrapped text. Multiline paste normalizes line endings to terminal Enter; bracketed paste is used when requested by the application, with embedded paste-end markers removed.
+- **Clickable URLs.** Hover over HTTP/HTTPS links to underline them and show a hand cursor; double-click opens them in the default browser. Detection spans visually wrapped rows and stays in sync with scrolling and resizing.
+- **File drag-and-drop.** Drop files from Explorer or Finder to paste space-separated, quoted paths into the active session. macOS escapes shell-special characters inside those paths.
+- **Scrollback and mouse input.** Browse terminal history with the mouse wheel or a draggable scrollbar. Terminal applications can receive mouse clicks, drags, motion, and wheel events through the negotiated VT mouse protocol; hold `Shift` to use local selection/scrolling instead.
+- **IME input.** CJK and other input methods show composition and candidate UI at the terminal caret.
+- **Kitty inline images.** Display terminal images with placement clipping, layering, scrolling, replacement, and deletion. Image state belongs to each terminal session. Windows requires a ConPTY version that forwards Kitty image sequences; see below.
+
+See [Configuration](configurations.md) for syntax, examples, defaults, and the full [platform support table](configurations.md#platform-support).
 
 ### Windows
 
@@ -50,40 +65,15 @@ not applied.
 
 Renderer changes require a restart. Unsupported drivers or presentation capabilities are reported at startup; research backends may offer an explicit D3D11 fallback but never switch silently. See [Configuration](configurations.md#renderer) for requirements and backend-specific behavior.
 
-#### Windows features
+#### Windows-specific features
 
-- Configurable startup launchers per tab, including right-click `+` launcher selection and SSH hosts integrated into the launcher menu.
-- Confirmation prompts before closing a tab or the window to reduce accidental session loss.
-- User configuration via `%LOCALAPPDATA%\Mostty\config`: font family/size/ligatures, colors and Ghostty-compatible themes (with live light/dark switching), per-tab launchers, window transparency (`background-opacity` / `background-blur`, the latter toggling DWM blur-behind so users can opt out of the default Aero-style translucency), and initial window state (`maximize` / `fullscreen`). See [Configuration](configurations.md).
-- Rendering improvements for wide-glyph clipping, tile-design handling, ambiguous-width symbol alignment/readability, and CRLF tolerance in the octant glyph parser.
-- Drag-and-drop from Explorer: dropped files are pasted as space-separated, double-quoted paths into the active tab (works under elevation via UIPI message filters).
-- IME composition and candidate windows track the caret cell instead of opening at the screen corner; the position re-pins if PTY output scrolls mid-composition.
-- Multi-line clipboard paste preserves line breaks by normalizing CRLF and bare LF to CR (matches xterm bracketed-paste, alacritty/kitty/foot).
-- Double-click selects the word under the cursor and copies it to the clipboard; boundary set tuned so URLs/paths/`$VAR`/`key:value` stay one token while `user@host` splits, with CJK-aware punctuation (sentences split at `，。！？「」` etc.) and wide-char right-half clicks resolved to the primary cell.
-- Hover-detect http/https URLs across visually-wrapped rows — matched cells get an underline, the cursor turns into a hand, and double-click opens the link via `ShellExecuteW`. The walker crosses row boundaries on URL-character continuity rather than `row.wrap`, so producer hard-wrapped output (e.g. `bat` defaulting to character wrap) is linkified the same as terminal soft-wrap. Detection re-validates from the render path so PTY scroll, resize, and viewport snap-back all keep the highlight in sync without per-event hooks; silently-truncated runs at the 4 KiB cap are rejected so a host-shortened prefix can't be opened.
-- Render hot-path performance pass: coalesced `InvalidateRect` via a `render_pending` flag, per-frame LRU dampening in the glyph cache, per-render selection-bounds precompute (replaces per-cell page walks), and a pow-free shader gamma decode approximation kept close to DirectWrite's gamma 2.2 rendering params.
-- Async glyph rasterization for single-cell DirectWrite misses: a dedicated worker thread produces CPU BGRA pixels off the UI thread through a process-lifetime font service, and the selected renderer uploads completed glyphs into its atlas via `WM_APP_GLYPH_READY`. A two-level generation guard (renderer-global `cache_gen` for font/DPI rebuilds + per-slot `gen` for LRU reuse) and a `pending` flag on each cache node let in-flight rasters land safely or get dropped on stale slots without stalling eviction. Unicode-heavy bursts (`cat unicode-test.txt`) no longer hitch the UI thread; a missed cell shows the blank placeholder for one or two frames before the real glyph swaps in.
-- Kitty graphics protocol support for inline terminal images. Mostty handles Kitty APC image transmissions through `libghostty-vt`, uploads visible images through the selected renderer, renders them with per-placement clipping/z-order, sends Kitty ACK replies, and supports deletion/cleanup when images or tabs go away. This depends on a ConPTY build that passes APC data through; release artifacts bundle Microsoft Terminal's `conpty.dll` and `OpenConsole.exe` under `dist/conpty/`.
-- Automated Windows builds via GitHub Actions, plus repository assistant tooling/docs updates for contributors.
+- **ConPTY sessions**, using the first configured launcher or `cmd.exe` by default.
+- **Advanced DirectWrite font controls:** configurable fallback and emoji font chains, programming ligatures and OpenType features, per-codepoint font mapping, style and synthetic-style controls, and a separate tab-bar font. The default terminal font is **Consolas at 13pt**.
+- **ClearType text with asynchronous glyph rasterization**, glyph caching, and partial redraws. Separate local and remote/software rendering intervals help control resource usage.
+- **Window appearance:** background images with fit, position, repeat, and opacity controls; DWM blur-behind; and live system light/dark theme switching with `theme = light:..., dark:...`.
+- **Desktop integration:** open/create `%LOCALAPPDATA%\Mostty\config` through **Open Settings File...** in the window system menu, switch themes from that menu, and accept Explorer file drops even when running elevated.
 
-**Tabs.** One window can host multiple ConPTY-backed shells. The selected renderer paints the tab bar into the top cell row (no extra Win32 control). Each tab owns its own terminal state, vt stream, child process, reader thread, title, and WM_CHAR surrogate carry; window-scoped state (mouse capture, scrollbar drag, selection fade) stays on the window. Closing the last tab quits.
-
-- `Ctrl+T` — new tab (uses the first configured launcher, or `cmd.exe` if none)
-- `Ctrl+W` — close the active tab
-- `Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+PgDn` / `Ctrl+PgUp` — cycle tabs
-- `Ctrl+1`..`Ctrl+9` — jump to tab N
-- Left-click a tab to activate, its `x` to close, the `+` to open a new one
-- Right-click the `+` to pick a launcher from the configured list
-
-Tab teardown sets an atomic `reader_stop` and calls `CancelIoEx` so the reader thread exits cleanly whether it was blocked in `ReadFile` or mid-`SendMessage`, and the main loop waits on all child process handles via `MsgWaitForMultipleObjectsEx` so an exiting shell posts a close instead of killing the process.
-
-Custom shells / startup programs are declared as `launcher` lines in `%LOCALAPPDATA%\Mostty\config` — see [Configuration](configurations.md). A failed launcher (bad path, missing exe) logs an error and skips the new tab rather than crashing Mostty.
-
-**Font configuration.** Defaults: primary family **Consolas @ 13pt** with a minimal hardcoded fallback chain (`Segoe UI Emoji`) attached via a custom `IDWriteFontFallback`. Cell size is measured from `IDWriteFontFace` design metrics rather than a text layout of U+2588 — some monospace fonts (Rec Mono Casual included) report a wider full-block glyph than their ASCII advance, which used to stretch every letter horizontally. Sizes are configured in points and converted pt → DIPs → physical pixels (the previous DIP-direct path rendered "13pt" at ~75% of intended size). Programming-symbol ligatures are enabled by default and can be disabled with `font-ligatures = false`. If the configured primary isn't installed, Mostty falls back through Cascadia Mono → Consolas → Courier New for cell-size measurement before erroring out.
-
-Font family, size, and ligatures (plus colors, themes, and launchers) are overridable via `%LOCALAPPDATA%\Mostty\config` — see [Configuration](configurations.md) for all keys and the file format.
-
-The child shell is spawned with an isolated per-process Unicode environment block (`TERM`/`COLORTERM`/`LANG`/`LC_ALL` applied, `NO_COLOR` stripped, sorted case-insensitively as Win32 requires) instead of mutating Mostty's own process env, which removes a race across concurrent `CreateProcessW` calls.
+Windows always prompts before manually closing sessions; `confirm-close-surface` currently only controls the macOS behavior.
 
 **Bundled ConPTY for Kitty graphics.** On Windows, the inbox ConPTY can filter Kitty's APC image sequences before Mostty's VT parser sees them. Mostty therefore looks for an experimental Microsoft Terminal ConPTY in this order:
 
@@ -91,33 +81,39 @@ The child shell is spawned with an isolated per-process Unicode environment bloc
 2. `<Mostty.exe directory>\conpty\conpty.dll`
 3. system `CreatePseudoConsole`
 
-CI downloads `Microsoft.Windows.Console.ConPTY.1.23.251216003.nupkg` from the Microsoft Terminal release, verifies SHA256 hashes, and stages `conpty.dll` plus `OpenConsole.exe` into `dist/conpty/`. Local development can use the same layout under `zig-out\bin\conpty\`.
-
-**Sharper text rendering.** Three coupled changes that together visibly crisp up the glyphs:
-
-- The glyph atlas and D2D staging surface are now `BGRA8` with `D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE`; the shader treats the stored RGB as a 3-component subpixel coverage mask. Atlas dimension is capped at 4096 (~64 MiB) with a min-2 guard so the LRU's head/tail invariant survives extreme cell sizes.
-- The render target view is created as `B8G8R8A8_UNORM_SRGB` and shader inputs (fg/bg/gradient/atlas) use a pow-free decode approximation close to gamma 2.2, so blending happens in linear space while avoiding the old per-pixel `pow` hotspot. A custom `IDWriteRenderingParams` (gamma 2.2, contrast 0, ClearType, RGB stripe, `NATURAL_SYMMETRIC`) is built once and applied per glyph so the atlas is reproducible across machines.
-- The per-glyph horizontal `SetTransform` that scaled fallback glyphs to the cell advance is gone — it was destroying hinting on every non-ASCII glyph. Fallback glyphs now render at their natural advance and over/underflow is clipped or padded by the cell.
+Windows release archives bundle `conpty.dll` and `OpenConsole.exe` in the `conpty/` directory beside `Mostty.exe`. CI verifies the downloaded package and binaries with SHA256 hashes. Local development can use the same layout under `zig-out\bin\conpty\`.
 
 ### macOS
 
-A native SwiftUI/AppKit application built on the same platform-neutral terminal core. The Zig core owns the PTY, the `libghostty-vt` state machine, and the grid model behind a C-ABI boundary (`src/macos/capi.zig`); text is shaped and rasterized with CoreText and presented through a Metal (`CAMetalLayer`) surface, so terminal behavior stays consistent with the Windows build. Requires macOS 13 or newer. Building requires full Xcode 26 or newer for the Icon Composer asset compiler (`actool`). `zig build` on a macOS host assembles a launchable `Mostty.app` into `zig-out/`, and CI publishes an arm64 `.dmg` on tagged releases.
+A native SwiftUI/AppKit application using PTY sessions, CoreText text rendering, and Metal presentation on the same `libghostty-vt` terminal core. Requires macOS 13 or newer. Building requires Zig 0.16.0 and full Xcode 26 or newer for the Icon Composer asset compiler (`actool`). `zig build` on a macOS host assembles a launchable `Mostty.app` into `zig-out/`, and CI publishes an arm64 `.dmg` on tagged releases.
 
-#### macOS features
+#### macOS-specific features
 
 Configuration is read from `~/Library/Application Support/com.dfordsoft.mostty.terminal/Config`;
 use **Mostty > Open Configuration File** (`Cmd+,`) to open or create it.
 See [Configuration](configurations.md#platform-support) for supported keys,
 platform differences, and examples; macOS does not use the Windows command-line overrides.
 
-- Multiple tabs in one window, each with its own PTY-backed shell process, VT state, and title. The tab title tracks the running program / current path.
-- Mouse selection with copy to the clipboard, mouse-wheel scrollback, and paste with a bracketed-paste guard that strips embedded paste-end markers (mirrors the Windows behavior).
-- IME composition for CJK and other input methods.
-- Window chrome pinned to dark mode.
+- **Login-shell startup.** New tabs use the first configured launcher, or the user's login shell, and start in the configured working directory or `$HOME`. Tab titles reflect the shell-provided title and current directory.
+- **Native session and window commands.** The **Tabs** menu provides tab navigation; `Ctrl+Cmd+F` toggles native fullscreen. Closing an active session, the window, or the app prompts by default; `confirm-close-surface = false` disables these prompts.
+- **Native appearance and scrolling.** Retina-aware CoreText rendering, a native scrollbar with thumb dragging and page clicks, trackpad scrollback, and configurable translucent backgrounds with an AppKit blur backdrop. Window chrome stays dark; `light:..., dark:...` theme pairs select the dark variant.
+- **Live theme selection.** **Mostty > Theme** changes all tabs immediately while retaining explicit color overrides. Menu choices last until the next config reload or restart.
+- **Kitty graphics over the native PTY.** Supports RGB/RGBA and PNG images, chunked transmissions and replies, Unicode placeholder placements, and images below or above text, without a bundled ConPTY dependency.
 
-Keyboard shortcuts:
+The default terminal font is **Menlo at 13pt**. Font size and regular/bold/italic/bold-italic families are configurable; macOS uses only the first `font-family` entry and lets CoreText resolve missing glyphs. Windows-only controls for ligatures, OpenType features, custom fallback/emoji chains, codepoint maps, synthetic styles, tab-bar fonts, background images, GPU/backend selection, and remote-session render cadence are not applied on macOS.
 
-- `Cmd+T` — new tab
-- `Cmd+W` — close the active tab
-- `Cmd+C` / `Cmd+V` — copy / paste
-- Click a tab to activate, its `×` to close, the `+` to open a new one
+### Shortcuts and mouse actions
+
+| Action | Windows | macOS |
+| --- | --- | --- |
+| New tab | `Ctrl+T` | `Cmd+T` |
+| Close active tab | `Ctrl+W` | `Cmd+W` |
+| Next tab | `Ctrl+Tab` or `Ctrl+PgDn` | `Cmd+Shift+]` |
+| Previous tab | `Ctrl+Shift+Tab` or `Ctrl+PgUp` | `Cmd+Shift+[` |
+| Select tab 1-9 | `Ctrl+1` through `Ctrl+9` | `Cmd+1` through `Cmd+9` |
+| Copy selection | Automatic on selection release | Automatic on selection release, or `Cmd+C` |
+| Paste | `Ctrl+V`, `Ctrl+Shift+V`, or `Shift+Insert` | `Cmd+V` |
+| Toggle fullscreen | `Alt+Enter` | `Ctrl+Cmd+F` |
+| Open configuration | Window system menu > Open Settings File... | `Cmd+,` |
+
+On both platforms, click a tab to activate it, its close button to close it, or `+` to open a new tab. Right-click `+` to choose a launcher or SSH host. The menu reads concrete `Host` aliases from the top-level `~/.ssh/config` each time it opens; wildcard/negated patterns and `Include` files are not listed. Double-click a URL to open it or another word to select it. Hold `Shift` to select text or scroll locally when a terminal application has enabled mouse reporting.

@@ -40,6 +40,80 @@ struct InteractionTests {
         expect(model.selectedTab?.view.launcher?.command == "echo second" &&
                model.selectedTab?.view.launcher?.directory == "/var", "selected launcher preserves its command and directory")
 
+        let sshURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("tmp/macos-interaction-tests/ssh-config")
+        do {
+            let source = "\u{feff}# Hosts\r\nHost alpha beta *.example !blocked ?pattern \"quoted\" # comment\r\n" +
+                "  HostName ignored.example\n\thOsT\tgamma\nInclude ignored.conf\n"
+            try Data(source.utf8).write(to: sshURL)
+            let button = LauncherMenuButton(frame: NSRect(x: 0, y: 0, width: 22, height: 22))
+            button.sshConfigURL = sshURL
+            let event = NSEvent.mouseEvent(with: .rightMouseDown, location: .zero, modifierFlags: [],
+                                          timestamp: 0, windowNumber: 0, context: nil,
+                                          eventNumber: 0, clickCount: 1, pressure: 1)!
+            let menu = button.menu(for: event)!
+            expect(menu.items.map(\.title) == ["[SSH: alpha]", "[SSH: beta]", "[SSH: gamma]"],
+                   "SSH-only configuration creates a menu with concrete Host aliases, excluding patterns and HostName")
+            let menuWindow = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 80, height: 60),
+                                      styleMask: [.titled], backing: .buffered, defer: false)
+            menuWindow.contentView?.addSubview(button)
+            menuWindow.orderFront(nil)
+            var trackedMenu = false
+            let observer = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification,
+                                                                  object: nil, queue: nil) { notification in
+                guard let openedMenu = notification.object as? NSMenu else { return }
+                trackedMenu = openedMenu.items.contains { $0.title == "[SSH: alpha]" }
+                DispatchQueue.main.async { openedMenu.cancelTracking() }
+            }
+            let click = NSEvent.mouseEvent(with: .rightMouseDown, location: NSPoint(x: 11, y: 11),
+                                          modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                          windowNumber: menuWindow.windowNumber, context: nil,
+                                          eventNumber: 0, clickCount: 1, pressure: 1)!
+            button.rightMouseDown(with: click)
+            NotificationCenter.default.removeObserver(observer)
+            menuWindow.orderOut(nil)
+            expect(trackedMenu, "right-clicking the native plus button actually opens the SSH context menu")
+            var chosen: TerminalLauncher?
+            var opened = 0
+            button.openTab = { chosen = $0; opened += 1 }
+            menu.performActionForItem(at: 1)
+            expect(chosen?.command == "ssh -- 'beta'" && chosen?.directory == "" && opened == 1,
+                   "selecting an SSH menu item opens that host through the existing launcher path")
+            button.performClick(nil)
+            expect(chosen == nil && opened == 2, "left-click still requests the normal default tab")
+
+            button.configuredLaunchers = { model.launchers }
+            let mixed = button.menu(for: event)!
+            expect(mixed.items.prefix(2).map(\.title) == ["First", "Second"] &&
+                   mixed.items[2].isSeparatorItem && mixed.items[3].title == "[SSH: alpha]",
+                   "configured launchers precede SSH hosts with a separator")
+            try Data("Host updated\n".utf8).write(to: sshURL)
+            expect(button.menu(for: event)?.items.last?.title == "[SSH: updated]",
+                   "opening the menu reads SSH edits without restarting or reloading Mostty configuration")
+            menu.performActionForItem(at: 1)
+            expect(chosen?.command == "ssh -- 'beta'", "an open menu keeps its selected command snapshot")
+            button.configuredLaunchers = { [] }
+            try Data("Host * !excluded\n".utf8).write(to: sshURL)
+            expect(button.menu(for: event) == nil, "patterns alone do not produce connectable menu entries")
+            button.sshConfigURL = sshURL.appendingPathComponent("missing")
+            expect(button.menu(for: event) == nil, "an unreadable SSH config leaves the menu empty")
+
+            let host = "-oProxyCommand=$(id);'literal'"
+            let escaped = SSHLaunchers.parse("Host \(host)\n")[0]
+            let process = Process()
+            let output = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", "ssh() { printf '%s\\n' \"$@\"; }; " + escaped.command]
+            process.standardOutput = output
+            try process.run()
+            let bytes = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            expect(process.terminationStatus == 0 && String(data: bytes, encoding: .utf8) == "--\n\(host)\n",
+                   "SSH aliases remain one literal shell argument after --, including quotes and command syntax")
+        } catch {
+            expect(false, "SSH launcher regression: \(error)")
+        }
+
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         let active = model.selectedTab!

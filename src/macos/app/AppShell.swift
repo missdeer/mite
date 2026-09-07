@@ -397,6 +397,91 @@ final class ContainerView: NSView {
     }
 }
 
+enum SSHLaunchers {
+    static func load(from url: URL) -> [TerminalLauncher] {
+        guard let file = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? file.close() }
+        guard let data = try? file.read(upToCount: 1024 * 1024 + 1), data.count <= 1024 * 1024,
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        return parse(text)
+    }
+
+    // Match Windows discovery: only concrete aliases in the top-level config.
+    static func parse(_ text: String) -> [TerminalLauncher] {
+        let text = text.hasPrefix("\u{feff}") ? String(text.dropFirst()) : text
+        var launchers: [TerminalLauncher] = []
+        for line in text.components(separatedBy: "\n") {
+            let fields = line.split { $0 == " " || $0 == "\t" || $0 == "\r" }
+            guard fields.first?.lowercased() == "host" else { continue }
+            for field in fields.dropFirst() {
+                if field.hasPrefix("#") { break }
+                if field.contains(where: { "*?!\"".contains($0) }) { continue }
+                let host = String(field)
+                // Launchers run through $SHELL -lc; keep the alias one literal
+                // argument, and prevent leading '-' from becoming an option.
+                let quoted = "'" + host.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                launchers.append(TerminalLauncher(label: "[SSH: \(host)]",
+                                                 command: "ssh -- \(quoted)", directory: ""))
+            }
+        }
+        return launchers
+    }
+}
+
+final class LauncherMenuButton: NSButton {
+    var configuredLaunchers: () -> [TerminalLauncher] = { [] }
+    var openTab: (TerminalLauncher?) -> Void = { _ in }
+    var sshConfigURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory())
+        .appendingPathComponent(".ssh/config")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        image = NSImage(systemSymbolName: "plus", accessibilityDescription: "New Tab")
+        imagePosition = .imageOnly
+        isBordered = false
+        toolTip = "New Tab"
+        target = self
+        action = #selector(newTab(_:))
+    }
+
+    required init?(coder: NSCoder) { fatalError("unsupported") }
+
+    @objc private func newTab(_ sender: Any?) { openTab(nil) }
+
+    @objc private func selectLauncher(_ sender: NSMenuItem) {
+        guard let launcher = sender.representedObject as? TerminalLauncher else { return }
+        openTab(launcher)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let configured = configuredLaunchers()
+        let ssh = SSHLaunchers.load(from: sshConfigURL)
+        guard !configured.isEmpty || !ssh.isEmpty else { return nil }
+        let menu = NSMenu()
+        for (index, launcher) in (configured + ssh).enumerated() {
+            if index == configured.count && !configured.isEmpty { menu.addItem(.separator()) }
+            let item = NSMenuItem(title: launcher.label, action: #selector(selectLauncher(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = launcher
+            menu.addItem(item)
+        }
+        return menu
+    }
+}
+
+struct LauncherButton: NSViewRepresentable {
+    let model: AppModel
+
+    func makeNSView(context: Context) -> LauncherMenuButton {
+        LauncherMenuButton(frame: .zero)
+    }
+
+    func updateNSView(_ button: LauncherMenuButton, context: Context) {
+        button.configuredLaunchers = { [weak model] in model?.launchers ?? [] }
+        button.openTab = { [weak model] launcher in model?.newTab(launcher: launcher) }
+    }
+}
+
 struct TabBar: View {
     @ObservedObject var model: AppModel
 
@@ -405,16 +490,8 @@ struct TabBar: View {
             ForEach(model.tabs) { tab in
                 TabChip(tab: tab, model: model)
             }
-            Button(action: { model.newTab() }) {
-                Image(systemName: "plus")
-            }
-            .buttonStyle(.borderless)
-            .help("New Tab")
-            .contextMenu {
-                ForEach(Array(model.launchers.enumerated()), id: \.offset) { _, launcher in
-                    Button(launcher.label) { model.newTab(launcher: launcher) }
-                }
-            }
+            LauncherButton(model: model)
+                .frame(width: 22, height: 22)
             Spacer()
         }
         .padding(.horizontal, 8)

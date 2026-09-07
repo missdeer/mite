@@ -649,6 +649,12 @@ May be repeated to define multiple launchers. The first entry is used for the
 initial tab and normal new-tab action; right-click **+** to select another.
 Without a launcher, Windows starts `cmd.exe` and macOS starts the login shell.
 
+On both platforms, the right-click **+** menu also reads concrete `Host` aliases
+from `~/.ssh/config` (`%USERPROFILE%\.ssh\config` on Windows), even when no
+`launcher` is configured. SSH entries appear after configured launchers and
+open `ssh` in a new tab. The file is re-read whenever the menu opens. Wildcard
+and negated patterns are skipped, and `Include` files are not followed.
+
 ### `env`
 
 Inject an environment variable into every newly-spawned tab's child process.
