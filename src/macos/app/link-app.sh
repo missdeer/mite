@@ -50,4 +50,5 @@ swiftc -O -o "$OUT" \
     -framework QuartzCore \
     -framework CoreText \
     -framework CoreGraphics \
+    -framework ImageIO \
     -framework Foundation

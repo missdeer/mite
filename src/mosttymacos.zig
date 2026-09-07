@@ -4,6 +4,10 @@ pub const GridModel = @import("macos/GridModel.zig");
 pub const CoreTextRenderer = @import("macos/CoreTextRenderer.zig");
 pub const capi = @import("macos/capi.zig");
 
+test {
+    _ = @import("macos/KittyTests.zig");
+}
+
 comptime {
     _ = @sizeOf(TerminalSession);
     _ = @sizeOf(PtySession);

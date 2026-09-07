@@ -473,6 +473,16 @@ The scrollbar queries the active VT screen's total rows, viewport offset and
 visible rows. Native dragging selects an absolute history row; the final offset
 explicitly restores bottom-follow mode. Its events stay outside the terminal
 mouse-reporting area, and the visible tab refreshes the indicator on render ticks.
+Kitty protocol parsing and replies remain in the shared VT stream. macOS installs
+an ImageIO PNG decoder when creating a PTY session. Each renderer owns decoded
+CoreGraphics images keyed by VT image ID/generation and resolves placements from
+the active screen's viewport, including Unicode placeholders. Images composite
+below explicit cell backgrounds, below text, or above text according to z-order;
+default backgrounds reveal the lowest image layer and placeholder glyphs are
+suppressed. The final bitmap still uses the existing Metal presentation pass.
+Replacement, deletion and screen changes prune stale cached images; tab teardown
+releases all copies. Destination clipping excludes non-grid padding and the
+bottom gutter.
 
 The flow per chunk of PTY bytes is:
 

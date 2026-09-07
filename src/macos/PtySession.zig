@@ -60,6 +60,7 @@ write_failed: bool,
 
 pub fn init(self: *PtySession, options: Options) !void {
     if (options.cols == 0 or options.rows == 0) return error.InvalidSize;
+    @import("PngDecoder.zig").install();
 
     self.* = .{
         .terminal = undefined,

@@ -42,6 +42,7 @@ pub const Size = struct {
 pub const Style = struct {
     foreground: Rgba,
     background: Rgba,
+    default_background: bool = true,
     bold: bool = false,
     italic: bool = false,
     faint: bool = false,
@@ -107,6 +108,7 @@ const SelectionPaint = struct {
         style.background = self.background orelse style.foreground;
         style.foreground = self.foreground orelse original_background;
         style.background.a = 255;
+        style.default_background = false;
         style.foreground.a = 255;
     }
 };
@@ -317,6 +319,7 @@ fn styleForCell(
         result.foreground.b /= 2;
     }
     result.background.a = if (default_background) background.a else 255;
+    result.default_background = default_background;
     result.foreground.a = 255;
     if (result.invisible) result.foreground = result.background;
     return result;

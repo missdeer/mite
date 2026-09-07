@@ -266,6 +266,7 @@ fn buildMacosApp(b: *std.Build, target: std.Build.ResolvedTarget) void {
 }
 
 fn addMacosFrameworks(module: *std.Build.Module) void {
+    module.linkFramework("ImageIO", .{});
     module.linkFramework("CoreFoundation", .{});
     module.linkFramework("CoreGraphics", .{});
     module.linkFramework("CoreText", .{});

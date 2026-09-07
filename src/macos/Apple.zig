@@ -12,6 +12,7 @@ const CTFontDescriptorRef = *anyopaque;
 const CTFontRef = *anyopaque;
 const CGColorSpaceRef = *anyopaque;
 const CGContextRef = *anyopaque;
+const CGImageRef = *anyopaque;
 
 extern "c" fn CFStringCreateWithBytes(
     allocator: ?*anyopaque,
@@ -27,6 +28,27 @@ extern "c" fn CFStringCreateWithCharacters(
 ) ?CFStringRef;
 extern "c" fn CFRelease(value: *anyopaque) void;
 extern "c" fn CFRetain(value: *anyopaque) *anyopaque;
+extern "c" fn CFDataCreate(allocator: ?*anyopaque, bytes: [*]const u8, count: CFIndex) ?*anyopaque;
+extern "c" fn CFEqual(lhs: *anyopaque, rhs: *anyopaque) bool;
+extern "c" fn CFDictionaryGetValue(dict: *anyopaque, key: *anyopaque) ?*anyopaque;
+extern "c" fn CFNumberGetValue(number: *anyopaque, kind: CFIndex, value: *i64) bool;
+
+extern "c" fn CGImageSourceCreateWithData(data: *anyopaque, options: ?*anyopaque) ?*anyopaque;
+extern "c" fn CGImageSourceGetType(source: *anyopaque) ?CFStringRef;
+extern "c" fn CGImageSourceCopyPropertiesAtIndex(source: *anyopaque, index: usize, options: ?*anyopaque) ?*anyopaque;
+extern "c" fn CGImageSourceCreateImageAtIndex(source: *anyopaque, index: usize, options: ?*anyopaque) ?CGImageRef;
+extern "c" var kCGImagePropertyPixelWidth: CFStringRef;
+extern "c" var kCGImagePropertyPixelHeight: CFStringRef;
+extern "c" fn CGDataProviderCreateWithCFData(data: *anyopaque) ?*anyopaque;
+extern "c" fn CGDataProviderRelease(provider: *anyopaque) void;
+extern "c" fn CGImageCreate(width: usize, height: usize, bits_per_component: usize, bits_per_pixel: usize, bytes_per_row: usize, space: CGColorSpaceRef, bitmap_info: u32, provider: *anyopaque, decode: ?*const f64, interpolate: bool, intent: c_int) ?CGImageRef;
+extern "c" fn CGImageRelease(image: CGImageRef) void;
+extern "c" fn CGImageGetWidth(image: CGImageRef) usize;
+extern "c" fn CGImageGetHeight(image: CGImageRef) usize;
+extern "c" fn CGContextDrawImage(context: CGContextRef, rect: Rect, image: CGImageRef) void;
+extern "c" fn CGContextSaveGState(context: CGContextRef) void;
+extern "c" fn CGContextRestoreGState(context: CGContextRef) void;
+extern "c" fn CGContextClipToRect(context: CGContextRef, rect: Rect) void;
 
 extern "c" fn CTFontDescriptorCreateWithNameAndSize(name: CFStringRef, size: f64) ?CTFontDescriptorRef;
 extern "c" fn CTFontCreateWithFontDescriptor(
@@ -143,7 +165,54 @@ pub const graphics = struct {
     };
 
     pub const ImageAlphaInfo = enum(u32) {
+        premultiplied_last = 1,
         premultiplied_first = 2,
+    };
+
+    pub const Image = opaque {
+        pub fn createRgba(bytes: []const u8, width: u32, height: u32) !*Image {
+            const count = std.math.mul(usize, width, height) catch return error.InvalidData;
+            const size = std.math.mul(usize, count, 4) catch return error.InvalidData;
+            if (width == 0 or height == 0 or bytes.len != size) return error.InvalidData;
+            const data = CFDataCreate(null, bytes.ptr, @intCast(bytes.len)) orelse return error.OutOfMemory;
+            defer CFRelease(data);
+            const provider = CGDataProviderCreateWithCFData(data) orelse return error.OutOfMemory;
+            defer CGDataProviderRelease(provider);
+            const space = try ColorSpace.createDeviceRGB();
+            defer space.release();
+            // Kitty bytes are straight RGBA. The image retains the provider's copy.
+            return @ptrCast(CGImageCreate(width, height, 8, 32, @as(usize, width) * 4, @ptrCast(space), 3, provider, null, true, 0) orelse return error.InvalidData);
+        }
+
+        pub fn createPng(bytes: []const u8) !*Image {
+            const data = CFDataCreate(null, bytes.ptr, @intCast(bytes.len)) orelse return error.OutOfMemory;
+            defer CFRelease(data);
+            const source = CGImageSourceCreateWithData(data, null) orelse return error.InvalidData;
+            defer CFRelease(source);
+            const kind = CGImageSourceGetType(source) orelse return error.InvalidData;
+            const png = try foundation.String.createWithBytes("public.png", .utf8, false);
+            defer png.release();
+            if (!CFEqual(kind, @ptrCast(png))) return error.InvalidData;
+            const properties = CGImageSourceCopyPropertiesAtIndex(source, 0, null) orelse return error.InvalidData;
+            defer CFRelease(properties);
+            // Validate metadata before ImageIO allocates decoded pixels, matching VT's limits.
+            for ([_]CFStringRef{ kCGImagePropertyPixelWidth, kCGImagePropertyPixelHeight }) |key| {
+                const number = CFDictionaryGetValue(properties, key) orelse return error.InvalidData;
+                var dimension: i64 = 0;
+                if (!CFNumberGetValue(number, 4, &dimension) or dimension <= 0 or dimension > 10000) return error.InvalidData;
+            }
+            return @ptrCast(CGImageSourceCreateImageAtIndex(source, 0, null) orelse return error.InvalidData);
+        }
+
+        pub fn getWidth(self: *Image) usize {
+            return CGImageGetWidth(@ptrCast(self));
+        }
+        pub fn getHeight(self: *Image) usize {
+            return CGImageGetHeight(@ptrCast(self));
+        }
+        pub fn release(self: *Image) void {
+            CGImageRelease(@ptrCast(self));
+        }
     };
 
     pub const ColorSpace = opaque {
@@ -181,6 +250,20 @@ pub const graphics = struct {
     };
 
     pub const Context = struct {
+        pub fn drawImage(value: *BitmapContext, rect: Apple.Rect, image: *Image) void {
+            CGContextDrawImage(@ptrCast(value), rect, @ptrCast(image));
+        }
+
+        pub fn save(value: *BitmapContext) void {
+            CGContextSaveGState(@ptrCast(value));
+        }
+        pub fn restore(value: *BitmapContext) void {
+            CGContextRestoreGState(@ptrCast(value));
+        }
+        pub fn clipToRect(value: *BitmapContext, rect: Apple.Rect) void {
+            CGContextClipToRect(@ptrCast(value), rect);
+        }
+
         pub fn release(value: *BitmapContext) void {
             CGContextRelease(@ptrCast(value));
         }

@@ -6,6 +6,7 @@ const macos = @import("Apple.zig");
 
 const GridModel = @import("GridModel.zig");
 const MetalBackend = @import("MetalBackend.zig");
+const KittyImages = @import("KittyImages.zig");
 const TerminalSession = @import("../terminal/Session.zig");
 const Config = @import("../Config.zig");
 const url_hover = @import("../terminal/url_hover.zig");
@@ -149,6 +150,7 @@ paint: Paint,
 selection: ?GridModel.Selection = null,
 hovered_url: ?url_hover.Hit = null,
 sprite_masks: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+kitty_images: KittyImages = .{},
 
 pub fn init(options: Options) !CoreTextRenderer {
     if (options.font.size <= 0 or options.scale <= 0) return error.InvalidFontSize;
@@ -183,6 +185,7 @@ pub fn init(options: Options) !CoreTextRenderer {
 }
 
 pub fn deinit(self: *CoreTextRenderer) void {
+    self.kitty_images.deinit(self.allocator);
     self.clearSpriteMasks();
     self.sprite_masks.deinit(self.allocator);
     self.metal.deinit();
@@ -258,6 +261,7 @@ pub fn gridSize(self: *const CoreTextRenderer) GridModel.Size {
 
 pub fn render(self: *CoreTextRenderer, session: *TerminalSession, cursor: ?Cursor) !RenderResult {
     session.syncPixelSize(self.metrics.cell_width, self.metrics.cell_height);
+    try self.kitty_images.sync(self.allocator, session.term);
     var frame = try GridModel.build(self.allocator, session.term, .{
         .metrics = self.metrics,
         .pixel_width = self.pixel_width,
@@ -320,21 +324,25 @@ fn rasterize(
     setFill(context, frame.background);
     ctx.fillRect(context, drawable);
 
-    for (frame.cells) |cell| {
-        var draw_cell = cell;
+    const viewport = graphics.Rect.init(0, self.pixel_height - frame.rows * self.metrics.cell_height, frame.cols * self.metrics.cell_width, frame.rows * self.metrics.cell_height);
+    self.kitty_images.draw(context, .below_background, viewport, self.pixel_height);
+    for (frame.cells) |*draw_cell| {
         // The cursor block is drawn into the cell itself, which keeps it aligned
         // with the glyph grid. `cursor-color` / `cursor-text` win when set;
         // otherwise it falls back to inverse video. Either way it is an explicit
         // highlight, so it stays opaque regardless of window opacity.
         if (cursor) |cur| {
-            if (cell.col == cur.col and cell.row == cur.row) {
-                draw_cell.style.background = cursor_color orelse cell.style.foreground;
-                draw_cell.style.foreground = self.paint.cursor_text orelse cell.style.background;
+            if (draw_cell.col == cur.col and draw_cell.row == cur.row) {
+                const background = draw_cell.style.background;
+                draw_cell.style.background = cursor_color orelse draw_cell.style.foreground;
+                draw_cell.style.foreground = self.paint.cursor_text orelse background;
                 draw_cell.style.foreground.a = 255;
                 draw_cell.style.background.a = 255;
+                draw_cell.style.default_background = false;
             }
         }
 
+        if (draw_cell.style.default_background) continue;
         const x = @as(f64, @floatFromInt(@as(u32, draw_cell.col) * self.metrics.cell_width));
         const y = @as(f64, @floatFromInt(self.pixel_height - (@as(u32, draw_cell.row) + 1) * self.metrics.cell_height));
         const width = @as(f64, @floatFromInt(@as(u32, draw_cell.width) * self.metrics.cell_width));
@@ -346,7 +354,14 @@ fn rasterize(
         if (draw_cell.style.background.a != 255) ctx.clearRect(context, rect);
         setFill(context, draw_cell.style.background);
         ctx.fillRect(context, rect);
-        if (draw_cell.style.invisible) continue;
+    }
+    self.kitty_images.draw(context, .below_text, viewport, self.pixel_height);
+    for (frame.cells) |draw_cell| {
+        if (draw_cell.style.invisible or draw_cell.codepoint == @import("vt").kitty.graphics.unicode.placeholder) continue;
+        const x = @as(f64, @floatFromInt(@as(u32, draw_cell.col) * self.metrics.cell_width));
+        const y = @as(f64, @floatFromInt(self.pixel_height - (@as(u32, draw_cell.row) + 1) * self.metrics.cell_height));
+        const width = @as(f64, @floatFromInt(@as(u32, draw_cell.width) * self.metrics.cell_width));
+        const height = @as(f64, @floatFromInt(self.metrics.cell_height));
 
         const font = self.fonts.select(draw_cell.style);
         if (draw_cell.grapheme.len == 0 and sprite.hasCodepoint(draw_cell.codepoint)) {
@@ -357,6 +372,7 @@ fn rasterize(
         }
         try drawCellText(context, font, draw_cell, x, y, width, self.metrics.cell_height);
     }
+    self.kitty_images.draw(context, .above_text, viewport, self.pixel_height);
 }
 
 fn clearSpriteMasks(self: *CoreTextRenderer) void {
