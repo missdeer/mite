@@ -5,11 +5,19 @@
 static bool confirm_enabled = true;
 static bool accept_close;
 static size_t alerts;
+static bool safe_close_default;
 static const char *active_theme = "Dark";
 static NSString *config_path;
 
 static NSModalResponse respondToAlert(id alert, SEL selector) {
     alerts++;
+    NSAlert *confirmation = alert;
+    [confirmation layout];
+    safe_close_default = confirmation.buttons.count == 2 &&
+        [confirmation.buttons[0].title isEqualToString:@"Cancel"] &&
+        [confirmation.buttons[1].title isEqualToString:@"Close"] &&
+        confirmation.window.defaultButtonCell != confirmation.buttons[1].cell &&
+        ![confirmation.buttons[1].keyEquivalent isEqualToString:@"\r"];
     return accept_close ? NSAlertSecondButtonReturn : NSAlertFirstButtonReturn;
 }
 
@@ -17,9 +25,11 @@ void interaction_test_confirmation(bool enabled, bool accept) {
     confirm_enabled = enabled;
     accept_close = accept;
     alerts = 0;
+    safe_close_default = false;
     method_setImplementation(class_getInstanceMethod(NSAlert.class, @selector(runModal)), (IMP)respondToAlert);
 }
 size_t interaction_test_alerts(void) { return alerts; }
+bool interaction_test_safe_close_default(void) { return safe_close_default; }
 bool mostty_config_confirm_close(void) { return confirm_enabled; }
 bool mostty_config_reload(void) { return true; }
 void interaction_test_config_path(const char *path) { config_path = [NSString stringWithUTF8String:path]; }

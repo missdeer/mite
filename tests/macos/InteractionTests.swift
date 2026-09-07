@@ -124,9 +124,13 @@ struct InteractionTests {
         model.closeSelected()
         expect(model.selectedID == active.id && interaction_test_alerts() == 1,
                "cancelling a tab close preserves the running session")
+        expect(active.view.hasActiveSession && interaction_test_safe_close_default(),
+               "tab confirmation puts Cancel first and never makes Close the Return-key default")
         let appDelegate = AppDelegate()
         expect(appDelegate.applicationShouldTerminate(NSApp) == .terminateCancel,
                "application quit can be cancelled while sessions are active")
+        expect(active.view.hasActiveSession && interaction_test_alerts() == 2 && interaction_test_safe_close_default(),
+               "quit confirmation uses the same safe default and leaves the running session intact")
 
         let original = OriginalDelegate()
         window.delegate = original
@@ -160,9 +164,27 @@ struct InteractionTests {
         expect(!model.tabs.contains { $0.id == unstarted.id } && interaction_test_alerts() == 0,
                "a tab without an active session closes without confirmation")
 
+        let remaining = Array(model.tabs.prefix(2))
+        for tab in remaining {
+            tab.view.frame = window.contentView!.bounds
+            window.contentView = tab.view
+        }
+        expect(remaining.count == 2 && remaining.allSatisfy { $0.view.hasActiveSession },
+               "window-close regression starts with two running sessions")
         original.allowsClose = true
-        expect(proxy.windowShouldClose?(window) == true && model.tabs.isEmpty,
-               "accepted window close shuts down every remaining tab")
+        interaction_test_confirmation(true, false)
+        let tabIDs = model.tabs.map(\.id)
+        expect(proxy.windowShouldClose?(window) == false && model.tabs.map(\.id) == tabIDs &&
+               remaining.allSatisfy { $0.view.hasActiveSession } && interaction_test_alerts() == 1,
+               "cancelling window close preserves every tab and running session")
+        expect(interaction_test_safe_close_default(),
+               "window confirmation never makes Close the Return-key default")
+        interaction_test_confirmation(true, true)
+        expect(proxy.windowShouldClose?(window) == true && model.tabs.isEmpty &&
+               remaining.allSatisfy { !$0.view.hasActiveSession } && interaction_test_alerts() == 1,
+               "one accepted window confirmation shuts down every running session")
+        expect(appDelegate.applicationShouldTerminate(NSApp) == .terminateNow && interaction_test_alerts() == 1,
+               "quitting after accepted window closure does not ask for a second confirmation")
         model.cycleTab(1)
         expect(model.tabs.isEmpty, "cycling an empty tab list is harmless")
 
