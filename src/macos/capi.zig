@@ -26,6 +26,13 @@ comptime {
 
 const allocator = std.heap.c_allocator;
 
+const SelectionInput = struct {
+    start_col: u32,
+    start_row: u32,
+    end_col: u32,
+    end_row: u32,
+};
+
 fn runtimeIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -35,6 +42,7 @@ const Tab = struct {
     renderer: CoreTextRenderer,
     exit_code: ?i32 = null,
     mouse_last_cell: ?vt.Coordinate = null,
+    selection_input: ?SelectionInput = null,
 };
 
 // Process-wide configuration, loaded lazily and replaced by
@@ -141,6 +149,7 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, launcher: ?*const 
     tab.pty.terminal.syncPixelSize(tab.renderer.metrics.cell_width, tab.renderer.metrics.cell_height);
     tab.exit_code = null;
     tab.mouse_last_cell = null;
+    tab.selection_input = null;
     return tab;
 }
 
@@ -297,11 +306,50 @@ export fn mostty_tab_set_selection(
 ) void {
     const tab = tab_opt orelse return;
     const screen = tab.pty.terminal.term.screens.active;
+    const input = SelectionInput{
+        .start_col = start_col,
+        .start_row = start_row,
+        .end_col = end_col,
+        .end_row = end_row,
+    };
+    if (!active) {
+        screen.clearSelection();
+        tab.selection_input = null;
+        return;
+    }
+
+    // Host coordinates remain viewport-relative while output can move the
+    // tracked selection into scrollback. Reuse unchanged endpoints so a
+    // delayed mouse callback cannot replace the selection with a new row.
+    if (screen.selection) |existing| {
+        if (tab.selection_input) |previous| {
+            const keep_start = input.start_col == previous.start_col and
+                input.start_row == previous.start_row;
+            const keep_end = input.end_col == previous.end_col and
+                input.end_row == previous.end_row;
+            if (keep_start and keep_end) return;
+            if (keep_start or keep_end) {
+                const start = if (keep_start)
+                    existing.start()
+                else
+                    viewportPin(tab, start_col, start_row) orelse return;
+                const end = if (keep_end)
+                    existing.end()
+                else
+                    viewportPin(tab, end_col, end_row) orelse return;
+                screen.select(vt.Selection.init(start, end, false)) catch return;
+                tab.selection_input = input;
+                return;
+            }
+        }
+    }
+
     screen.clearSelection();
-    if (!active) return;
+    tab.selection_input = null;
     const start = viewportPin(tab, start_col, start_row) orelse return;
     const end = viewportPin(tab, end_col, end_row) orelse return;
     screen.select(vt.Selection.init(start, end, false)) catch return;
+    tab.selection_input = input;
 }
 
 fn viewportPin(tab: *Tab, col: u32, row: u32) ?vt.Pin {
@@ -315,6 +363,7 @@ export fn mostty_tab_select_word(tab_opt: ?*Tab, col: u32, row: u32) bool {
     const tab = tab_opt orelse return false;
     const screen = tab.pty.terminal.term.screens.active;
     screen.clearSelection();
+    tab.selection_input = null;
     var pin = viewportPin(tab, col, row) orelse return false;
     if (pin.rowAndCell().cell.wide == .spacer_tail and pin.x > 0) pin.x -= 1;
     const sel = word_selection.selectWordCJK(pin, &word_selection.WORD_BOUNDARIES) orelse
@@ -432,6 +481,7 @@ export fn mostty_tab_set_surface(
     if (grid.cols == 0 or grid.rows == 0) return false;
     tab.pty.resize(@intCast(grid.cols), @intCast(grid.rows)) catch return false;
     tab.pty.terminal.syncPixelSize(tab.renderer.metrics.cell_width, tab.renderer.metrics.cell_height);
+    tab.selection_input = null;
     out_cols.* = grid.cols;
     out_rows.* = grid.rows;
     return true;
@@ -599,6 +649,7 @@ export fn mostty_tab_cursor_visible(tab_opt: ?*Tab) bool {
 /// positive scrolls down toward the active area).
 export fn mostty_tab_scroll(tab_opt: ?*Tab, delta_rows: i32) void {
     const tab = tab_opt orelse return;
+    tab.selection_input = null;
     tab.pty.terminal.term.scrollViewport(.{ .delta = @as(isize, delta_rows) });
 }
 
@@ -616,6 +667,7 @@ export fn mostty_tab_scrollbar(tab_opt: ?*Tab) Scrollbar {
 
 export fn mostty_tab_scroll_to_row(tab_opt: ?*Tab, row: u64) void {
     const tab = tab_opt orelse return;
+    tab.selection_input = null;
     const sb = mostty_tab_scrollbar(tab);
     const max_offset = sb.total -| sb.visible;
     tab.pty.terminal.term.scrollViewport(if (row >= max_offset)
@@ -626,6 +678,7 @@ export fn mostty_tab_scroll_to_row(tab_opt: ?*Tab, row: u64) void {
 
 export fn mostty_tab_scroll_to_bottom(tab_opt: ?*Tab) void {
     const tab = tab_opt orelse return;
+    tab.selection_input = null;
     tab.pty.terminal.term.scrollViewport(.{ .bottom = {} });
 }
 
@@ -904,6 +957,34 @@ test "scrollbar offsets select actual history rows and bottom restores output fo
     state = mostty_tab_scrollbar(tab);
     try std.testing.expectEqual(@as(u64, rows), state.visible);
     try std.testing.expect(state.offset <= state.total - state.visible);
+}
+
+test "live output keeps copy anchored when the host republishes stale viewport selection" {
+    const tab = mostty_tab_create(320, 96, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    try tab.pty.terminal.resize(5, 4);
+
+    const initial = "one\r\ntwo\r\nthree\r\nfour";
+    mostty_tab_feed(tab, initial.ptr, initial.len);
+    mostty_tab_set_selection(tab, true, 0, 1, 2, 1);
+
+    // Follow mode scrolls the selected row into history as new output arrives.
+    const update = "\r\nfive";
+    mostty_tab_feed(tab, update.ptr, update.len);
+
+    // A mouse-up callback can still carry the pre-scroll viewport coordinates.
+    // It must not replace the tracked selection with the newly visible row.
+    mostty_tab_set_selection(tab, true, 0, 1, 2, 1);
+
+    var out: [16]u8 = undefined;
+    const n = mostty_tab_selection_text(tab, &out, out.len);
+    try std.testing.expectEqualStrings("two", out[0..n]);
+    try std.testing.expectEqual(GridModel.Selection{
+        .start_col = 0,
+        .start_row = 0,
+        .end_col = 2,
+        .end_row = 0,
+    }, visibleSelection(tab).?);
 }
 
 test "bridge mouse writes negotiated encodings and suppresses disabled and duplicate motion" {
