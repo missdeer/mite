@@ -1,3 +1,4 @@
+//! Shared Windows and macOS terminal mouse encoding.
 const std = @import("std");
 const vt = @import("vt");
 

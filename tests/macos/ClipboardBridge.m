@@ -22,6 +22,21 @@ static NSString *opened_url;
 static bool hovered_url;
 static bool url_open_success;
 static IMP original_open_url;
+static bool mouse_enabled;
+static uint32_t mouse_count, mouse_action, mouse_button;
+static int32_t mouse_x, mouse_y;
+
+void clipboard_test_mouse_mode(bool enabled) { mouse_enabled = enabled; mouse_count = 0; }
+uint32_t clipboard_test_mouse_count(void) { return mouse_count; }
+uint32_t clipboard_test_mouse_action(void) { return mouse_action; }
+uint32_t clipboard_test_mouse_button(void) { return mouse_button; }
+int32_t clipboard_test_mouse_x(void) { return mouse_x; }
+int32_t clipboard_test_mouse_y(void) { return mouse_y; }
+bool mostty_tab_mouse_enabled(MosttyTab *tab) { return mouse_enabled; }
+void mostty_tab_mouse(MosttyTab *tab, uint32_t action, uint32_t button, uint32_t mods, int32_t x, int32_t y) {
+    write_tab = tab;
+    mouse_count += 1; mouse_action = action; mouse_button = button; mouse_x = x; mouse_y = y;
+}
 
 static BOOL recordOpenURL(id workspace, SEL selector, NSURL *url) {
     opened_url = url.absoluteString;

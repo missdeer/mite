@@ -78,6 +78,7 @@ pub fn init(self: *PtySession, options: Options) !void {
             .context = self,
             .title_changed = onTitleChanged,
             .write_pty = onWritePty,
+            .size = onSize,
         },
     });
     errdefer self.terminal.deinit();
@@ -220,6 +221,15 @@ fn onWritePty(context: *anyopaque, bytes: [:0]const u8) void {
     const self: *PtySession = @ptrCast(@alignCast(context));
     self.write(bytes) catch {
         self.write_failed = true;
+    };
+}
+
+fn onSize(_: *anyopaque, term: *vt.Terminal) TerminalSession.SizeResponse {
+    return .{
+        .rows = term.rows,
+        .columns = term.cols,
+        .cell_width = term.width_px / term.cols,
+        .cell_height = term.height_px / term.rows,
     };
 }
 
@@ -469,6 +479,25 @@ fn expectChildOutputLine(session: *PtySession, expected: []const u8) !void {
     }
     std.debug.print("child output did not contain '{s}':\n{s}\n", .{ expected, contents });
     return error.TestExpectedEqual;
+}
+
+test "macOS size query replies with the resized grid through the PTY" {
+    var session: PtySession = undefined;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 80,
+        .rows = 24,
+        .shell = "/bin/sh",
+        .command = "stty -echo -icanon min 0 time 10; printf '\\033[18t'; reply=$(dd bs=1 count=11 2>/dev/null); test \"$reply\" = \"$(printf '\\033[8;32;100t')\" && printf 'SIZE_OK\\n'",
+    });
+    defer session.deinit();
+    try session.resize(100, 32);
+    try drainToEof(&session);
+    const result = try session.wait();
+    try std.testing.expectEqual(@as(u8, 0), result.exited);
+    try expectChildOutputLine(&session, "SIZE_OK");
 }
 
 test "macOS PTY injects configured env entries into the child" {

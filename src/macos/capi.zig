@@ -18,6 +18,7 @@ const Config = @import("../Config.zig");
 const title_mod = @import("../terminal/title.zig");
 const word_selection = @import("../terminal/word_selection.zig");
 const url_hover = @import("../terminal/url_hover.zig");
+const mouse_report = @import("../terminal/mouse_report.zig");
 
 comptime {
     if (builtin.os.tag != .macos) @compileError("capi is macOS-only");
@@ -33,6 +34,7 @@ const Tab = struct {
     pty: PtySession,
     renderer: CoreTextRenderer,
     exit_code: ?i32 = null,
+    mouse_last_cell: ?vt.Coordinate = null,
 };
 
 // Process-wide configuration, loaded lazily and replaced by
@@ -136,7 +138,9 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, launcher: ?*const 
         .env = cfg.env,
     });
     cfg.theme.applyToNewTerminal(tab.pty.terminal.term);
+    tab.pty.terminal.syncPixelSize(tab.renderer.metrics.cell_width, tab.renderer.metrics.cell_height);
     tab.exit_code = null;
+    tab.mouse_last_cell = null;
     return tab;
 }
 
@@ -427,6 +431,7 @@ export fn mostty_tab_set_surface(
     const grid = tab.renderer.gridSize();
     if (grid.cols == 0 or grid.rows == 0) return false;
     tab.pty.resize(@intCast(grid.cols), @intCast(grid.rows)) catch return false;
+    tab.pty.terminal.syncPixelSize(tab.renderer.metrics.cell_width, tab.renderer.metrics.cell_height);
     out_cols.* = grid.cols;
     out_rows.* = grid.rows;
     return true;
@@ -511,6 +516,44 @@ export fn mostty_tab_cell_size(tab_opt: ?*Tab, out_w: *u32, out_h: *u32) void {
     const tab = tab_opt orelse return;
     out_w.* = tab.renderer.metrics.cell_width;
     out_h.* = tab.renderer.metrics.cell_height;
+}
+
+export fn mostty_tab_mouse_enabled(tab_opt: ?*Tab) bool {
+    const tab = tab_opt orelse return false;
+    return mouse_report.enabled(tab.pty.terminal.term);
+}
+
+export fn mostty_tab_mouse(
+    tab_opt: ?*Tab,
+    action: u32,
+    button: u32,
+    mods: u32,
+    x: i32,
+    y: i32,
+) void {
+    const tab = tab_opt orelse return;
+    const event: mouse_report.Event = .{
+        .action = std.enums.fromInt(mouse_report.Action, action) orelse return,
+        .button = if (button == 7) null else std.enums.fromInt(mouse_report.Button, button) orelse return,
+        .mods = .{ .shift = mods & mod_shift != 0, .alt = mods & mod_alt != 0, .ctrl = mods & mod_ctrl != 0 },
+        .pos = .{ .x = x, .y = y },
+    };
+    const term = tab.pty.terminal.term;
+    var bytes: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&bytes);
+    mouse_report.encode(&writer, event, .{
+        .event = term.flags.mouse_event,
+        .format = term.flags.mouse_format,
+        .grid = .{
+            .cols = term.cols,
+            .rows = term.rows,
+            .cell_width = @intCast(tab.renderer.metrics.cell_width),
+            .cell_height = @intCast(tab.renderer.metrics.cell_height),
+        },
+        .any_button_pressed = event.button != null,
+        .last_cell = &tab.mouse_last_cell,
+    }) catch return;
+    if (writer.buffered().len > 0) tab.pty.write(writer.buffered()) catch {};
 }
 
 /// Cursor position in grid cells (column, row from the top of the viewport),
@@ -780,6 +823,87 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     try std.testing.expect(mostty_tab_app_cursor_keys(tab));
     mostty_tab_feed(tab, "\x1b[?2004h", 8);
     try std.testing.expect(mostty_tab_bracketed_paste(tab));
+}
+
+test "bridge mouse writes negotiated encodings and suppresses disabled and duplicate motion" {
+    const tab = mostty_tab_create(640, 480, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    var pipe: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&pipe));
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
+    const original = tab.pty.master_fd;
+    tab.pty.master_fd = pipe[1];
+    defer tab.pty.master_fd = original;
+    const flags: std.c.O = .{ .NONBLOCK = true };
+    try std.testing.expect(std.c.fcntl(pipe[0], std.c.F.SETFL, @as(c_int, @bitCast(flags))) >= 0);
+
+    const cw: i32 = @intCast(tab.renderer.metrics.cell_width);
+    const ch: i32 = @intCast(tab.renderer.metrics.cell_height);
+    const cases = .{
+        .{ "\x1b[?1000h", @as(u32, 0), @as(u32, 0), "\x1b[M !\"" },
+        .{ "\x1b[?1005h", @as(u32, 0), @as(u32, 2), "\x1b[M\"!\"" },
+        .{ "\x1b[?1006h", @as(u32, 0), @as(u32, 1), "\x1b[<1;1;2M" },
+        .{ "", @as(u32, 1), @as(u32, 1), "\x1b[<1;1;2m" },
+        .{ "\x1b[?1002h", @as(u32, 2), @as(u32, 0), "\x1b[<32;1;2M" },
+        .{ "", @as(u32, 0), @as(u32, 3), "\x1b[<64;1;2M" },
+    };
+    var out: [64]u8 = undefined;
+    inline for (cases) |case| {
+        tab.pty.terminal.feed(case[0]);
+        tab.mouse_last_cell = null;
+        mostty_tab_mouse(tab, case[1], case[2], 0, 1, ch + 1);
+        const count = try std.posix.read(pipe[0], &out);
+        try std.testing.expectEqualStrings(case[3], out[0..count]);
+    }
+    mostty_tab_mouse(tab, 2, 0, 0, 1, ch + 1);
+    try std.testing.expectError(error.WouldBlock, std.posix.read(pipe[0], &out));
+    tab.pty.terminal.feed("\x1b[?1003h\x1b[?1016h");
+    mostty_tab_mouse(tab, 2, 7, mod_alt | mod_ctrl, cw + 1, ch + 1);
+    var expected: [64]u8 = undefined;
+    const pixel_report = try std.fmt.bufPrint(&expected, "\x1b[<59;{d};{d}M", .{ cw + 1, ch + 1 });
+    const count = try std.posix.read(pipe[0], &out);
+    try std.testing.expectEqualStrings(pixel_report, out[0..count]);
+    tab.pty.terminal.feed("\x1b[?1003l");
+    try std.testing.expect(!mostty_tab_mouse_enabled(tab));
+    mostty_tab_mouse(tab, 0, 0, 0, 1, 1);
+    try std.testing.expectError(error.WouldBlock, std.posix.read(pipe[0], &out));
+}
+
+test "vim receives mouse clicks and drags from the macOS bridge" {
+    const command =
+        "exec /usr/bin/vim -Nu NONE -i NONE -n " ++
+        "-c 'set mouse=a ttymouse=sgr title' " ++
+        "-c 'call setline(1, [\"alpha\", \"bravo\", \"charlie\"])' " ++
+        "-c \"set titlestring=MOUSE_%{line('.')}_%{col('.')}\"";
+    const tab = mostty_tab_create_with_launcher(640, 480, 1, command, "") orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    try waitForTestTitle(tab, "MOUSE_1_1");
+    try std.testing.expect(mostty_tab_mouse_enabled(tab));
+    const cw: i32 = @intCast(tab.renderer.metrics.cell_width);
+    const ch: i32 = @intCast(tab.renderer.metrics.cell_height);
+    mostty_tab_mouse(tab, 0, 0, 0, 2 * cw + 1, ch + 1);
+    try waitForTestTitle(tab, "MOUSE_2_3");
+    mostty_tab_mouse(tab, 2, 0, 0, 4 * cw + 1, 2 * ch + 1);
+    try waitForTestTitle(tab, "MOUSE_3_5");
+    mostty_tab_mouse(tab, 1, 0, 0, 4 * cw + 1, 2 * ch + 1);
+}
+
+fn waitForTestTitle(tab: *Tab, expected: []const u8) !void {
+    var bytes: [4096]u8 = undefined;
+    for (0..100) |_| {
+        if (tab.pty.terminal.term.getTitle()) |title| {
+            if (std.mem.eql(u8, title, expected)) return;
+        }
+        const count = mostty_tab_read(tab, &bytes, bytes.len);
+        if (count > 0) mostty_tab_feed(tab, &bytes, @intCast(count));
+        if (count == 0 or count == -1) break;
+    }
+    std.debug.print("expected title {s}, received {s}\n", .{ expected, tab.pty.terminal.term.getTitle() orelse "<none>" });
+    const dump = try tab.pty.terminal.term.plainString(std.testing.allocator);
+    defer std.testing.allocator.free(dump);
+    std.debug.print("{s}\n", .{dump});
+    return error.TestExpectedEqual;
 }
 
 test "selection copy unwraps soft lines and includes a wide character from its right half" {

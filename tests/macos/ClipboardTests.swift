@@ -1,5 +1,18 @@
 import AppKit
 
+private final class MouseWheelEvent: NSEvent {
+    var point = NSPoint.zero
+    var delta = 0.0
+    var horizontalDelta = 0.0
+    var precise = false
+    override var type: NSEvent.EventType { .scrollWheel }
+    override var locationInWindow: NSPoint { point }
+    override var scrollingDeltaY: CGFloat { delta }
+    override var scrollingDeltaX: CGFloat { horizontalDelta }
+    override var hasPreciseScrollingDeltas: Bool { precise }
+    override var modifierFlags: NSEvent.ModifierFlags { [] }
+}
+
 @main
 struct ClipboardTests {
     static func main() {
@@ -89,6 +102,66 @@ struct ClipboardTests {
         expect(pasteboard.string(forType: .string) == "sentinel", "a click without selection preserves the clipboard")
         view.mouseUp(with: mouse(.leftMouseUp, 4))
         expect(pasteboard.string(forType: .string) == "sentinel", "an unmatched release preserves the clipboard")
+        clipboard_test_mouse_mode(true)
+        clipboard("sentinel")
+        view.mouseDown(with: mouse(.leftMouseDown, 2))
+        expect(clipboard_test_mouse_count() == 1 && clipboard_test_mouse_action() == 0 &&
+               clipboard_test_mouse_button() == 0, "mouse mode routes the left press to the application")
+        expect(clipboard_test_mouse_x() == 25 && clipboard_test_mouse_y() == 10,
+               "native point coordinates become top-left device pixels")
+        view.mouseDragged(with: mouse(.leftMouseDragged, 4))
+        expect(clipboard_test_mouse_action() == 2, "application drag emits motion")
+        view.mouseUp(with: mouse(.leftMouseUp, 4))
+        expect(clipboard_test_mouse_count() == 3 && clipboard_test_mouse_action() == 1,
+               "application drag ends with one release")
+        expect(clipboard_test_write_tab() == firstTab && pasteboard.string(forType: .string) == "sentinel",
+               "application drag stays with its tab and cannot copy a host selection")
+        view.mouseUp(with: mouse(.leftMouseUp, 4))
+        expect(clipboard_test_mouse_count() == 3, "unmatched releases are not reported")
+        view.mouseDown(with: mouse(.leftMouseDown, 0, flags: .shift))
+        view.mouseDragged(with: mouse(.leftMouseDragged, 4, flags: .shift))
+        view.mouseUp(with: mouse(.leftMouseUp, 4, flags: .shift))
+        expect(clipboard_test_mouse_count() == 3 && pasteboard.string(forType: .string) == "hello",
+               "Shift bypass preserves host selection while application mouse mode is enabled")
+        view.rightMouseDown(with: mouse(.rightMouseDown, 2))
+        view.rightMouseUp(with: mouse(.rightMouseUp, 2))
+        expect(clipboard_test_mouse_count() == 5 && clipboard_test_mouse_button() == 2,
+               "right button routes press and release")
+        view.mouseDown(with: mouse(.leftMouseDown, -1))
+        view.mouseUp(with: mouse(.leftMouseUp, -1))
+        expect(clipboard_test_mouse_count() == 5, "outside-grid clicks are not reported")
+        let wheel = MouseWheelEvent()
+        wheel.point = mouse(.mouseMoved, 2).locationInWindow
+        wheel.delta = 1
+        view.scrollWheel(with: wheel)
+        expect(clipboard_test_mouse_count() == 6 && clipboard_test_mouse_button() == 3,
+               "wheel up is routed to the terminal application")
+        wheel.delta = 0
+        wheel.horizontalDelta = -1
+        view.scrollWheel(with: wheel)
+        expect(clipboard_test_mouse_count() == 7 && clipboard_test_mouse_button() == 6,
+               "horizontal wheel reports its direction")
+        wheel.horizontalDelta = 0
+        wheel.precise = true
+        wheel.delta = view.overlayCellPoints.h / 2
+        view.scrollWheel(with: wheel)
+        expect(clipboard_test_mouse_count() == 7, "partial trackpad movement waits for a cell step")
+        view.scrollWheel(with: wheel)
+        expect(clipboard_test_mouse_count() == 8, "accumulated trackpad movement emits one wheel step")
+        view.mouseDown(with: mouse(.leftMouseDown, 2))
+        let capturedDrag = mouse(.leftMouseDragged, 4)
+        let capturedRelease = mouse(.leftMouseUp, 4)
+        let switched = MosttyTerminalView(frame: view.frame)
+        window.contentView = switched
+        // AppKit's local monitor must intercept events even with another tab attached.
+        NSApp.sendEvent(capturedDrag)
+        NSApp.sendEvent(capturedRelease)
+        expect(clipboard_test_write_tab() == firstTab && clipboard_test_mouse_action() == 1 &&
+               clipboard_test_mouse_count() == 11,
+               "switching tabs mid-drag keeps motion and release on the originating PTY")
+        switched.shutdown()
+        window.contentView = view
+        clipboard_test_mouse_mode(false)
         for (col, expected) in [(2, "hello"), (8, "x")] {
             clipboard("sentinel")
             view.mouseDown(with: mouse(.leftMouseDown, col, clicks: 2))

@@ -22,6 +22,7 @@ src/
   mosttymacos.zig          macOS static-core library entry
   terminal/Session.zig     platform-neutral VT state, stream, and effects owner
   terminal/url_hover.zig   shared viewport URL detection for Windows and macOS
+  terminal/mouse_report.zig shared VT mouse-report encoding for Windows and macOS
   macos/PtySession.zig     macOS shell process, PTY, and VT session owner
   macos/GridModel.zig      VT viewport to resolved renderer-cell conversion
   macos/CoreTextRenderer.zig CoreText rasterization and renderer resource owner
@@ -95,7 +96,6 @@ src/
     png_decode.zig         WIC PNG decode for Kitty f=100 payloads
     paste.zig              clipboard paste, drag-drop, bracketed-paste guard
     tooltip.zig            native TOOLTIPS_CLASS control for tab-bar hover
-    mouse_report.zig       X10/SGR/UTF8/SGR_PIXELS mouse-report encoding
 ```
 
 External modules: `vt` (`ghostty-vt`), `z2d` (Ghostty's 2D vector backend),
@@ -458,6 +458,11 @@ before rendering, paints its underline through `GridModel`, and re-detects the
 target on double-click before passing it to `NSWorkspace` for browser opening.
 Native file drops read file URLs from the drag pasteboard and send individually
 quoted paths through the same bracketed-paste framing as clipboard input.
+The macOS host routes VT mouse modes through the shared mouse encoder and the
+owning tab's PTY; Shift keeps host selection available. A local AppKit event
+monitor pins a pressed gesture to its originating view until release, including
+across tab switches. `PtySession` supplies size replies using the current VT grid
+and pixel dimensions, synchronized when the bridge creates or resizes a surface.
 
 The flow per chunk of PTY bytes is:
 

@@ -54,6 +54,13 @@ bool mostty_tab_app_keypad(MosttyTab *tab);
 bool mostty_tab_bracketed_paste(MosttyTab *tab);
 bool mostty_tab_cursor_visible(MosttyTab *tab);
 
+bool mostty_tab_mouse_enabled(MosttyTab *tab);
+/* action: press=0, release=1, motion=2; button: left/middle/right=0/1/2,
+   wheel up/down/left/right=3/4/5/6, none=7; mods: Shift/Alt/Ctrl=1/2/4.
+   Coordinates are device pixels from the terminal's top-left corner. */
+void mostty_tab_mouse(MosttyTab *tab, uint32_t action, uint32_t button,
+                      uint32_t mods, int32_t x, int32_t y);
+
 void mostty_tab_scroll(MosttyTab *tab, int32_t delta_rows);
 void mostty_tab_scroll_to_bottom(MosttyTab *tab);
 bool mostty_tab_at_bottom(MosttyTab *tab);

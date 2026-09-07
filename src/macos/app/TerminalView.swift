@@ -54,6 +54,13 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     private var urlTrackingArea: NSTrackingArea?
     private var hoveringURL = false
     private var scrollAccum = 0.0
+    private var horizontalScrollAccum = 0.0
+    private var scrollReporting = false
+    private var reportingButtons = Set<UInt32>()
+    private var mouseMonitor: Any?
+    private weak var mouseWindow: NSWindow?
+    private var mouseOrigin = NSPoint.zero
+    private var mouseScale = 1.0
     private var markedText = ""
 
     private var overlay: OverlayView?
@@ -159,6 +166,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 
     func shutdown() {
+        endMouseCapture()
         updateURLHover(at: nil)
         guard alive else {
             if let t = tab { mostty_tab_destroy(t); tab = nil }
@@ -464,7 +472,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
     private func updateURLHover(at point: NSPoint?) {
         guard let t = tab else { return }
-        let cell = selecting ? nil : point.flatMap { viewportCell(at: $0) }
+        let cell = selecting || mostty_tab_mouse_enabled(t) ? nil : point.flatMap { viewportCell(at: $0) }
         let hit = mostty_tab_hover_url(t, cell != nil, cell?.col ?? 0, cell?.row ?? 0)
         if hit != hoveringURL { dirty = true }
         if hit { NSCursor.pointingHand.set() }
@@ -473,6 +481,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        if !selecting, wantsMouseReport(event) { reportMouse(event, action: 2, button: 7) }
         updateURLHover(at: convert(event.locationInWindow, from: nil))
         dirty = true
     }
@@ -492,6 +501,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         guard let t = tab else { return }
+        if beginMouseReport(event, button: 0) { return }
         let point = convert(event.locationInWindow, from: nil)
         if event.clickCount == 2, !event.modifierFlags.contains(.shift), openURL(at: point) {
             selecting = false; selectingWord = false; hasSelection = false
@@ -513,6 +523,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if reportingButtons.contains(0) { reportMouse(event, action: 2, button: 0); return }
         guard selecting else { return }
         selectingWord = false
         selEnd = cellAt(event)
@@ -521,6 +532,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if finishMouseReport(event, button: 0) { return }
         guard selecting else { return }
         selecting = false
         if !selectingWord {
@@ -530,6 +542,100 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         }
         selectingWord = false
         copy(nil)
+    }
+
+    private func wantsMouseReport(_ event: NSEvent) -> Bool {
+        guard let t = tab, alive, !terminated else { return false }
+        if !reportingButtons.isEmpty { return true }
+        return !event.modifierFlags.contains(.shift) && mostty_tab_mouse_enabled(t) &&
+            viewportCell(at: convert(event.locationInWindow, from: nil)) != nil
+    }
+
+    private func reportMouse(_ event: NSEvent, action: UInt32, button: UInt32) {
+        guard let t = tab, alive, !terminated else { return }
+        let captured = !reportingButtons.isEmpty
+        let point = captured
+            ? NSPoint(x: event.locationInWindow.x - mouseOrigin.x, y: event.locationInWindow.y - mouseOrigin.y)
+            : convert(event.locationInWindow, from: nil)
+        let scale = captured ? mouseScale : Double(currentScale())
+        let x = Int32(clamping: Int(floor(Double(point.x) * scale)))
+        let y = Int32(clamping: Int(floor((Double(bounds.height) - Double(point.y)) * scale)))
+        mostty_tab_mouse(t, action, button, KeyInput.modifiers(event.modifierFlags), x, y)
+    }
+
+    private func beginMouseReport(_ event: NSEvent, button: UInt32) -> Bool {
+        guard !selecting, wantsMouseReport(event) else { return false }
+        if reportingButtons.isEmpty {
+            mouseWindow = window
+            mouseOrigin = convert(.zero, to: nil)
+            mouseScale = Double(currentScale())
+            // A tab switch detaches this view. Keep the originating view and
+            // window coordinates as the report target until the buttons lift.
+            mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [
+                .leftMouseDown, .rightMouseDown, .otherMouseDown,
+                .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
+                .leftMouseUp, .rightMouseUp, .otherMouseUp, .scrollWheel,
+            ]) { [weak self] next in
+                guard let self = self, !self.reportingButtons.isEmpty,
+                      next.window === self.mouseWindow else { return next }
+                if next.type == .scrollWheel { self.scrollWheel(with: next); return nil }
+                let button: UInt32
+                switch next.buttonNumber {
+                case 0: button = 0
+                case 1: button = 2
+                case 2: button = 1
+                default: return next
+                }
+                switch next.type {
+                case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+                    _ = self.beginMouseReport(next, button: button)
+                case .leftMouseUp, .rightMouseUp, .otherMouseUp:
+                    _ = self.finishMouseReport(next, button: button)
+                default:
+                    if self.reportingButtons.contains(button) { self.reportMouse(next, action: 2, button: button) }
+                }
+                return nil
+            }
+        }
+        reportingButtons.insert(button)
+        reportMouse(event, action: 0, button: button)
+        hasSelection = false
+        publishSelection()
+        updateURLHover(at: nil)
+        return true
+    }
+
+    private func finishMouseReport(_ event: NSEvent, button: UInt32) -> Bool {
+        guard reportingButtons.contains(button) else { return false }
+        reportMouse(event, action: 1, button: button)
+        reportingButtons.remove(button)
+        if reportingButtons.isEmpty { endMouseCapture() }
+        return true
+    }
+
+    private func endMouseCapture() {
+        if let monitor = mouseMonitor { NSEvent.removeMonitor(monitor) }
+        mouseMonitor = nil
+        mouseWindow = nil
+        reportingButtons.removeAll()
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        if !beginMouseReport(event, button: 2) { super.rightMouseDown(with: event) }
+    }
+    override func rightMouseDragged(with event: NSEvent) {
+        if reportingButtons.contains(2) { reportMouse(event, action: 2, button: 2) }
+    }
+    override func rightMouseUp(with event: NSEvent) { _ = finishMouseReport(event, button: 2) }
+    override func otherMouseDown(with event: NSEvent) {
+        if event.buttonNumber == 2 { _ = beginMouseReport(event, button: 1) }
+    }
+    override func otherMouseDragged(with event: NSEvent) {
+        if event.buttonNumber == 2, reportingButtons.contains(1) { reportMouse(event, action: 2, button: 1) }
+    }
+    override func otherMouseUp(with event: NSEvent) {
+        if event.buttonNumber == 2 { _ = finishMouseReport(event, button: 1) }
     }
 
     /// Hand the selection to the bridge so the highlight is painted with the
@@ -546,6 +652,11 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
     override func scrollWheel(with event: NSEvent) {
         guard let t = tab else { return }
+        let reporting = !selecting && wantsMouseReport(event)
+        if reporting != scrollReporting {
+            scrollAccum = 0; horizontalScrollAccum = 0
+            scrollReporting = reporting
+        }
         scrollAccum += Double(event.scrollingDeltaY)
         // Precise (trackpad) deltas are points and must be divided by the cell
         // height; non-precise (mouse wheel) deltas are already line units.
@@ -559,8 +670,19 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         let rowsMoved = Int(scrollAccum / step)
         if rowsMoved != 0 {
             scrollAccum -= Double(rowsMoved) * step
-            mostty_tab_scroll(t, Int32(-rowsMoved))
+            if reporting {
+                for _ in 0..<abs(rowsMoved) { reportMouse(event, action: 0, button: rowsMoved > 0 ? 3 : 4) }
+            } else {
+                mostty_tab_scroll(t, Int32(clamping: -rowsMoved))
+            }
             dirty = true
+        }
+        if reporting {
+            horizontalScrollAccum += Double(event.scrollingDeltaX)
+            let xStep = event.hasPreciseScrollingDeltas ? max(1, Double(cellWidthPx) / Double(currentScale())) : 1
+            let columnsMoved = Int(horizontalScrollAccum / xStep)
+            horizontalScrollAccum -= Double(columnsMoved) * xStep
+            for _ in 0..<abs(columnsMoved) { reportMouse(event, action: 0, button: columnsMoved > 0 ? 5 : 6) }
         }
     }
 
