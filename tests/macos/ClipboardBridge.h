@@ -16,3 +16,4 @@ uint32_t clipboard_test_mouse_action(void);
 uint32_t clipboard_test_mouse_button(void);
 int32_t clipboard_test_mouse_x(void);
 int32_t clipboard_test_mouse_y(void);
+void clipboard_test_scrollback(MosttyTab *tab, uint64_t total, uint64_t offset, uint64_t visible);

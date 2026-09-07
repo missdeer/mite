@@ -10,6 +10,7 @@ static uint8_t written[4096];
 static size_t written_count;
 static uint8_t tabs[8];
 static size_t tab_count;
+static MosttyScrollbar scrollbars[8];
 static MosttyTab *write_tab;
 static bool bracketed_paste;
 static bool selection_active;
@@ -71,6 +72,7 @@ size_t clipboard_test_written(uint8_t *buf, size_t cap) {
 
 MosttyTab *mostty_tab_create(uint32_t w, uint32_t h, float scale) {
     assert(tab_count < sizeof(tabs));
+    scrollbars[tab_count] = (MosttyScrollbar){h / 20, 0, h / 20};
     return (MosttyTab *)&tabs[tab_count++];
 }
 MosttyTab *mostty_tab_create_with_launcher(uint32_t w, uint32_t h, float scale,
@@ -105,8 +107,23 @@ void mostty_tab_cell_size(MosttyTab *tab, uint32_t *w, uint32_t *h) { *w = 10; *
 void mostty_tab_cursor(MosttyTab *tab, uint32_t *col, uint32_t *row) { *col = 0; *row = 0; }
 bool mostty_tab_app_cursor_keys(MosttyTab *tab) { return false; }
 bool mostty_tab_bracketed_paste(MosttyTab *tab) { return bracketed_paste; }
-void mostty_tab_scroll(MosttyTab *tab, int32_t rows) {}
-void mostty_tab_scroll_to_bottom(MosttyTab *tab) {}
+MosttyScrollbar mostty_tab_scrollbar(MosttyTab *tab) {
+    return tab ? scrollbars[(uint8_t *)tab - tabs] : (MosttyScrollbar){0};
+}
+void clipboard_test_scrollback(MosttyTab *tab, uint64_t total, uint64_t offset, uint64_t visible) {
+    scrollbars[(uint8_t *)tab - tabs] = (MosttyScrollbar){total, offset, visible};
+}
+void mostty_tab_scroll_to_row(MosttyTab *tab, uint64_t row) {
+    if (!tab) return;
+    MosttyScrollbar *state = &scrollbars[(uint8_t *)tab - tabs];
+    uint64_t max_offset = state->total > state->visible ? state->total - state->visible : 0;
+    state->offset = MIN(row, max_offset);
+}
+void mostty_tab_scroll(MosttyTab *tab, int32_t rows) {
+    MosttyScrollbar state = mostty_tab_scrollbar(tab);
+    mostty_tab_scroll_to_row(tab, MAX(0, (int64_t)state.offset + rows));
+}
+void mostty_tab_scroll_to_bottom(MosttyTab *tab) { mostty_tab_scroll_to_row(tab, UINT64_MAX); }
 void mostty_tab_set_selection(MosttyTab *tab, bool active, uint32_t sc, uint32_t sr, uint32_t ec, uint32_t er) {
     selection_active = active; selection_end = ec; word_selection = false;
 }

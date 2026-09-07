@@ -63,6 +63,8 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     private var mouseScale = 1.0
     private var markedText = ""
 
+    private let surface = TerminalMetalView(frame: .zero)
+    private let scroller = NSScroller(frame: NSRect(x: 0, y: 0, width: 15, height: 100))
     private var overlay: OverlayView?
 
     var onTitleChange: ((String) -> Void)?
@@ -81,17 +83,27 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         super.init(frame: frameRect)
         wantsLayer = true
         layerContentsRedrawPolicy = .duringViewResize
+        surface.wantsLayer = true
+        addSubview(surface)
         let ov = OverlayView(frame: bounds)
         ov.owner = self
         ov.autoresizingMask = [.width, .height]
         addSubview(ov)
         overlay = ov
+        scroller.scrollerStyle = .legacy
+        scroller.controlSize = .regular
+        scroller.target = self
+        scroller.action = #selector(scrollbarChanged(_:))
+        scroller.isContinuous = true
+        scroller.setAccessibilityLabel("Terminal scrollback")
+        addSubview(scroller)
+        layoutSurface()
+        updateScroller()
         registerForDraggedTypes([.fileURL])
     }
 
     required init?(coder: NSCoder) { fatalError("unsupported") }
 
-    override func makeBackingLayer() -> CALayer { CAMetalLayer() }
     override var isOpaque: Bool { !translucent }
     override var acceptsFirstResponder: Bool { true }
     override func becomeFirstResponder() -> Bool { true }
@@ -103,6 +115,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         if let window = window {
             window.acceptsMouseMovedEvents = true
             setupIfNeeded()
+            updateScroller()
         } else {
             updateURLHover(at: nil)
         }
@@ -110,21 +123,30 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
     override func layout() {
         super.layout()
+        layoutSurface()
         setupIfNeeded()
-        overlay?.frame = bounds
+    }
+
+    private func layoutSurface() {
+        let width = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        let contentWidth = max(0, bounds.width - width)
+        surface.frame = NSRect(x: 0, y: 0, width: contentWidth, height: bounds.height)
+        overlay?.frame = surface.frame
+        scroller.frame = NSRect(x: contentWidth, y: 0, width: width, height: bounds.height)
     }
 
     private func currentScale() -> CGFloat { window?.backingScaleFactor ?? 2.0 }
 
     private func pixelSize() -> (w: UInt32, h: UInt32) {
         let scale = currentScale()
-        let w = UInt32(max(1.0, Double(bounds.width) * Double(scale)))
+        let w = UInt32(max(1.0, Double(surface.bounds.width) * Double(scale)))
         let h = UInt32(max(1.0, Double(bounds.height) * Double(scale)))
         return (w, h)
     }
 
     private func setupIfNeeded() {
         guard tab == nil, window != nil, bounds.width > 1, bounds.height > 1 else { return }
+        layoutSurface()
         let scale = currentScale()
         let (pw, ph) = pixelSize()
         let created: OpaquePointer?
@@ -138,7 +160,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
 
         guard let devPtr = mostty_tab_metal_device(t),
               let dev = Unmanaged<AnyObject>.fromOpaque(devPtr).takeUnretainedValue() as? MTLDevice,
-              let layer = self.layer as? CAMetalLayer else {
+              let layer = surface.layer as? CAMetalLayer else {
             mostty_tab_destroy(t); tab = nil; return
         }
         device = dev
@@ -281,6 +303,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     func resyncSurface() {
         guard window != nil else { return }
         syncSurfaceIfNeeded()
+        updateScroller()
     }
 
     private func startBlink() {
@@ -301,6 +324,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         // The reader still feeds VT state; the next present happens when shown.
         guard window != nil else { return }
         syncSurfaceIfNeeded()
+        updateScroller()
         guard alive, dirty, let t = tab, let layer = metalLayer, let queue = commandQueue else { return }
         let mouse = window?.isKeyWindow == true
             ? window.map { convert($0.mouseLocationOutsideOfEventStream, from: nil) } : nil
@@ -329,6 +353,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 
     private func syncSurfaceIfNeeded() {
+        layoutSurface()
         guard alive, let t = tab, let layer = metalLayer else { return }
         let scale = currentScale()
         let (pw, ph) = pixelSize()
@@ -394,8 +419,36 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     private func scrollToBottomOnInput() {
         guard let t = tab else { return }
         mostty_tab_scroll_to_bottom(t)
+        updateScroller()
         blinkOn = true
         dirty = true
+    }
+
+    private func updateScroller() {
+        let state = mostty_tab_scrollbar(tab)
+        let scrollable = state.total > state.visible
+        scroller.isEnabled = scrollable
+        scroller.knobProportion = state.total > 0 ? Double(state.visible) / Double(state.total) : 1
+        scroller.doubleValue = scrollable ? Double(state.offset) / Double(state.total - state.visible) : 1
+    }
+
+    @objc private func scrollbarChanged(_ sender: NSScroller) {
+        guard let t = tab else { return }
+        let state = mostty_tab_scrollbar(t)
+        guard state.total > state.visible else { return }
+        let page = Int32(clamping: max(1, state.visible - 1))
+        switch sender.hitPart {
+        case .decrementLine: mostty_tab_scroll(t, -1)
+        case .incrementLine: mostty_tab_scroll(t, 1)
+        case .decrementPage: mostty_tab_scroll(t, -page)
+        case .incrementPage: mostty_tab_scroll(t, page)
+        case .knob, .knobSlot:
+            let row = UInt64((sender.doubleValue * Double(state.total - state.visible)).rounded())
+            mostty_tab_scroll_to_row(t, row)
+        default: return
+        }
+        dirty = true
+        updateScroller()
     }
 
     // MARK: Keyboard
@@ -453,7 +506,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     }
 
     private func viewportCell(at point: NSPoint) -> (col: UInt32, row: UInt32)? {
-        guard bounds.contains(point) else { return nil }
+        guard surface.frame.contains(point) else { return nil }
         let cell = gridCell(at: point)
         guard cell.col >= 0, cell.row >= 0, cell.col < Int(cols), cell.row < Int(rows) else { return nil }
         return (UInt32(cell.col), UInt32(cell.row))
@@ -674,6 +727,7 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
                 for _ in 0..<abs(rowsMoved) { reportMouse(event, action: 0, button: rowsMoved > 0 ? 3 : 4) }
             } else {
                 mostty_tab_scroll(t, Int32(clamping: -rowsMoved))
+                updateScroller()
             }
             dirty = true
         }
@@ -840,6 +894,11 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
         mostty_tab_cursor(t, &col, &row)
         return (Int(col), Int(row))
     }
+}
+
+private final class TerminalMetalView: NSView {
+    override func makeBackingLayer() -> CALayer { CAMetalLayer() }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 /// Transparent layer above the Metal content that draws the IME composition text.

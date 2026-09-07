@@ -467,6 +467,12 @@ owning tab's PTY; Shift keeps host selection available. A local AppKit event
 monitor pins a pressed gesture to its originating view until release, including
 across tab switches. `PtySession` supplies size replies using the current VT grid
 and pixel dimensions, synchronized when the bridge creates or resizes a surface.
+Each macOS terminal view reserves a right-side strip for a native `NSScroller`;
+the Metal child surface and IME overlay share the remaining content bounds.
+The scrollbar queries the active VT screen's total rows, viewport offset and
+visible rows. Native dragging selects an absolute history row; the final offset
+explicitly restores bottom-follow mode. Its events stay outside the terminal
+mouse-reporting area, and the visible tab refreshes the indicator on render ticks.
 
 The flow per chunk of PTY bytes is:
 

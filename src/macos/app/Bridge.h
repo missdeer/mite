@@ -62,6 +62,15 @@ void mostty_tab_mouse(MosttyTab *tab, uint32_t action, uint32_t button,
                       uint32_t mods, int32_t x, int32_t y);
 
 void mostty_tab_scroll(MosttyTab *tab, int32_t delta_rows);
+/* Live tabs have 0 < visible <= total and offset <= total - visible. */
+typedef struct {
+    uint64_t total;
+    uint64_t offset;
+    uint64_t visible;
+} MosttyScrollbar;
+MosttyScrollbar mostty_tab_scrollbar(MosttyTab *tab);
+/* Absolute row from the start of history, clamped to the active viewport. */
+void mostty_tab_scroll_to_row(MosttyTab *tab, uint64_t row);
 void mostty_tab_scroll_to_bottom(MosttyTab *tab);
 bool mostty_tab_at_bottom(MosttyTab *tab);
 

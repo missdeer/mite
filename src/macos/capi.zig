@@ -602,6 +602,28 @@ export fn mostty_tab_scroll(tab_opt: ?*Tab, delta_rows: i32) void {
     tab.pty.terminal.term.scrollViewport(.{ .delta = @as(isize, delta_rows) });
 }
 
+const Scrollbar = extern struct {
+    total: u64,
+    offset: u64,
+    visible: u64,
+};
+
+export fn mostty_tab_scrollbar(tab_opt: ?*Tab) Scrollbar {
+    const tab = tab_opt orelse return .{ .total = 0, .offset = 0, .visible = 0 };
+    const sb = tab.pty.terminal.term.screens.active.pages.scrollbar();
+    return .{ .total = sb.total, .offset = sb.offset, .visible = sb.len };
+}
+
+export fn mostty_tab_scroll_to_row(tab_opt: ?*Tab, row: u64) void {
+    const tab = tab_opt orelse return;
+    const sb = mostty_tab_scrollbar(tab);
+    const max_offset = sb.total -| sb.visible;
+    tab.pty.terminal.term.scrollViewport(if (row >= max_offset)
+        .bottom
+    else
+        .{ .row = @intCast(row) });
+}
+
 export fn mostty_tab_scroll_to_bottom(tab_opt: ?*Tab) void {
     const tab = tab_opt orelse return;
     tab.pty.terminal.term.scrollViewport(.{ .bottom = {} });
@@ -823,6 +845,65 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     try std.testing.expect(mostty_tab_app_cursor_keys(tab));
     mostty_tab_feed(tab, "\x1b[?2004h", 8);
     try std.testing.expect(mostty_tab_bracketed_paste(tab));
+}
+
+test "scrollbar offsets select actual history rows and bottom restores output following" {
+    const tab = mostty_tab_create(320, 160, 1) orelse return error.TabCreateFailed;
+    defer mostty_tab_destroy(tab);
+    const initial = mostty_tab_scrollbar(tab);
+    try std.testing.expectEqual(initial.visible, initial.total);
+    try std.testing.expectEqual(@as(u64, 0), initial.offset);
+    try std.testing.expectEqual(@as(u64, 0), mostty_tab_scrollbar(null).total);
+    mostty_tab_scroll_to_row(null, 123);
+    mostty_tab_scroll_to_row(tab, std.math.maxInt(u64));
+    try std.testing.expect(mostty_tab_at_bottom(tab));
+
+    for (0..100) |i| {
+        var buf: [16]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "{d:0>3}\r\n", .{i});
+        mostty_tab_feed(tab, line.ptr, line.len);
+    }
+    var state = mostty_tab_scrollbar(tab);
+    try std.testing.expectEqual(@as(u64, 101), state.total);
+    try std.testing.expectEqual(state.total - state.visible, state.offset);
+
+    for ([_]u64{ 0, (state.total - state.visible) / 2, state.total - state.visible }) |row| {
+        mostty_tab_scroll_to_row(tab, row);
+        state = mostty_tab_scrollbar(tab);
+        try std.testing.expectEqual(row, state.offset);
+        mostty_tab_set_selection(tab, true, 0, 0, 2, 0);
+        var text: [16]u8 = undefined;
+        const len = mostty_tab_selection_text(tab, &text, text.len);
+        var expected: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{d:0>3}", .{row}), text[0..len]);
+    }
+    mostty_tab_set_selection(tab, false, 0, 0, 0, 0);
+    mostty_tab_scroll_to_row(tab, 20);
+    mostty_tab_feed(tab, "100\r\n", 5);
+    try std.testing.expectEqual(@as(u64, 20), mostty_tab_scrollbar(tab).offset);
+    mostty_tab_scroll(tab, -5);
+    try std.testing.expectEqual(@as(u64, 15), mostty_tab_scrollbar(tab).offset);
+    mostty_tab_scroll_to_row(tab, std.math.maxInt(u64));
+    try std.testing.expect(mostty_tab_at_bottom(tab));
+    mostty_tab_feed(tab, "101\r\n", 5);
+    state = mostty_tab_scrollbar(tab);
+    try std.testing.expectEqual(state.total - state.visible, state.offset);
+
+    mostty_tab_scroll_to_row(tab, 20);
+    mostty_tab_feed(tab, "\x1b[?1049h", 8);
+    state = mostty_tab_scrollbar(tab);
+    try std.testing.expectEqual(state.visible, state.total);
+    mostty_tab_scroll_to_row(tab, 500);
+    try std.testing.expectEqual(@as(u64, 0), mostty_tab_scrollbar(tab).offset);
+    mostty_tab_feed(tab, "\x1b[?1049l", 8);
+    try std.testing.expectEqual(@as(u64, 20), mostty_tab_scrollbar(tab).offset);
+
+    var cols: u32 = 0;
+    var rows: u32 = 0;
+    try std.testing.expect(mostty_tab_set_surface(tab, 320, 240, 1, &cols, &rows));
+    state = mostty_tab_scrollbar(tab);
+    try std.testing.expectEqual(@as(u64, rows), state.visible);
+    try std.testing.expect(state.offset <= state.total - state.visible);
 }
 
 test "bridge mouse writes negotiated encodings and suppresses disabled and duplicate motion" {
