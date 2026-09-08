@@ -217,3 +217,93 @@ test "Kitty chunk completion and query replies do not publish partial images" {
     try f.expectPixel(f.renderer.metrics.cell_width, f.renderer.metrics.cell_height, .{ 255, 0, 0, 255 });
     try f.expectPixel(f.renderer.metrics.cell_width, 3 * f.renderer.metrics.cell_height, .{ 0, 255, 0, 255 });
 }
+
+test "Sixel shares the renderer, scrolls with text, and disappears on clear" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.session.feed("\x1b[?25l\x1bP0;1q\"1;1;12;12#1;2;100;0;0!12~-#2;2;0;100;0!12~\x1b\\");
+    try f.render();
+    try f.expectPixel(3, 2, .{ 255, 0, 0, 255 });
+    try f.expectPixel(3, 9, .{ 0, 255, 0, 255 });
+    const rows = f.session.term.rows;
+    for (0..rows + 1) |_| f.session.feed("\r\n");
+    try f.render();
+    try std.testing.expectEqual(@as(usize, 0), f.renderer.kitty_images.placements.items.len);
+    f.session.term.scrollViewport(.top);
+    try f.render();
+    try f.expectPixel(3, 2, .{ 255, 0, 0, 255 });
+    f.session.feed("\x1b[H\x1b[2J\x1b[3J");
+    try f.render();
+    try std.testing.expectEqual(@as(usize, 0), f.renderer.kitty_images.placements.items.len);
+}
+
+test "iTerm PNG size units, aspect ratio, fragmented input and disabled rendering" {
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAHElEQVR4nATAAREAAAgDIc7kNv9xkTwKFgAA//87AAV+M2k18gAAAABJRU5ErkJggg==";
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.session.feed("\x1b[?25l");
+    const cw = f.renderer.metrics.cell_width;
+    const ch = f.renderer.metrics.cell_height;
+    for ([_]struct { options: []const u8, width: u32, height: u32 }{
+        .{ .options = "width=20px;height=12px;preserveAspectRatio=0", .width = 20, .height = 12 },
+        .{ .options = "width=20px;height=12px;preserveAspectRatio=1", .width = 12, .height = 12 },
+        .{ .options = "width=2;height=1;preserveAspectRatio=0", .width = 2 * cw, .height = ch },
+        .{ .options = "width=50%;height=auto", .width = f.session.term.width_px / 2, .height = f.session.term.width_px / 2 },
+        .{ .options = "width=auto;height=auto", .width = 2, .height = 2 },
+    }) |case| {
+        f.session.feed("\x1b[H\x1b[2J\x1b[3J");
+        const sequence = try std.fmt.allocPrint(alloc, "\x1b]1337;File=inline=1;{s}:{s}\x07", .{ case.options, png });
+        defer alloc.free(sequence);
+        for (sequence) |byte| f.session.feed(&.{byte});
+        try f.render();
+        try std.testing.expectEqual(@as(usize, 1), f.renderer.kitty_images.placements.items.len);
+        var images = f.session.term.screens.active.kitty_images.images.valueIterator();
+        // Clear removes placements; storage may retain older image data.
+        var matched = false;
+        while (images.next()) |image| {
+            if (image.metadata.placement_count == 0) continue;
+            try std.testing.expectEqual(case.width, image.width);
+            try std.testing.expectEqual(case.height, image.height);
+            matched = true;
+        }
+        try std.testing.expect(matched);
+        const cursor_row = try std.math.divCeil(u32, case.height, ch);
+        try std.testing.expectEqual(cursor_row, f.session.term.screens.active.cursor.y);
+        try f.expectPixel(case.width / 4, case.height / 4, .{ 255, 0, 0, 255 });
+        try f.expectPixel(case.width / 4, case.height * 3 / 4, .{ 0, 0, 255, 255 });
+    }
+    f.session.setImagesEnabled(false);
+    try f.render();
+    try std.testing.expectEqual(@as(usize, 0), f.renderer.kitty_images.placements.items.len);
+    f.session.feed("\x1b]1337;File=inline=1:invalid\x1b\\");
+    try f.render();
+    try std.testing.expectEqual(@as(u32, 0), f.renderer.kitty_images.images.count());
+}
+
+test "imgcat multipart transfer publishes only on FileEnd and disable cancels pending data" {
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAHElEQVR4nATAAREAAAgDIc7kNv9xkTwKFgAA//87AAV+M2k18gAAAABJRU5ErkJggg==";
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.session.feed("\x1b[?25l\x1b]1337;MultipartFile=inline=1;width=20px\x07");
+    for ([_][]const u8{ png[0..60], png[60..] }) |part| {
+        f.session.feed("\x1b]1337;FilePart=");
+        for (part) |byte| f.session.feed(&.{byte});
+        f.session.feed("\x07");
+        try std.testing.expectEqual(@as(u32, 0), f.session.term.screens.active.kitty_images.images.count());
+    }
+    f.session.feed("\x1b]1337;FileEnd\x07");
+    try f.render();
+    try std.testing.expectEqual(@as(usize, 1), f.renderer.kitty_images.placements.items.len);
+    try f.expectPixel(5, 5, .{ 255, 0, 0, 255 });
+    try f.expectPixel(5, 15, .{ 0, 0, 255, 255 });
+    f.session.feed("\x1b]1337;MultipartFile=inline=1\x07\x1b]1337;FilePart=");
+    f.session.feed(png);
+    f.session.feed("\x07");
+    f.session.setImagesEnabled(false);
+    f.session.setImagesEnabled(true);
+    f.session.feed("\x1b]1337;FileEnd\x07");
+    try std.testing.expectEqual(@as(u32, 0), f.session.term.screens.active.kitty_images.images.count());
+}

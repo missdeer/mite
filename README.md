@@ -23,7 +23,7 @@ Both Windows and macOS provide:
 - **File drag-and-drop.** Drop files from Explorer or Finder to paste space-separated, quoted paths into the active session. macOS escapes shell-special characters inside those paths.
 - **Scrollback and mouse input.** Browse terminal history with the mouse wheel or a draggable scrollbar. Terminal applications can receive mouse clicks, drags, motion, and wheel events through the negotiated VT mouse protocol; hold `Shift` to use local selection/scrolling instead.
 - **IME input.** CJK and other input methods show composition and candidate UI at the terminal caret.
-- **Kitty inline images.** Display terminal images with placement clipping, layering, scrolling, replacement, and deletion. Image state belongs to each terminal session. Windows requires a ConPTY version that forwards Kitty image sequences; see below.
+- **Terminal inline images.** Display Kitty, Sixel, and iTerm2 images with placement clipping and scrolling. Kitty also supports layering, replacement, and deletion. Sixel and iTerm2 advance the cursor below the image; iTerm2 accepts pixel, cell, percentage, and automatic sizes. Set `images-enabled = false` to discard all three image protocols; the setting reloads live and removes existing images. Windows requires a ConPTY version that forwards image sequences; see below.
 
 See [Configuration](configurations.md) for syntax, examples, defaults, and the full [platform support table](configurations.md#platform-support).
 

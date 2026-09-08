@@ -97,6 +97,7 @@ unknown keys follow the rules in [Syntax](#syntax).
 | `cursor-color`, `cursor-text` | yes | yes |
 | `selection-background`, `selection-foreground` | yes | yes |
 | `background-opacity`, `background-blur` | yes | yes |
+| `images-enabled` | yes | yes |
 | `maximize`, `fullscreen` | yes | yes |
 | `confirm-close-surface` | no | yes |
 | `render-interval-local-ms` | yes | yes |
@@ -583,6 +584,16 @@ D3D11 fallback or exit and never switches between the two Vulkan presentation
 paths.
 
 **Hot-reload:** no; changing the renderer requires restarting Mostty.
+
+### `images-enabled`
+
+Enable Kitty, Sixel, and iTerm2 terminal image protocols. Defaults to `true`.
+Set `images-enabled = false` to discard image sequences without displaying
+their payload as text. Disabling also removes existing images and stops
+advertising Sixel capability. This does not affect background wallpaper.
+
+**Hot-reload:** yes, on both platforms; re-enabling accepts new images but
+does not restore removed images.
 
 ### `render-interval-local-ms` / `render-interval-remote-ms`
 

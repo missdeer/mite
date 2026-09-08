@@ -533,6 +533,26 @@ Kitty graphics support is wired through `Tab.session` and
    only when the visible placement set changes; visible above-text images
    force a full grid redraw for correctness with the persistent grid texture.
 
+### 5.5 Sixel and iTerm2 images
+
+`terminal/InlineImages.zig` intercepts Sixel DCS and iTerm2 file transfers
+strings at the shared session input boundary because the pinned VT library
+does not implement these image protocols. Other input continues through the
+upstream stream. Interception preserves state across PTY chunks and cancels
+unfinished image strings on CAN/SUB or an unrelated escape sequence. Captured
+payloads and final RGBA images are bounded to 64 MiB and dimensions to 10,000
+pixels. iTerm2 multipart transfers assemble file parts until `FileEnd`.
+
+`terminal/Sixel.zig` decodes raster data and RGB/HLS palettes; iTerm2 files use
+WIC on Windows and ImageIO on macOS. Resized RGBA images enter the existing
+Kitty image store with implicit IDs and tracked cursor pins, so every renderer
+uses its existing image upload and clipping path. The cursor advances to the
+first full row below the image. VT owns scrolling, clear, and teardown.
+
+`images-enabled` defaults to true. Startup and config reload apply it to each
+session; disabling clears image storage across screens, drops new images,
+and removes Sixel from the shared DA1 capability response.
+
 ---
 
 ## 6. Rendering Pipeline

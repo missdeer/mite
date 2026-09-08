@@ -144,6 +144,7 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, launcher: ?*const 
         .working_directory = working_directory,
         .command = command,
         .env = cfg.env,
+        .images_enabled = cfg.images_enabled,
     });
     cfg.theme.applyToNewTerminal(tab.pty.terminal.term);
     tab.pty.terminal.syncPixelSize(tab.renderer.metrics.cell_width, tab.renderer.metrics.cell_height);
@@ -197,6 +198,7 @@ export fn mostty_tab_apply_config(tab_opt: ?*Tab) bool {
     const tab = tab_opt orelse return false;
     const cfg = config();
     tab.renderer.paint = paintOptions(cfg);
+    tab.pty.terminal.setImagesEnabled(cfg.images_enabled);
     cfg.theme.rebaseTerminal(tab.pty.terminal.term);
     return tab.renderer.reconfigure(fontOptions(cfg)) catch false;
 }

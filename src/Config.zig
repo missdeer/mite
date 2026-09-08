@@ -250,6 +250,8 @@ background_image_position: BackgroundImagePosition = .center,
 background_image_fit: BackgroundImageFit = .contain,
 // Tile the image to fill space left over after fitting.
 background_image_repeat: bool = false,
+// Controls terminal image protocols, independently of the wallpaper.
+images_enabled: bool = true,
 
 // Start each new window maximized. Applied after the initial ShowWindow.
 // When `fullscreen` is also true, fullscreen takes effect on top of this so
@@ -392,6 +394,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
     var background_image_position = defaults.background_image_position;
     var background_image_fit = defaults.background_image_fit;
     var background_image_repeat = defaults.background_image_repeat;
+    var images_enabled = defaults.images_enabled;
     var maximize = defaults.maximize;
     var fullscreen = defaults.fullscreen;
     var confirm_close_surface = defaults.confirm_close_surface;
@@ -568,6 +571,11 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
                 std.log.warn("config: {s}:{}: invalid background-blur '{s}' (expect true/false or 0..N)", .{ source_name, line_no, value });
                 continue;
             };
+        } else if (std.mem.eql(u8, key, "images-enabled")) {
+            images_enabled = parseStrictBool(value) orelse {
+                std.log.warn("config: {s}:{}: invalid images-enabled '{s}' (expect true/false)", .{ source_name, line_no, value });
+                continue;
+            };
         } else if (std.mem.eql(u8, key, "background-image")) {
             // Empty value clears a prior line (no image).
             background_image = if (value.len == 0) &.{} else a.dupe(u8, value) catch oom();
@@ -672,6 +680,7 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8, source_name: []const u8
         .background_image_position = background_image_position,
         .background_image_fit = background_image_fit,
         .background_image_repeat = background_image_repeat,
+        .images_enabled = images_enabled,
         .maximize = maximize,
         .fullscreen = fullscreen,
         .confirm_close_surface = confirm_close_surface,
@@ -1418,6 +1427,16 @@ test "parse reads color keys into theme" {
     try std.testing.expectEqual(@as(?u24, 0x445566), cfg.theme.selection_background);
     // Index not set by the theme keeps the standard xterm cube (non-zero).
     try std.testing.expectEqual(vt.color.default[16], cfg.theme.palette[16]);
+}
+
+test "inline images can be disabled independently of the wallpaper" {
+    var cfg = Config.parse(std.testing.allocator, "images-enabled = false\nbackground-image = wallpaper.png", "test");
+    defer cfg.deinit();
+    try std.testing.expect(!cfg.images_enabled);
+    try std.testing.expectEqualStrings("wallpaper.png", cfg.background_image);
+    var invalid = Config.parse(std.testing.allocator, "images-enabled = invalid", "test");
+    defer invalid.deinit();
+    try std.testing.expect(invalid.images_enabled);
 }
 
 test "parse background-image keys" {

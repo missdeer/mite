@@ -2,6 +2,7 @@ const Session = @This();
 
 const std = @import("std");
 const vt = @import("vt");
+const InlineImages = @import("InlineImages.zig");
 
 pub const DEFAULT_SCROLLBACK_BYTES: usize = 10_000_000;
 
@@ -21,6 +22,7 @@ pub const Options = struct {
     cols: u16,
     rows: u16,
     hooks: Hooks,
+    images_enabled: bool = true,
 };
 
 terminal_allocator: std.mem.Allocator,
@@ -28,6 +30,7 @@ terminal_arena: std.heap.ArenaAllocator,
 term: *vt.Terminal,
 stream: vt.TerminalStream,
 hooks: Hooks,
+images: InlineImages,
 
 pub fn init(self: *Session, options: Options) !void {
     self.terminal_allocator = options.terminal_allocator;
@@ -42,6 +45,8 @@ pub fn init(self: *Session, options: Options) !void {
         terminalInitOptions(options.cols, options.rows),
     );
     self.hooks = options.hooks;
+    self.images = .{ .allocator = options.stream_allocator, .enabled = options.images_enabled };
+    self.setImagesEnabled(options.images_enabled);
 
     var handler = self.term.vtHandler();
     handler.effects = effects: {
@@ -61,6 +66,7 @@ pub fn init(self: *Session, options: Options) !void {
 }
 
 pub fn deinit(self: *Session) void {
+    self.images.deinit();
     self.stream.deinit();
     self.term.deinit(self.terminal_arena.allocator());
     self.terminal_arena.deinit();
@@ -69,7 +75,17 @@ pub fn deinit(self: *Session) void {
 }
 
 pub fn feed(self: *Session, bytes: []const u8) void {
-    self.stream.nextSlice(bytes);
+    self.images.feed(&self.stream, bytes);
+}
+
+pub fn setImagesEnabled(self: *Session, enabled: bool) void {
+    self.images.enabled = enabled;
+    if (!enabled) {
+        self.images.discard = true;
+        self.images.transferring = false;
+        self.images.transfer.clearRetainingCapacity();
+    }
+    self.term.setKittyGraphicsSizeLimit(self.term.gpa(), if (enabled) 320 * 1000 * 1000 else 0);
 }
 
 pub fn resize(self: *Session, cols: u16, rows: u16) !void {
@@ -111,8 +127,11 @@ fn onWritePty(handler: *vt.TerminalStream.Handler, data: [:0]const u8) void {
     callback(self.hooks.context, data);
 }
 
-fn onDeviceAttributes(_: *vt.TerminalStream.Handler) effectReturnType("device_attributes") {
-    return .{};
+fn onDeviceAttributes(handler: *vt.TerminalStream.Handler) effectReturnType("device_attributes") {
+    return if (sessionFromEffectHandler(handler).images.enabled)
+        .{ .primary = .{ .features = &.{ .sixel, .ansi_color } } }
+    else
+        .{};
 }
 
 fn onXtVersion(_: *vt.TerminalStream.Handler) []const u8 {
@@ -226,4 +245,79 @@ test "default scrollback preserves early normal output" {
     const dump = try session.term.plainString(std.testing.allocator);
     defer std.testing.allocator.free(dump);
     try std.testing.expect(std.mem.indexOf(u8, dump, "line 0000") != null);
+}
+
+test "Sixel survives every chunk boundary and advances below its anchored image" {
+    const sequence = "\x1bP0;1q\"1;1;2;12#1;2;100;0;0!2~-!2~\x1b\\";
+    for (0..sequence.len + 1) |split| {
+        var context: u8 = 0;
+        var session: Session = undefined;
+        try session.init(.{ .io = std.testing.io, .terminal_allocator = std.testing.allocator, .stream_allocator = std.testing.allocator, .cols = 10, .rows = 5, .hooks = .{ .context = &context } });
+        defer session.deinit();
+        session.syncPixelSize(8, 6);
+        session.feed(sequence[0..split]);
+        session.feed(sequence[split..]);
+        const storage = &session.term.screens.active.kitty_images;
+        try std.testing.expectEqual(@as(u32, 1), storage.images.count());
+        try std.testing.expectEqual(@as(u32, 1), storage.placements.count());
+        try std.testing.expectEqual(@as(usize, 2), session.term.screens.active.cursor.y);
+        try std.testing.expectEqual(@as(usize, 0), session.term.screens.active.cursor.x);
+        var images = storage.images.valueIterator();
+        try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, images.next().?.data.bytes().?[0..4]);
+        session.feed("\x1b[H\x1b[2J\x1b[3J");
+        try std.testing.expectEqual(@as(u32, 0), storage.placements.count());
+    }
+}
+
+test "image disable suppresses all protocols and Sixel capability, including alternate screens" {
+    const Capture = struct {
+        response: [64]u8 = undefined,
+        len: usize = 0,
+        fn write(context: *anyopaque, bytes: [:0]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.len = bytes.len;
+            @memcpy(self.response[0..bytes.len], bytes);
+        }
+    };
+    var capture: Capture = .{};
+    var session: Session = undefined;
+    try session.init(.{ .io = std.testing.io, .terminal_allocator = std.testing.allocator, .stream_allocator = std.testing.allocator, .cols = 10, .rows = 5, .hooks = .{ .context = &capture, .write_pty = Capture.write } });
+    defer session.deinit();
+    session.syncPixelSize(8, 6);
+    session.feed("\x1b[c");
+    try std.testing.expectEqualStrings("\x1b[?62;4;22c", capture.response[0..capture.len]);
+    session.feed("\x1bPq#1;2;100;0;0~\x1b\\");
+    session.setImagesEnabled(false);
+    try std.testing.expectEqual(@as(u32, 0), session.term.screens.active.kitty_images.images.count());
+    for ([_][]const u8{ "", "\x1b[?1049h" }) |screen| {
+        session.feed(screen);
+        session.feed("\x1b[H\x1b[2J");
+        session.feed("\x1b[c");
+        try std.testing.expectEqualStrings("\x1b[?62;22c", capture.response[0..capture.len]);
+        capture.len = 0;
+        const input = "\x1b_Ga=T,f=24,s=1,v=1,i=1;/wAA\x1b\\\x1bPq#1;2;100;0;0~\x1b\\\x1b]1337;File=inline=1:AAAA\x07ok";
+        for (input) |ch| session.feed(&.{ch});
+        try std.testing.expectEqual(@as(u32, 0), session.term.screens.active.kitty_images.images.count());
+        const text = try session.term.plainString(std.testing.allocator);
+        defer std.testing.allocator.free(text);
+        try std.testing.expectEqualStrings("ok", std.mem.trim(u8, text, "\n"));
+    }
+    session.setImagesEnabled(true);
+    session.feed("\x1bPq#1;2;100;0;0~\x1b\\");
+    try std.testing.expectEqual(@as(u32, 1), session.term.screens.active.kitty_images.images.count());
+}
+
+test "image interception preserves non-image strings and recovers after cancellation" {
+    var context: u8 = 0;
+    var session: Session = undefined;
+    try session.init(.{ .io = std.testing.io, .terminal_allocator = std.testing.allocator, .stream_allocator = std.testing.allocator, .cols = 20, .rows = 5, .hooks = .{ .context = &context } });
+    defer session.deinit();
+    session.syncPixelSize(8, 6);
+    const input = "\x1b]0;title\x07\x1bP$qm\x1b\\\x1bPq~\x18\x1b]1337;File=inline=1:AAAA\x1b[31mhello";
+    for (input) |ch| session.feed(&.{ch});
+    try std.testing.expectEqualStrings("title", session.term.getTitle().?);
+    try std.testing.expectEqual(@as(u32, 0), session.term.screens.active.kitty_images.images.count());
+    const text = try session.term.plainString(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("hello", text);
 }

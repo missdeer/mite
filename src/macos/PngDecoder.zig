@@ -4,10 +4,19 @@ const graphics = @import("Apple.zig").graphics;
 
 pub fn install() void {
     vt.sys.decode_png = decode;
+    @import("../terminal/InlineImages.zig").decode_image = decodeFile;
 }
 
 fn decode(allocator: std.mem.Allocator, data: []const u8) vt.sys.DecodeError!vt.sys.Image {
-    const image = try graphics.Image.createPng(data);
+    return decodeImage(allocator, data, true);
+}
+
+fn decodeFile(allocator: std.mem.Allocator, data: []const u8) vt.sys.DecodeError!vt.sys.Image {
+    return decodeImage(allocator, data, false);
+}
+
+fn decodeImage(allocator: std.mem.Allocator, data: []const u8, png_only: bool) vt.sys.DecodeError!vt.sys.Image {
+    const image = try graphics.Image.createEncoded(data, png_only);
     defer image.release();
     const width = image.getWidth();
     const height = image.getHeight();

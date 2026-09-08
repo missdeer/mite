@@ -184,15 +184,17 @@ pub const graphics = struct {
             return @ptrCast(CGImageCreate(width, height, 8, 32, @as(usize, width) * 4, @ptrCast(space), 3, provider, null, true, 0) orelse return error.InvalidData);
         }
 
-        pub fn createPng(bytes: []const u8) !*Image {
+        pub fn createEncoded(bytes: []const u8, png_only: bool) !*Image {
             const data = CFDataCreate(null, bytes.ptr, @intCast(bytes.len)) orelse return error.OutOfMemory;
             defer CFRelease(data);
             const source = CGImageSourceCreateWithData(data, null) orelse return error.InvalidData;
             defer CFRelease(source);
-            const kind = CGImageSourceGetType(source) orelse return error.InvalidData;
-            const png = try foundation.String.createWithBytes("public.png", .utf8, false);
-            defer png.release();
-            if (!CFEqual(kind, @ptrCast(png))) return error.InvalidData;
+            if (png_only) {
+                const kind = CGImageSourceGetType(source) orelse return error.InvalidData;
+                const png = try foundation.String.createWithBytes("public.png", .utf8, false);
+                defer png.release();
+                if (!CFEqual(kind, @ptrCast(png))) return error.InvalidData;
+            }
             const properties = CGImageSourceCopyPropertiesAtIndex(source, 0, null) orelse return error.InvalidData;
             defer CFRelease(properties);
             // Validate metadata before ImageIO allocates decoded pixels, matching VT's limits.

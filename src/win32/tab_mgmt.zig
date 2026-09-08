@@ -165,6 +165,7 @@ pub fn newTabWithLauncher(window: *Window, launcher: ?*const Config.Launcher) vo
         .stream_allocator = global.gpa.allocator(),
         .cols = cell_count.col,
         .rows = cell_count.row,
+        .images_enabled = global.config.images_enabled,
         .hooks = .{
             .context = tab,
             .title_changed = onTitleChanged,

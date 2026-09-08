@@ -50,6 +50,7 @@ pub const Options = struct {
     // variable of the same name, matching the Windows ConPTY child.
     env: []const Config.EnvEntry = &.{},
     hooks: ?Hooks = null,
+    images_enabled: bool = true,
 };
 
 terminal: TerminalSession,
@@ -75,6 +76,7 @@ pub fn init(self: *PtySession, options: Options) !void {
         .stream_allocator = options.stream_allocator,
         .cols = options.cols,
         .rows = options.rows,
+        .images_enabled = options.images_enabled,
         .hooks = .{
             .context = self,
             .title_changed = onTitleChanged,
