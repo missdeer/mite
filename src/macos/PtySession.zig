@@ -51,6 +51,8 @@ pub const Options = struct {
     env: []const Config.EnvEntry = &.{},
     hooks: ?Hooks = null,
     images_enabled: bool = true,
+    cell_width: u32 = 0,
+    cell_height: u32 = 0,
 };
 
 terminal: TerminalSession,
@@ -85,6 +87,7 @@ pub fn init(self: *PtySession, options: Options) !void {
         },
     });
     errdefer self.terminal.deinit();
+    self.terminal.syncPixelSize(options.cell_width, options.cell_height);
 
     const shell = options.shell orelse defaultShell();
     // The child reads these pointers after fork, so they only need to outlive
@@ -101,8 +104,8 @@ pub fn init(self: *PtySession, options: Options) !void {
     var window_size: posix.winsize = .{
         .row = options.rows,
         .col = options.cols,
-        .xpixel = 0,
-        .ypixel = 0,
+        .xpixel = pixelDimension(options.cols, options.cell_width),
+        .ypixel = pixelDimension(options.rows, options.cell_height),
     };
     var master_fd: c_int = -1;
     const pid = forkpty(&master_fd, null, null, &window_size);
@@ -176,11 +179,21 @@ pub fn resize(self: *PtySession, cols: u16, rows: u16) !void {
 
     const old_cols: u16 = @intCast(self.terminal.term.cols);
     const old_rows: u16 = @intCast(self.terminal.term.rows);
-    try resizePty(self.master_fd, cols, rows);
+    const cell_width = self.terminal.term.width_px / old_cols;
+    const cell_height = self.terminal.term.height_px / old_rows;
+    try resizePty(self.master_fd, cols, rows, cell_width, cell_height);
     self.terminal.resize(cols, rows) catch |err| {
-        resizePty(self.master_fd, old_cols, old_rows) catch {};
+        resizePty(self.master_fd, old_cols, old_rows, cell_width, cell_height) catch {};
         return err;
     };
+    self.terminal.syncPixelSize(cell_width, cell_height);
+}
+
+pub fn syncPixelSize(self: *PtySession, cell_width: u32, cell_height: u32) !void {
+    if (self.master_fd < 0) return error.SessionClosed;
+    if (cell_width == 0 or cell_height == 0) return error.InvalidSize;
+    try resizePty(self.master_fd, @intCast(self.terminal.term.cols), @intCast(self.terminal.term.rows), cell_width, cell_height);
+    self.terminal.syncPixelSize(cell_width, cell_height);
 }
 
 pub fn wait(self: *PtySession) !Exit {
@@ -352,12 +365,16 @@ fn readExecFailure(fd: c.fd_t) !bool {
     return true;
 }
 
-fn resizePty(fd: c.fd_t, cols: u16, rows: u16) !void {
+fn pixelDimension(cells: u16, cell_pixels: u32) u16 {
+    return @intCast(@min(@as(u64, cells) * cell_pixels, std.math.maxInt(u16)));
+}
+
+fn resizePty(fd: c.fd_t, cols: u16, rows: u16, cell_width: u32, cell_height: u32) !void {
     var window_size: posix.winsize = .{
         .row = rows,
         .col = cols,
-        .xpixel = 0,
-        .ypixel = 0,
+        .xpixel = pixelDimension(cols, cell_width),
+        .ypixel = pixelDimension(rows, cell_height),
     };
     if (c.ioctl(fd, TIOCSWINSZ, &window_size) != 0) return error.PtyResizeFailed;
 }
@@ -438,6 +455,34 @@ test "macOS PTY resize reaches both the child and VT grid" {
     const contents = try session.terminal.term.plainString(std.testing.allocator);
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "40 100") != null);
+}
+
+test "Kitty client can obtain pixel dimensions through TIOCGWINSZ" {
+    var session: PtySession = undefined;
+    try session.init(.{
+        .io = std.testing.io,
+        .terminal_allocator = std.testing.allocator,
+        .stream_allocator = std.testing.allocator,
+        .cols = 80,
+        .rows = 24,
+        .shell = "/bin/sh",
+        .command = "read line",
+        .cell_width = 10,
+        .cell_height = 20,
+    });
+    defer session.deinit();
+    var size: posix.winsize = undefined;
+    const TIOCGWINSZ: c_int = @bitCast(@as(u32, 0x40087468));
+    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(session.master_fd, TIOCGWINSZ, &size));
+    try std.testing.expectEqual(@as(u16, 800), size.xpixel);
+    try std.testing.expectEqual(@as(u16, 480), size.ypixel);
+    try session.resize(100, 30);
+    try session.syncPixelSize(12, 24);
+    try std.testing.expectEqual(@as(c_int, 0), c.ioctl(session.master_fd, TIOCGWINSZ, &size));
+    try std.testing.expectEqual(@as(u16, 1200), size.xpixel);
+    try std.testing.expectEqual(@as(u16, 720), size.ypixel);
+    try std.testing.expectEqual(@as(u32, 1200), session.terminal.term.width_px);
+    try std.testing.expectEqual(@as(u32, 720), session.terminal.term.height_px);
 }
 
 test "macOS PTY starts the shell in the requested working directory" {

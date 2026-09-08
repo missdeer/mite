@@ -145,9 +145,10 @@ fn createTab(pixel_width: u32, pixel_height: u32, scale: f32, launcher: ?*const 
         .command = command,
         .env = cfg.env,
         .images_enabled = cfg.images_enabled,
+        .cell_width = tab.renderer.metrics.cell_width,
+        .cell_height = tab.renderer.metrics.cell_height,
     });
     cfg.theme.applyToNewTerminal(tab.pty.terminal.term);
-    tab.pty.terminal.syncPixelSize(tab.renderer.metrics.cell_width, tab.renderer.metrics.cell_height);
     tab.exit_code = null;
     tab.mouse_last_cell = null;
     tab.selection_input = null;
@@ -482,7 +483,7 @@ export fn mostty_tab_set_surface(
     const grid = tab.renderer.gridSize();
     if (grid.cols == 0 or grid.rows == 0) return false;
     tab.pty.resize(@intCast(grid.cols), @intCast(grid.rows)) catch return false;
-    tab.pty.terminal.syncPixelSize(tab.renderer.metrics.cell_width, tab.renderer.metrics.cell_height);
+    tab.pty.syncPixelSize(tab.renderer.metrics.cell_width, tab.renderer.metrics.cell_height) catch return false;
     tab.selection_input = null;
     out_cols.* = grid.cols;
     out_rows.* = grid.rows;
