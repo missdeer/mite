@@ -13,6 +13,17 @@ private final class MouseWheelEvent: NSEvent {
     override var modifierFlags: NSEvent.ModifierFlags { [] }
 }
 
+private final class KeypadEvent: NSEvent {
+    var code: UInt16 = 0
+    var flags: NSEvent.ModifierFlags = .numericPad
+    var text = ""
+    override var type: NSEvent.EventType { .keyDown }
+    override var keyCode: UInt16 { code }
+    override var modifierFlags: NSEvent.ModifierFlags { flags }
+    override var characters: String? { text }
+    override var charactersIgnoringModifiers: String? { text }
+}
+
 @main
 struct ClipboardTests {
     static func main() {
@@ -54,6 +65,32 @@ struct ClipboardTests {
         view.setFrameSize(NSSize(width: 410, height: 200))
         view.resyncSurface()
         let firstTab = clipboard_test_created_tab()
+
+        let keypadCases: [(UInt16, String)] = [
+            (82, "\u{1b}Op"), (83, "\u{1b}Oq"), (84, "\u{1b}Or"), (85, "\u{1b}Os"),
+            (86, "\u{1b}Ot"), (87, "\u{1b}Ou"), (88, "\u{1b}Ov"), (89, "\u{1b}Ow"),
+            (91, "\u{1b}Ox"), (92, "\u{1b}Oy"), (65, "\u{1b}On"), (67, "\u{1b}Oj"),
+            (69, "\u{1b}Ok"), (75, "\u{1b}Oo"), (76, "\u{1b}OM"), (78, "\u{1b}Om"),
+            (81, "\u{1b}OX"),
+        ]
+        for (keyCode, sequence) in keypadCases {
+            expect(KeyInput.keypadBytes(keyCode, applicationMode: true) == Array(sequence.utf8),
+                   "DECKPAM maps keypad keyCode \(keyCode) to its xterm application sequence")
+            expect(KeyInput.keypadBytes(keyCode, applicationMode: false) == nil,
+                   "normal keypad mode leaves keyCode \(keyCode) on the existing AppKit text path")
+        }
+        clipboard_test_keypad_mode(true)
+        clipboard_test_reset(false)
+        let keypadZero = KeypadEvent()
+        keypadZero.code = 82
+        keypadZero.text = "0"
+        view.keyDown(with: keypadZero)
+        var keypadOutput = [UInt8](repeating: 0, count: 16)
+        let keypadCount = clipboard_test_written(&keypadOutput, keypadOutput.count)
+        expect(clipboard_test_keypad_queries() == 1,
+               "the macOS host queries terminal DECKPAM state for keypad input")
+        expect(Array(keypadOutput.prefix(keypadCount)) == Array("\u{1b}Op".utf8),
+               "the macOS host sends the application sequence selected by DECKPAM state")
 
         let start = "\u{1b}[200~", end = "\u{1b}[201~"
         let cases: [(String, String)] = [

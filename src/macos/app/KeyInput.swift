@@ -13,6 +13,40 @@ enum KeyInput {
     static let modAlt: UInt32 = 2
     static let modCtrl: UInt32 = 4
 
+    static func isKeypad(_ keyCode: UInt16) -> Bool {
+        keypadFinal(keyCode) != nil
+    }
+
+    /// Encode the VT application-keypad form. Returning nil in normal mode
+    /// keeps the event on AppKit's existing text-input path.
+    static func keypadBytes(_ keyCode: UInt16, applicationMode: Bool) -> [UInt8]? {
+        guard applicationMode, let final = keypadFinal(keyCode) else { return nil }
+        return [0x1b, 0x4f, final]
+    }
+
+    private static func keypadFinal(_ keyCode: UInt16) -> UInt8? {
+        switch keyCode {
+        case 82: return 0x70 // 0 => p
+        case 83: return 0x71 // 1 => q
+        case 84: return 0x72 // 2 => r
+        case 85: return 0x73 // 3 => s
+        case 86: return 0x74 // 4 => t
+        case 87: return 0x75 // 5 => u
+        case 88: return 0x76 // 6 => v
+        case 89: return 0x77 // 7 => w
+        case 91: return 0x78 // 8 => x
+        case 92: return 0x79 // 9 => y
+        case 65: return 0x6e // decimal => n
+        case 67: return 0x6a // multiply => j
+        case 69: return 0x6b // plus => k
+        case 75: return 0x6f // divide => o
+        case 76: return 0x4d // enter => M
+        case 78: return 0x6d // minus => m
+        case 81: return 0x58 // equals => X
+        default: return nil
+        }
+    }
+
     /// Map a macOS virtual key code to a terminal special key, or nil for keys
     /// that carry text (and should flow through the input context / IME).
     static func specialKey(_ keyCode: UInt16) -> MosttyKey? {

@@ -13,6 +13,8 @@ static size_t tab_count;
 static MosttyScrollbar scrollbars[8];
 static MosttyTab *write_tab;
 static bool bracketed_paste;
+static bool application_keypad;
+static size_t keypad_queries;
 static bool selection_active;
 static uint32_t selection_end;
 static bool word_selection;
@@ -64,6 +66,11 @@ void clipboard_test_restore_url_open(void) {
 }
 
 void clipboard_test_reset(bool bracketed) { written_count = 0; bracketed_paste = bracketed; }
+void clipboard_test_keypad_mode(bool enabled) {
+    application_keypad = enabled;
+    keypad_queries = 0;
+}
+size_t clipboard_test_keypad_queries(void) { return keypad_queries; }
 size_t clipboard_test_written(uint8_t *buf, size_t cap) {
     assert(written_count <= cap);
     memcpy(buf, written, written_count);
@@ -106,6 +113,7 @@ bool mostty_tab_poll_exit(MosttyTab *tab, int32_t *code) { return false; }
 void mostty_tab_cell_size(MosttyTab *tab, uint32_t *w, uint32_t *h) { *w = 10; *h = 20; }
 void mostty_tab_cursor(MosttyTab *tab, uint32_t *col, uint32_t *row) { *col = 0; *row = 0; }
 bool mostty_tab_app_cursor_keys(MosttyTab *tab) { return false; }
+bool mostty_tab_app_keypad(MosttyTab *tab) { keypad_queries += 1; return application_keypad; }
 bool mostty_tab_bracketed_paste(MosttyTab *tab) { return bracketed_paste; }
 MosttyScrollbar mostty_tab_scrollbar(MosttyTab *tab) {
     return tab ? scrollbars[(uint8_t *)tab - tabs] : (MosttyScrollbar){0};

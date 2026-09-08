@@ -454,13 +454,19 @@ final class MosttyTerminalView: NSView, NSTextInputClient {
     // MARK: Keyboard
 
     override func keyDown(with event: NSEvent) {
-        guard tab != nil, !terminated else { return }
+        guard let t = tab, !terminated else { return }
         if !markedText.isEmpty {
             inputContext?.handleEvent(event)
             return
         }
         let flags = event.modifierFlags
         if flags.contains(.command) { super.keyDown(with: event); return }
+        if KeyInput.isKeypad(event.keyCode),
+           let bytes = KeyInput.keypadBytes(event.keyCode, applicationMode: mostty_tab_app_keypad(t)) {
+            writeBytes(bytes)
+            scrollToBottomOnInput()
+            return
+        }
         if let key = KeyInput.specialKey(event.keyCode) {
             sendKey(key, flags: flags)
             scrollToBottomOnInput()

@@ -877,6 +877,7 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     try std.testing.expect(mostty_tab_metal_device(tab) != null);
     try std.testing.expect(mostty_tab_at_bottom(tab));
     try std.testing.expect(!mostty_tab_app_cursor_keys(tab));
+    try std.testing.expect(!mostty_tab_app_keypad(tab));
     try std.testing.expect(!mostty_tab_bracketed_paste(tab));
 
     const line = "hello world";
@@ -896,6 +897,10 @@ test "bridge feeds content, renders a texture, and reports mode/selection" {
     // Terminal modes drive input encoding; verify they track VT state.
     mostty_tab_feed(tab, "\x1b[?1h", 5);
     try std.testing.expect(mostty_tab_app_cursor_keys(tab));
+    mostty_tab_feed(tab, "\x1b=", 2);
+    try std.testing.expect(mostty_tab_app_keypad(tab));
+    mostty_tab_feed(tab, "\x1b>", 2);
+    try std.testing.expect(!mostty_tab_app_keypad(tab));
     mostty_tab_feed(tab, "\x1b[?2004h", 8);
     try std.testing.expect(mostty_tab_bracketed_paste(tab));
 }
